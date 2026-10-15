@@ -12,20 +12,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
+import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest import mock
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import torch
 from omegaconf import OmegaConf
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.profiler.config import ProfilerConfig, TorchProfilerScheduleConfig, TorchProfilerToolConfig
+from verl.utils.profiler.config import (
+    DEVICE_ACTIVITIES,
+    DEVICE_CONTENTS,
+    ProfilerConfig,
+    TorchProfilerScheduleConfig,
+    TorchProfilerToolConfig,
+)
 from verl.utils.profiler.profile import DistProfiler, _NoOpProfiler
 from verl.utils.profiler.torch_profile import (
     Profiler,
     build_trace_basename,
     get_torch_profiler,
+)
+
+
+def _cuda_platform():
+    """A CUDA platform, for tests asserting the CUDA activity.
+
+    The device activity now comes from the active platform, so these tests are about a CUDA
+    platform specifically; patching it in keeps them passing on non-CUDA hardware.
+    """
+    platform = MagicMock()
+    type(platform).device_name = PropertyMock(return_value="cuda")
+    return platform
+
+
+# Some device torch can profile that is not CUDA, taken from whatever this build exposes so that no
+# single accelerator is baked into the tests.
+_OTHER_DEVICE = next(iter(sorted(device for device in DEVICE_ACTIVITIES if device != "cuda")), None)
+_requires_other_device = unittest.skipIf(
+    _OTHER_DEVICE is None, "this torch build exposes no device activity other than CUDA"
 )
 
 
@@ -39,6 +67,7 @@ class TestTorchProfile(unittest.TestCase):
         Profiler._define_count = 0
         Profiler._active_prof = None
 
+    @patch("verl.utils.profiler.torch_profile.get_platform", new=_cuda_platform)
     @patch("torch.profiler.profile")
     def test_get_torch_profiler(self, mock_profile):
         # Test wrapper function
@@ -55,6 +84,24 @@ class TestTorchProfile(unittest.TestCase):
         self.assertTrue(kwargs["with_stack"])
         self.assertFalse(kwargs["record_shapes"])
         self.assertFalse(kwargs["profile_memory"])
+
+    @patch("torch.profiler.profile")
+    def test_role_goes_in_filename_not_a_directory(self, mock_profile):
+        # The role must not create a directory level: one step's traces would be scattered
+        # across sibling dirs and hidden from finish_hook_cmd, which only sees save_path.
+        with tempfile.TemporaryDirectory() as save_path:
+            get_torch_profiler(contents=["cpu"], save_path=save_path, role="train", save_file_prefix="actor", rank=0)
+            # No "train" sub-directory is created next to the traces.
+            self.assertEqual(os.listdir(save_path), [])
+
+            _, kwargs = mock_profile.call_args
+            mock_prof = MagicMock()
+            kwargs["on_trace_ready"](mock_prof)
+
+            (out_path,), _ = mock_prof.export_chrome_trace.call_args
+            self.assertEqual(os.path.dirname(out_path), save_path)
+            self.assertTrue(os.path.basename(out_path).startswith("actor_train_"))
+            self.assertTrue(out_path.endswith(".json.gz"))
 
     @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
     def test_profiler_lifecycle(self, mock_get_profiler):
@@ -79,6 +126,73 @@ class TestTorchProfile(unittest.TestCase):
         # Test Stop
         profiler.stop()
         mock_prof_instance.stop.assert_called_once()
+
+    @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
+    def test_start_forwards_training_step(self, mock_get_profiler):
+        # The trainer reports the profiled step as start_profile(profile_step=...); it must reach
+        # the filename, otherwise traces from different steps cannot be told apart.
+        mock_get_profiler.return_value = MagicMock()
+        tool_config = TorchProfilerToolConfig(contents=["cpu"], discrete=False)
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+
+        profiler.start(role="train", profile_step=3)
+        _, kwargs = mock_get_profiler.call_args
+        self.assertEqual(kwargs["profile_step"], 3)
+        self.assertEqual(kwargs["role"], "train")
+        profiler.stop()
+
+    @patch("torch.profiler.record_function")
+    def test_continuous_annotate_range_names_role_and_function(self, mock_record_function):
+        # Continuous mode puts every stage in one trace, so the range name has to carry the role as
+        # well as the function: a bare "compute_log_prob" cannot say whether the forward belonged to
+        # the actor or to the reference model colocated in the same process.
+        tool_config = TorchProfilerToolConfig(contents=["cpu"], discrete=False)
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+
+        @profiler.annotate(role="ref_compute_log_prob")
+        def compute_log_prob():
+            return "done"
+
+        @profiler.annotate()
+        def train_batch():
+            return "done"
+
+        self.assertEqual(compute_log_prob(), "done")
+        mock_record_function.assert_called_with("ref_compute_log_prob")
+
+        # A stage that declares no role is still named after the function it wraps.
+        self.assertEqual(train_batch(), "done")
+        mock_record_function.assert_called_with("train_batch")
+
+    @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
+    def test_discrete_annotate_names_stage_and_step(self, mock_get_profiler):
+        # Discrete mode opens one profiler per stage from annotate(), long after start(): the
+        # stage name and the training step recorded at start() must both reach the filename.
+        mock_get_profiler.return_value = MagicMock()
+        tool_config = TorchProfilerToolConfig(contents=["cpu"], discrete=True)
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+        profiler.start(role="train", profile_step=5)
+
+        @profiler.annotate(role="actor_update")
+        def update_actor():
+            return "done"
+
+        # An unlabeled stage falls back to the wrapped function's name.
+        @profiler.annotate()
+        def compute_log_prob():
+            return "done"
+
+        self.assertEqual(update_actor(), "done")
+        _, kwargs = mock_get_profiler.call_args
+        self.assertEqual(kwargs["role"], "actor_update")
+        self.assertEqual(kwargs["profile_step"], 5)
+
+        self.assertEqual(compute_log_prob(), "done")
+        _, kwargs = mock_get_profiler.call_args
+        self.assertEqual(kwargs["role"], "compute_log_prob")
 
     @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
     def test_discrete_mode(self, mock_get_profiler):
@@ -195,55 +309,232 @@ class TestTorchProfile(unittest.TestCase):
 
     @patch("torch.profiler.schedule")
     @patch("torch.profiler.profile")
-    def test_get_torch_profiler_with_schedule(self, mock_profile, mock_schedule):
-        # When a schedule dict is provided, torch.profiler.schedule must be built and forwarded.
-        sentinel_schedule = object()
-        mock_schedule.return_value = sentinel_schedule
-        schedule = {"skip_first": 1, "wait": 2, "warmup": 1, "active": 3, "repeat": 2}
-
-        get_torch_profiler(contents=["cpu"], save_path="/tmp/test", rank=0, schedule=schedule)
-
-        mock_schedule.assert_called_once_with(**schedule)
-        _, kwargs = mock_profile.call_args
-        self.assertIs(kwargs["schedule"], sentinel_schedule)
-
-    @patch("torch.profiler.schedule")
-    @patch("torch.profiler.profile")
-    def test_get_torch_profiler_without_schedule(self, mock_profile, mock_schedule):
-        # Without a schedule, the profiler runs in continuous mode (no schedule kwarg).
+    def test_no_schedule_collects_continuously(self, mock_profile, mock_schedule):
+        # Without a schedule, collection runs from start() to stop() with no torch.profiler.schedule.
         get_torch_profiler(contents=["cpu"], save_path="/tmp/test", rank=0)
 
         mock_schedule.assert_not_called()
         _, kwargs = mock_profile.call_args
         self.assertNotIn("schedule", kwargs)
 
-    @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
-    def test_scheduled_profiler_lifecycle(self, mock_get_profiler):
-        mock_prof_instance = MagicMock()
-        mock_get_profiler.return_value = mock_prof_instance
+    @patch("torch.profiler.schedule")
+    @patch("torch.profiler.profile")
+    def test_schedule_is_passed_through_when_provided(self, mock_profile, mock_schedule):
+        # A schedule dict is forwarded to torch.profiler.schedule and attached to the profiler.
+        sched = {"skip_first": 1, "wait": 1, "warmup": 1, "active": 2, "repeat": 0}
+        get_torch_profiler(contents=["cpu"], save_path="/tmp/test", rank=0, schedule=sched)
 
-        schedule_cfg = TorchProfilerScheduleConfig(wait=1, warmup=1, active=2, repeat=1)
-        tool_config = TorchProfilerToolConfig(contents=["cpu"], discrete=False, schedule=schedule_cfg)
+        mock_schedule.assert_called_once_with(**sched)
+        _, kwargs = mock_profile.call_args
+        self.assertIn("schedule", kwargs)
+
+    @patch("torch.profiler.schedule")
+    @patch("torch.profiler.profile")
+    def test_schedule_suppresses_profiler_step_rows(self, mock_profile, mock_schedule):
+        # A schedule sub-samples mini-batches, but verl advances step() per mini-batch (not per RL
+        # step), so torch's "ProfilerStep#<n>" rows are turned off via record_steps=False.
+        sched = {"skip_first": 0, "wait": 0, "warmup": 0, "active": 2, "repeat": 1}
+        prof = get_torch_profiler(contents=["cpu"], save_path="/tmp/test", rank=0, schedule=sched)
+
+        self.assertIs(prof.record_steps, False)
+
+    @patch("torch.profiler.schedule")
+    @patch("torch.profiler.profile")
+    def test_no_schedule_leaves_record_steps_untouched(self, mock_profile, mock_schedule):
+        # Without a schedule there are no step boundaries to label, so record_steps is left alone
+        # (torch already defaults it to False).
+        prof = get_torch_profiler(contents=["cpu"], save_path="/tmp/test", rank=0)
+
+        self.assertIsNot(prof.record_steps, False)
+
+    def test_continuous_schedule_follows_the_full_schedule(self):
+        # In continuous mode the schedule selects which update mini-batch is captured, so
+        # skip_first/wait/warmup are honored (an explicit repeat is kept as-is).
+        tool_config = TorchProfilerToolConfig(
+            contents=["cpu"],
+            discrete=False,
+            schedule=TorchProfilerScheduleConfig(skip_first=3, wait=2, warmup=1, active=2, repeat=5),
+        )
         config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
         profiler = Profiler(rank=0, config=config, tool_config=tool_config)
 
-        # Start forwards the resolved schedule kwargs and records the active profiler.
-        profiler.start()
-        _, kwargs = mock_get_profiler.call_args
         self.assertEqual(
-            kwargs["schedule"],
-            {"skip_first": 0, "wait": 1, "warmup": 1, "active": 2, "repeat": 1},
+            profiler._resolve_continuous_schedule_kwargs(),
+            {"skip_first": 3, "wait": 2, "warmup": 1, "active": 2, "repeat": 5},
         )
+        # The full schedule (used for the discrete update stage) matches.
+        self.assertEqual(
+            profiler._resolve_schedule_kwargs(),
+            {"skip_first": 3, "wait": 2, "warmup": 1, "active": 2, "repeat": 5},
+        )
+
+    def test_continuous_schedule_defaults_record_from_start(self):
+        # With skip_first/wait/warmup left at 0, recording still starts at the top of the step
+        # (keeping the earlier stages in full) and repeat is capped to a single window per step.
+        tool_config = TorchProfilerToolConfig(
+            contents=["cpu"],
+            discrete=False,
+            schedule=TorchProfilerScheduleConfig(active=2),
+        )
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+
+        self.assertEqual(
+            profiler._resolve_continuous_schedule_kwargs(),
+            {"skip_first": 0, "wait": 0, "warmup": 0, "active": 2, "repeat": 1},
+        )
+
+    def test_schedule_disabled_when_active_not_positive(self):
+        tool_config = TorchProfilerToolConfig(
+            contents=["cpu"], discrete=False, schedule=TorchProfilerScheduleConfig(active=0)
+        )
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+        self.assertIsNone(profiler._resolve_schedule_kwargs())
+        self.assertIsNone(profiler._resolve_continuous_schedule_kwargs())
+
+    @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
+    def test_discrete_update_stage_is_scheduled_and_drives_active_prof(self, mock_get_profiler):
+        # In discrete mode only the update stage (scheduled=True) carries the schedule, and it must
+        # expose its profiler process-globally so the inner update loop's step() advances it.
+        mock_prof_instance = MagicMock()
+        mock_get_profiler.return_value = mock_prof_instance
+
+        tool_config = TorchProfilerToolConfig(
+            contents=["cpu"],
+            discrete=True,
+            schedule=TorchProfilerScheduleConfig(skip_first=1, wait=1, warmup=1, active=2, repeat=0),
+        )
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+        profiler.start(role="train", profile_step=5)
+
+        active_prof_during_stage = {}
+
+        @profiler.annotate(role="actor_update", scheduled=True)
+        def update_actor():
+            # The update loop steps the process-global profiler while the stage runs.
+            active_prof_during_stage["prof"] = Profiler._active_prof
+            return "done"
+
+        self.assertEqual(update_actor(), "done")
+        _, kwargs = mock_get_profiler.call_args
+        self.assertEqual(kwargs["schedule"], {"skip_first": 1, "wait": 1, "warmup": 1, "active": 2, "repeat": 0})
+        self.assertTrue(kwargs["name_mini_batch_window"])
+        # The stage's profiler was the active one during the call, and is cleared afterwards.
+        self.assertIs(active_prof_during_stage["prof"], mock_prof_instance)
+        self.assertIsNone(Profiler._active_prof)
+
+    @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
+    def test_discrete_non_update_stage_is_not_scheduled(self, mock_get_profiler):
+        # A stage that does not iterate mini-batches (no scheduled=True) must collect in full: it
+        # never calls step(), so a wait/warmup schedule would leave it recording nothing.
+        mock_get_profiler.return_value = MagicMock()
+        tool_config = TorchProfilerToolConfig(
+            contents=["cpu"],
+            discrete=True,
+            schedule=TorchProfilerScheduleConfig(skip_first=1, wait=1, warmup=1, active=2, repeat=0),
+        )
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+        profiler.start(role="train", profile_step=5)
+
+        @profiler.annotate(role="ref_compute_log_prob")
+        def compute_ref_log_prob():
+            return "done"
+
+        self.assertEqual(compute_ref_log_prob(), "done")
+        _, kwargs = mock_get_profiler.call_args
+        self.assertIsNone(kwargs["schedule"])
+        self.assertFalse(kwargs["name_mini_batch_window"])
+        # A non-scheduled stage never claims the process-global slot.
+        self.assertIsNone(Profiler._active_prof)
+
+    @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
+    def test_continuous_stop_flushes_partial_window_when_scheduled(self, mock_get_profiler):
+        # With a schedule, stop() must not emit a trailing step() (that would advance the schedule);
+        # it flushes any window the update loop ended mid-way instead.
+        mock_prof_instance = MagicMock()
+        # current_action left as a plain attribute so _flush_partial_window can inspect it.
+        mock_prof_instance.current_action = torch.profiler.ProfilerAction.RECORD
+        mock_get_profiler.return_value = mock_prof_instance
+
+        tool_config = TorchProfilerToolConfig(
+            contents=["cpu"], discrete=False, schedule=TorchProfilerScheduleConfig(active=3)
+        )
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        profiler = Profiler(rank=0, config=config, tool_config=tool_config)
+
+        profiler.start(role="train", profile_step=1)
+        profiler.stop()
+
+        # A pending RECORD window is promoted so torch saves it on stop() instead of dropping it,
+        # and no trailing step() is issued.
+        self.assertIs(mock_prof_instance.current_action, torch.profiler.ProfilerAction.RECORD_AND_SAVE)
+        mock_prof_instance.step.assert_not_called()
+        mock_prof_instance.stop.assert_called_once()
+
+    @patch("torch.profiler.profile")
+    def test_scheduled_files_are_named_by_mini_batch_window(self, mock_profile):
+        # A discrete scheduled file holds one window of mini-batches, so its name states which.
+        sched = {"skip_first": 1, "wait": 1, "warmup": 1, "active": 2, "repeat": 0}
+        with tempfile.TemporaryDirectory() as save_path:
+            get_torch_profiler(
+                contents=["cpu"], save_path=save_path, rank=0, schedule=sched, name_mini_batch_window=True
+            )
+            on_trace_ready = mock_profile.call_args[1]["on_trace_ready"]
+
+            # First window flushed at step_num=5 -> recorded mini-batches 3 and 4.
+            mock_prof = MagicMock()
+            mock_prof.step_num = 5
+            on_trace_ready(mock_prof)
+            (out_path,), _ = mock_prof.export_chrome_trace.call_args
+            self.assertIn("_mb3-4", os.path.basename(out_path))
+
+    @patch("torch.profiler.profile")
+    def test_second_flush_does_not_overwrite_the_first(self, mock_profile):
+        # Both windows share one filename stem, so the second needs a suffix of its own.
+        with tempfile.TemporaryDirectory() as save_path:
+            get_torch_profiler(contents=["cpu"], save_path=save_path, rank=0)
+            on_trace_ready = mock_profile.call_args[1]["on_trace_ready"]
+
+            names = []
+            for _ in range(2):
+                mock_prof = MagicMock()
+                on_trace_ready(mock_prof)
+                (out_path,), _ = mock_prof.export_chrome_trace.call_args
+                names.append(os.path.basename(out_path))
+
+            self.assertNotIn("_part", names[0])
+            self.assertTrue(names[1].endswith("_part1.json.gz"), names[1])
+
+    @patch("verl.utils.profiler.torch_profile.get_torch_profiler")
+    def test_colocated_roles_share_one_collection(self, mock_get_profiler):
+        # A colocated actor and reference model each own a Profiler but share one process-global
+        # collection: only the first start() opens it, and step() from either advances that one
+        # profiler (the actor update loop is what actually drives step() per mini-batch).
+        mock_prof_instance = MagicMock()
+        mock_get_profiler.return_value = mock_prof_instance
+
+        tool_config = TorchProfilerToolConfig(contents=["cpu"], discrete=False)
+        config = ProfilerConfig(save_path="/tmp/test", enable=True, tool_config=tool_config)
+        actor = Profiler(rank=0, config=config, tool_config=tool_config)
+        colocated_ref = Profiler(rank=0, config=config, tool_config=tool_config)
+
+        actor.start(role="train", profile_step=1)
+        colocated_ref.start(profile_step=1)
+        # One collection for the process, opened by the first role to start.
+        mock_get_profiler.assert_called_once()
         self.assertIs(Profiler._active_prof, mock_prof_instance)
 
-        # Each step advances the active torch profiler.
-        profiler.step()
-        profiler.step()
+        # Any Profiler instance advances the shared process-global collection (per mini-batch).
+        actor.step()
+        colocated_ref.step()
         self.assertEqual(mock_prof_instance.step.call_count, 2)
 
-        # With a schedule, stop must NOT emit an extra implicit step (stepping is per mini-batch).
-        profiler.stop()
-        self.assertEqual(mock_prof_instance.step.call_count, 2)
+        # Without a schedule, stop() emits a trailing step() to flush, then tears the collection down.
+        actor.stop()
+        self.assertEqual(mock_prof_instance.step.call_count, 3)
         mock_prof_instance.stop.assert_called_once()
         self.assertIsNone(Profiler._active_prof)
 
@@ -252,14 +543,27 @@ class TestTorchProfile(unittest.TestCase):
         # tp/pp/dp/cp parallel ranks so per-process traces are self-describing.
         name = build_trace_basename(
             rank=5,
-            role="e2e",
+            role="train",
             save_file_prefix="actor",
             topology={"rank": 5, "world_size": 16, "tp": 1, "pp": 0, "dp": 2, "cp": 0},
         )
-        self.assertTrue(name.startswith("actor_e2e_"))
+        self.assertTrue(name.startswith("actor_train_"))
         self.assertIn("rank5-of-16", name)
         self.assertIn("tp1-pp0-dp2-cp0", name)
         self.assertIn(f"pid{os.getpid()}", name)
+
+    def test_build_trace_basename_encodes_training_step(self):
+        # Without the step, traces from different profiled steps are only distinguishable by
+        # their wall-clock timestamp, which is unreadable when several steps are profiled.
+        name = build_trace_basename(
+            rank=0, role="train", save_file_prefix="actor", profile_step=7, topology={"rank": 0, "world_size": 8}
+        )
+        self.assertTrue(name.startswith("actor_train_step7_rank0-of-8_"))
+
+    def test_build_trace_basename_omits_step_when_unknown(self):
+        name = build_trace_basename(rank=0, role="train", save_file_prefix="actor", topology={})
+        self.assertTrue(name.startswith("actor_train_rank0_"))
+        self.assertNotIn("step", name)
 
     def test_build_trace_basename_distinguishes_roles_same_rank(self):
         # The original scheme collided ref/critic at the same rank; the role prefix fixes it.
@@ -339,6 +643,150 @@ class TestTorchProfile(unittest.TestCase):
         dist_profiler.stop()
 
 
+class TestCpuActivityAlwaysCollected(unittest.TestCase):
+    """Stage markers are CPU-side events, so a device-only trace hides every verl stage.
+
+    ``contents`` is left exactly as the user wrote it; CPU activity is enabled when the profiler is
+    built, so no configuration can produce a trace of unattributable kernels.
+    """
+
+    @patch("verl.utils.profiler.torch_profile.get_platform", new=_cuda_platform)
+    @patch("torch.profiler.profile")
+    def test_cpu_activity_added_for_device_only_contents(self, mock_profile):
+        for contents in (["cuda"], ["cuda", "memory"], []):
+            with self.subTest(contents=contents):
+                mock_profile.reset_mock()
+                get_torch_profiler(contents=list(contents), save_path="/tmp/test", rank=0)
+                activities = mock_profile.call_args[1]["activities"]
+                self.assertIn(torch.profiler.ProfilerActivity.CPU, activities)
+                self.assertIn(torch.profiler.ProfilerActivity.CUDA, activities)
+
+    @patch("torch.profiler.profile")
+    def test_contents_are_not_rewritten(self, mock_profile):
+        # The user's selection is theirs: enabling the activity must not edit the config.
+        contents = ["cuda"]
+        tool_config = TorchProfilerToolConfig(contents=contents)
+        get_torch_profiler(contents=tool_config.contents, save_path="/tmp/test", rank=0)
+        self.assertEqual(tool_config.contents, ["cuda"])
+        self.assertEqual(contents, ["cuda"])
+
+
+class TestDeviceActivityFromPlatform(unittest.TestCase):
+    """The device activity is resolved from the active platform's ``device_name``."""
+
+    def _platform(self, device_name):
+        platform = MagicMock()
+        type(platform).device_name = PropertyMock(return_value=device_name)
+        return platform
+
+    def _activities(self, mock_profile):
+        return mock_profile.call_args[1]["activities"]
+
+    @_requires_other_device
+    @patch("verl.utils.profiler.torch_profile.get_platform")
+    @patch("torch.profiler.profile")
+    def test_non_cuda_device_recorded(self, mock_profile, mock_get_platform):
+        mock_get_platform.return_value = self._platform(_OTHER_DEVICE)
+        for contents in ([], [_OTHER_DEVICE], [_OTHER_DEVICE, "memory"]):
+            with self.subTest(contents=contents):
+                mock_profile.reset_mock()
+                get_torch_profiler(contents=list(contents), save_path="/tmp/test", rank=0)
+                activities = self._activities(mock_profile)
+                self.assertIn(DEVICE_ACTIVITIES[_OTHER_DEVICE], activities)
+                # torch checks CUDA before every other device: leaving it in a list it does not
+                # belong to disables device profiling altogether.
+                self.assertNotIn(torch.profiler.ProfilerActivity.CUDA, activities)
+
+    @patch("verl.utils.profiler.torch_profile.get_platform")
+    @patch("torch.profiler.profile")
+    def test_cuda_platform_unchanged(self, mock_profile, mock_get_platform):
+        # Regression guard for every in-tree CUDA/ROCm user: same activities as before.
+        mock_get_platform.return_value = self._platform("cuda")
+        for contents in ([], ["cuda"], ["cpu", "cuda", "stack"]):
+            with self.subTest(contents=contents):
+                mock_profile.reset_mock()
+                get_torch_profiler(contents=list(contents), save_path="/tmp/test", rank=0)
+                self.assertIn(torch.profiler.ProfilerActivity.CUDA, self._activities(mock_profile))
+
+    @_requires_other_device
+    @patch("verl.utils.profiler.torch_profile.get_platform")
+    @patch("torch.profiler.profile")
+    def test_other_platforms_device_keyword_warns(self, mock_profile, mock_get_platform):
+        # A CUDA config run on another accelerator records no device activity, so say so.
+        mock_get_platform.return_value = self._platform(_OTHER_DEVICE)
+        with self.assertLogs("verl.utils.profiler.torch_profile", level="WARNING") as log_ctx:
+            get_torch_profiler(contents=["cuda"], save_path="/tmp/test", rank=0)
+        self.assertEqual(self._activities(mock_profile), [torch.profiler.ProfilerActivity.CPU])
+        self.assertTrue(any(f"'{_OTHER_DEVICE}'" in record.getMessage() for record in log_ctx.records))
+
+    @patch("verl.utils.profiler.torch_profile.get_platform")
+    @patch("torch.profiler.profile")
+    def test_device_without_profiler_activity_warns(self, mock_profile, mock_get_platform):
+        # torch has no ProfilerActivity.NPU: same CPU-only trace as before, but the warning
+        # explaining it is now verl's instead of torch's misleading CUDA one.
+        mock_get_platform.return_value = self._platform("npu")
+        with self.assertLogs("verl.utils.profiler.torch_profile", level="WARNING"):
+            get_torch_profiler(contents=[], save_path="/tmp/test", rank=0)
+        self.assertEqual(self._activities(mock_profile), [torch.profiler.ProfilerActivity.CPU])
+
+    @_requires_other_device
+    @patch("verl.utils.profiler.torch_profile.get_platform")
+    @patch("torch.profiler.profile")
+    def test_non_device_contents_select_no_device(self, mock_profile, mock_get_platform):
+        # `contents` naming only profiler options is an explicit CPU-only request, not a mistake.
+        mock_get_platform.return_value = self._platform(_OTHER_DEVICE)
+        logger = logging.getLogger("verl.utils.profiler.torch_profile")
+        with mock.patch.object(logger, "warning") as mock_warning:
+            get_torch_profiler(contents=["stack"], save_path="/tmp/test", rank=0)
+        self.assertEqual(self._activities(mock_profile), [torch.profiler.ProfilerActivity.CPU])
+        mock_warning.assert_not_called()
+
+    @patch("verl.utils.profiler.torch_profile.get_platform")
+    @patch("torch.profiler.profile")
+    def test_every_device_keyword_resolves_its_activity(self, mock_profile, mock_get_platform):
+        # Holds for whatever members a torch build exposes, however they are capitalized.
+        for device, activity in DEVICE_ACTIVITIES.items():
+            with self.subTest(device=device):
+                mock_profile.reset_mock()
+                mock_get_platform.return_value = self._platform(device)
+                get_torch_profiler(contents=[], save_path="/tmp/test", rank=0)
+                self.assertIn(activity, self._activities(mock_profile))
+
+    @patch("verl.utils.profiler.torch_profile.get_platform")
+    @patch("torch.profiler.profile")
+    def test_cpu_device_not_added_twice(self, mock_profile, mock_get_platform):
+        mock_get_platform.return_value = self._platform("cpu")
+        get_torch_profiler(contents=[], save_path="/tmp/test", rank=0)
+        self.assertEqual(self._activities(mock_profile), [torch.profiler.ProfilerActivity.CPU])
+
+
+class TestDeviceContentsConfigValidation(unittest.TestCase):
+    """``contents`` accepts a device keyword for any backend torch can profile.
+
+    The keywords come from torch rather than a hardcoded list, so validation needs no platform
+    detection on the (often CPU-only) driver.
+    """
+
+    def test_every_torch_device_keyword_accepted(self):
+        for device in DEVICE_CONTENTS:
+            with self.subTest(device=device):
+                TorchProfilerToolConfig(contents=[device], discrete=False)
+
+    def test_profiler_options_still_accepted(self):
+        TorchProfilerToolConfig(contents=["cpu", "cuda", "memory", "shapes", "stack"], discrete=False)
+
+    def test_unknown_keyword_rejected(self):
+        with self.assertRaises(AssertionError):
+            TorchProfilerToolConfig(contents=["not_a_device"], discrete=False)
+
+    def test_private_use1_keyword_rejected(self):
+        # No platform reports "privateuse1" as its device_name, so accepting the keyword would
+        # validate a value that is then silently never recorded.
+        self.assertNotIn("privateuse1", DEVICE_CONTENTS)
+        with self.assertRaises(AssertionError):
+            TorchProfilerToolConfig(contents=["privateuse1"], discrete=False)
+
+
 def _role_profiler_omegaconf(tool="torch", enable=True, discrete=False, contents=("cpu", "cuda")):
     """Mimic a per-role ``profiler`` OmegaConf sub-tree (identical across ref/ref.yaml and
     critic/critic.yaml).
@@ -360,14 +808,6 @@ def _role_profiler_omegaconf(tool="torch", enable=True, discrete=False, contents
                     "_target_": "verl.utils.profiler.config.TorchProfilerToolConfig",
                     "contents": list(contents),
                     "discrete": discrete,
-                    "schedule": {
-                        "_target_": "verl.utils.profiler.config.TorchProfilerScheduleConfig",
-                        "skip_first": 0,
-                        "wait": 0,
-                        "warmup": 0,
-                        "active": 0,
-                        "repeat": 0,
-                    },
                 },
             },
         }
@@ -396,7 +836,7 @@ class TestRefWorkerProfilerConfig(unittest.TestCase):
         self.assertEqual(ref_profiler_config.tool, "torch")
 
         # TrainingWorker.__init__ extracts the tool-specific config exactly like this; it must be a
-        # real dataclass (not a plain dict) for the torch Profiler to read .contents/.schedule.
+        # real dataclass (not a plain dict) for the torch Profiler to read .contents/.discrete.
         tool_config = ref_profiler_config.tool_config.get(ref_profiler_config.tool)
         self.assertIsInstance(tool_config, TorchProfilerToolConfig)
         self.assertEqual(tool_config.contents, ["cpu", "cuda"])

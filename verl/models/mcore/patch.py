@@ -92,13 +92,73 @@ def apply_fast_hadamard_transform_shim():
     )
 
 
+class _MissingFlashAttnCute:
+    """Meta-path finder that reports ``flash_attn.cute`` as an absent module."""
+
+    _PREFIX = "flash_attn.cute"
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == self._PREFIX or fullname.startswith(self._PREFIX + "."):
+            raise ModuleNotFoundError(f"No module named {fullname!r}", name=fullname)
+        return None
+
+
+def neutralize_broken_flash_attn_cute():
+    """Hide ``flash_attn.cute`` when importing it raises anything but ImportError.
+
+    Megatron-LM probes FA4 with ``from flash_attn.cute import flash_attn_varlen_func``
+    guarded by ``except ImportError``. flash-attn 2.8.3 ships that subpackage but
+    declares no ``nvidia-cutlass-dsl`` dependency, and the code targets the 4.5.x
+    API, so against the 4.6.x sglang pins it raises ``AttributeError`` on
+    ``cute.core.ThrMma``. That escapes the guard and aborts
+    ``import megatron.core.transformer.attention`` — i.e. every mcore entry point.
+
+    Probe once and only install the finder when the subpackage is actually broken,
+    so a build whose FA4 does import keeps it. Must run before anything imports
+    megatron's GPT layer specs.
+    """
+    import importlib
+    import importlib.util
+    import logging
+    import sys
+
+    if any(isinstance(finder, _MissingFlashAttnCute) for finder in sys.meta_path):
+        return
+    try:
+        if importlib.util.find_spec("flash_attn.cute") is None:
+            return
+    except Exception:
+        return  # flash-attn absent or unimportable; the probe already sees ImportError
+
+    try:
+        importlib.import_module("flash_attn.cute")
+    except ImportError:
+        return  # already the exception every probe expects
+    except Exception as e:
+        reason = f"{type(e).__name__}: {e}"
+    else:
+        return  # FA4 imports here; leave it usable
+
+    # A failed import can leave half-initialized submodules behind; drop them so
+    # the finder below is what every later import reaches.
+    for name in [n for n in sys.modules if n == "flash_attn.cute" or n.startswith("flash_attn.cute.")]:
+        del sys.modules[name]
+    sys.meta_path.insert(0, _MissingFlashAttnCute())
+
+    logging.getLogger(__name__).warning(
+        "flash_attn.cute (FlashAttention-4) is unusable and is being hidden so optional "
+        "FA4 probes fail with ImportError as they expect; FlashAttention-2 is unaffected. "
+        "Cause: %s",
+        reason,
+    )
+
+
 def apply_patch():
     # DeepSeek sparse-attention (DSA) needs ``fast_hadamard_transform``, which
     # cannot be built on ROCm (its setup requires nvcc). Install a pure-torch
     # fallback from the central mcore patch entry so every DSA importer picks it
-    # up without engine-specific wiring. Callers run this both before model
-    # creation (hf_to_mcore_config_dpskv3) and after it (the mbridge path in
-    # megatron_utils.get_model), which is why the shim also back-fills importers.
+    # up without engine-specific wiring. megatron_utils.make_megatron_module
+    # calls this after model creation, so the shim also back-fills importers.
     apply_fast_hadamard_transform_shim()
 
     import megatron.core
@@ -443,36 +503,6 @@ def apply_patch():
         MultiLatentAttention.forward = patch_forward
 
 
-def apply_patch_mbridge():
-    try:
-        from megatron.core.utils import get_tensor_model_parallel_group_if_none
-    except ImportError:
-        import warnings
-
-        import megatron.core.utils
-        import torch
-        from megatron.core import parallel_state
-
-        def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
-            """Issue a deprecation warning if tp_group is None and return the default tp group."""
-            if not torch.distributed.is_initialized():
-                return None
-            if tp_group is None:
-                if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-                    warnings.warn(
-                        "Warning: tp_group is None, using default tp group. Passing tp_group will be mandatory soon",
-                        DeprecationWarning,
-                        stacklevel=2,
-                    )
-                if is_expert:
-                    tp_group = parallel_state.get_expert_tensor_parallel_group(check_initialized=check_initialized)
-                else:
-                    tp_group = parallel_state.get_tensor_model_parallel_group(check_initialized=check_initialized)
-            return tp_group
-
-        megatron.core.utils.get_tensor_model_parallel_group_if_none = get_tensor_model_parallel_group_if_none
-
-
 def apply_patch_megatron_v012_with_torch_v28_v29() -> None:
     # Error due to missing serialization_format in _write_item of megatron v012;
     # resolved by using megatron v013's implementation.
@@ -642,14 +672,29 @@ def apply_patch_megatron_recomputation_backward():
             for inp in detached_inputs
         )
         cur_stream = torch.cuda.current_stream()
-        # Release original input and grad tensors
-        for t in detached_inputs:
-            if isinstance(t, torch.Tensor) and t.requires_grad:
-                t.record_stream(cur_stream)
-                t.untyped_storage().resize_(0)
-                if t.grad is not None:
-                    t.grad.record_stream(cur_stream)
-                    t.grad.untyped_storage().resize_(0)
+        # Release saved input/grad tensors (MoE residual-memory leak fix, commit 04df110c).
+        # Skip MTP layer checkpoints: their saved ``hidden_states`` aliases the decoder
+        # output (a ``torch.chunk`` view), and MTP backward runs before the decoder
+        # backward, so ``resize_(0)`` would truncate storage the decoder still needs
+        # -> async CUDA illegal-memory-access.
+        is_mtp_checkpoint = False
+        run_fn = getattr(ctx, "run_function", None)
+        for cell in getattr(run_fn, "__closure__", None) or ():
+            try:
+                obj = cell.cell_contents
+            except ValueError:
+                continue
+            if obj.__class__.__name__ == "MultiTokenPredictionLayer":
+                is_mtp_checkpoint = True
+                break
+        if not is_mtp_checkpoint:
+            for t in detached_inputs:
+                if isinstance(t, torch.Tensor) and t.requires_grad:
+                    t.record_stream(cur_stream)
+                    t.untyped_storage().resize_(0)
+                    if t.grad is not None:
+                        t.grad.record_stream(cur_stream)
+                        t.grad.untyped_storage().resize_(0)
         # ctx.saved_tensors = None
         return (None, None) + grads
 

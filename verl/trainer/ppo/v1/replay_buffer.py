@@ -29,6 +29,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS", "60"))
 
 DAPO_FILTERED_REWARD_COUNTS_KEY = "_dapo_filtered_reward_counts"
+FILTER_GROUPS_REWARD_METRIC = "reward"
 
 
 def _metric_component(value: object) -> str:
@@ -122,13 +123,18 @@ class ReplayBuffer:
     Args:
         trainer_mode (str): Trainer mode.
         trainer_config (DictConfig): Trainer configuration.
-        max_off_policy_threshold (int): Maximum number of model versions that trajectory can span.
+        max_off_policy_threshold (int | None): Maximum number of model versions that trajectory can span.
+            None disables off-policy version control entirely: no samples are dropped or awaited for
+            staleness (off-policy degree is then only bounded by rollout concurrency and feed/consume
+            balance).
         max_off_policy_strategy (str): How to handle trajectory that exceeds the maximum number of model versions.
+            Ignored when ``max_off_policy_threshold`` is None.
         sampler_kwargs (dict): Additional kwargs for the custom sampler.
         poll_interval (float, optional): Poll interval in seconds. Defaults to 2.0.
         refill_fn (callable, optional): Trainer-injected function that submits an exact number of fresh prompts.
         filter_groups_metric (str, optional): DAPO group-filtering metric read from each trajectory's
-            ``extra_fields.reward_extra_info``. ``None`` disables DAPO filtering.
+            ``extra_fields.reward_extra_info``. ``"reward"`` falls back to the canonical pre-KL reward
+            summed from ``rm_scores`` when the trajectory does not report it. ``None`` disables DAPO filtering.
         train_batch_size (int, optional): Prompt count represented by one Sync DAPO in-flight batch.
         gen_batch_size (int, optional): Dataloader fetch granularity for refill dispatches.
         max_inflight_gen_batches (int): Maximum Sync DAPO prompt batches concurrently pending or running.
@@ -139,7 +145,7 @@ class ReplayBuffer:
         self,
         trainer_mode: str,
         trainer_config: DictConfig,
-        max_off_policy_threshold: int,
+        max_off_policy_threshold: int | None,
         max_off_policy_strategy: str,
         sampler_kwargs: DictConfig,
         poll_interval: float = 2.0,
@@ -163,9 +169,16 @@ class ReplayBuffer:
         self.max_inflight_gen_batches = max_inflight_gen_batches
         self.sync_refill_failed_groups = sync_refill_failed_groups
 
-        assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
-            f"Invalid max off policy threshold: {self.max_off_policy_threshold}, must be an integer greater than 0"
-        )
+        if self.max_off_policy_threshold is not None:
+            assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
+                f"Invalid max off policy threshold: {self.max_off_policy_threshold}, "
+                "must be an integer greater than 0, or null to disable off-policy version control"
+            )
+        else:
+            logger.info(
+                "[V1ReplayBuffer] off-policy version control disabled (max_off_policy_threshold is null): "
+                "no samples will be dropped or awaited for staleness"
+            )
         assert self.max_off_policy_strategy in ["drop", "wait"], (
             f"Invalid max off policy strategy: {self.max_off_policy_strategy}, must be one of ['drop', 'wait']"
         )
@@ -293,7 +306,7 @@ class ReplayBuffer:
 
         if trajectory_keys:
             select_fields = ["extra_fields"]
-            if self.filter_groups_metric == "reward":
+            if self.filter_groups_metric == FILTER_GROUPS_REWARD_METRIC:
                 select_fields.append("rm_scores")
             data = tq.kv_batch_get(
                 keys=trajectory_keys,
@@ -314,7 +327,11 @@ class ReplayBuffer:
             extra_fields = getattr(extra_fields, "data", extra_fields)
             reward_extra_info = extra_fields.get("reward_extra_info", {}) if isinstance(extra_fields, dict) else {}
             metric_value = reward_extra_info.get(self.filter_groups_metric)
-            if metric_value is None and self.filter_groups_metric == "reward" and index < len(rm_scores_list):
+            if (
+                metric_value is None
+                and self.filter_groups_metric == FILTER_GROUPS_REWARD_METRIC
+                and index < len(rm_scores_list)
+            ):
                 score = getattr(rm_scores_list[index], "data", rm_scores_list[index])
                 if hasattr(score, "sum"):
                     score = score.sum()
@@ -630,7 +647,7 @@ class ReplayBufferAsync(ReplayBuffer):
         pass
 
     def _stale_terminal_keys(self, global_steps: int, partition_id: str) -> set[str]:
-        if partition_id == "val" or self.max_off_policy_strategy != "drop":
+        if partition_id == "val" or self.max_off_policy_threshold is None or self.max_off_policy_strategy != "drop":
             return set()
         prompt_global_steps = self.prompt_global_steps[partition_id]
         terminal_keys = self.finished_keys[partition_id]
@@ -659,7 +676,7 @@ class ReplayBufferAsync(ReplayBuffer):
     ) -> bool:
         # Dropless off-policy control: block sampling while any in-flight prompt has reached the staleness
         # threshold, so it can finish and be trained on instead of dropped.
-        if self.max_off_policy_strategy == "wait":
+        if self.max_off_policy_threshold is not None and self.max_off_policy_strategy == "wait":
             for key in self.pending_keys[partition_id] | self.running_keys[partition_id]:
                 prompt_global_steps = self.prompt_global_steps[partition_id][key]
                 if (global_steps - prompt_global_steps + 1) >= self.max_off_policy_threshold:
@@ -667,9 +684,17 @@ class ReplayBufferAsync(ReplayBuffer):
 
         return len(sampleable_keys) >= batch_size
 
-    @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
-    def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
-        """Sample a batch while evicting and replacing stale, DAPO-filtered, or failed groups."""
+    def get_sampleable_count(self, global_steps: int, partition_id: str) -> int:
+        """Return the current number of terminal groups eligible for sampling."""
+        self._sync_metadata_from_transfer_queue()
+        eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
+        return len(self._sampleable_terminal_keys(partition_id, eviction_reasons))
+
+    def wait_for_sampleable(self, global_steps: int, partition_id: str, target_count: int) -> tuple[set[str], dict]:
+        """Poll until ``target_count`` groups are sampleable, evicting and refilling meanwhile.
+
+        Returns the sampleable uids and the eviction metrics accrued while waiting.
+        """
         last_debug_time = time.time()
         eviction_metrics: dict = {}
 
@@ -690,15 +715,24 @@ class ReplayBufferAsync(ReplayBuffer):
                 continue
 
             sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
-            if self._has_enough_samples(global_steps, partition_id, batch_size, sampleable_keys):
-                selected_prompt_uids, partition_snapshot, prompt_global_steps_snapshot = self._select_prompt_uids(
-                    partition_id, sampleable_keys, batch_size
-                )
-                break
+            if self._has_enough_samples(global_steps, partition_id, target_count, sampleable_keys):
+                return sampleable_keys, eviction_metrics
 
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
 
-        if partition_id != "val" and self.max_off_policy_strategy == "drop":
+    @SkipManager.annotate_tq(role="rollout_tq", phase="sample")
+    def sample(self, global_steps: int, partition_id: str, batch_size: int) -> tuple[KVBatchMeta, dict]:
+        """Sample a batch while evicting and replacing stale, DAPO-filtered, or failed groups."""
+        sampleable_keys, eviction_metrics = self.wait_for_sampleable(global_steps, partition_id, batch_size)
+        selected_prompt_uids, partition_snapshot, prompt_global_steps_snapshot = self._select_prompt_uids(
+            partition_id, sampleable_keys, batch_size
+        )
+
+        if (
+            partition_id != "val"
+            and self.max_off_policy_threshold is not None
+            and self.max_off_policy_strategy == "drop"
+        ):
             selected_spans = [
                 global_steps - prompt_global_steps_snapshot.get(uid, global_steps) + 1 for uid in selected_prompt_uids
             ]
