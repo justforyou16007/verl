@@ -129,7 +129,7 @@ class QATEngineConfig(BaseConfig):
 
     Args:
         enable (bool): Whether to enable QAT, default False
-        mode (str): Quantization mode, "w4a16" or "w4a4", default "w4a16"
+        mode (str): Quantization mode, "fp8", "mxfp8", "mxfp4", or "nvfp4", default "fp8"
         group_size (int): Group size for blockwise quantization, default 16
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
@@ -137,7 +137,7 @@ class QATEngineConfig(BaseConfig):
     """
 
     enable: bool = False
-    mode: str = "w4a16"
+    mode: str = "fp8"
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
@@ -179,7 +179,9 @@ class McoreEngineConfig(EngineConfig):
     """
 
     # sequence_parallel is not listed as a frozen field for auto-correction purpose
-    _mutable_fields = EngineConfig._mutable_fields | {"sequence_parallel"}
+    _mutable_fields = EngineConfig._mutable_fields | {"sequence_parallel", "_liger_flsce_capacity"}
+    # Runtime-only reservation shared by colocated engines, not a user-facing knob.
+    _liger_flsce_capacity: Optional[tuple[int, int]] = field(default=None, init=False, repr=False)
     # mcore parallelism
     tensor_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
