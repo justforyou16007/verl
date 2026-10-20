@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插课 A：Ray 环境进程与 k8s pod 的配合 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>插课 A：Ray 环境进程与 k8s pod</h2>
+  <ol>
+    <li><a href="#xa-0">0. 结论先行</a></li>
+    <li><a href="#xa-1">1. 三方角色与部署位置</a></li>
+    <li><a href="#xa-2">2. env_actor 内部的对象层次</a></li>
+    <li><a href="#xa-3">3. pod 长什么样：main + sidecar</a></li>
+    <li><a href="#xa-4">4. 建 pod：setup 的完整时序</a></li>
+    <li><a href="#xa-5">5. 一次工具调用怎么到达 pod</a></li>
+    <li><a href="#xa-6">6. 打分：在 sidecar 里跑 verifier</a></li>
+    <li><a href="#xa-7">7. 清理：删 pod、杀 actor</a></li>
+    <li><a href="#xa-8">8. 故障怎么分类（含一个疑似 bug）</a></li>
+    <li><a href="#xa-9">9. 思考题</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="02-agent-loop-init.html">相关：第二课 ④</a><a href="03b-harness-execution.html">相关：第三课（下）</a></div>
+
+<h2 id="xa">插课 A：MiMo 的 agent 执行进程（Ray）与 k8s pod 怎么配合</h2>
+<div class="box ask"><b>提问</b>：临时插一节课，我想知道 mimo 的 agent 执行容器（通过 ray）和 k8s 管理的 pod 是怎么配合的。</div>
+
+<h3 id="xa-0">0. 结论先行</h3>
+<div class="box key">
+<ol>
+  <li><b>agent 本身不在 pod 里运行。</b>mimoagent 的循环跑在 Ray 的 <code>AgentLoopWorker</code> 进程里（第三课上讲的 T 线程），pod 只是"手脚"：一个执行命令、存放文件的沙箱。</li>
+  <li><b>每条轨迹 = 1 个 <code>DatasetEnvActor</code>（Ray 进程）+ 1 个 pod。</b>actor 是这个 pod 的唯一"遥控器"：负责创建 pod、往 pod 里执行命令和传文件、打分、最后删除 pod。</li>
+  <li><b>actor 和 pod 之间没有直接的网络连接。</b>所有操作都经过 k8s 的 API server：创建/查询/删除 pod 用普通 HTTPS 请求；执行命令、传文件用 API server 提供的 exec 通道（WebSocket），效果等同于 <code>kubectl exec</code>。Ray 节点只要能访问 API server 即可，不需要能访问 pod 的 IP。</li>
+  <li><b>pod 里有两个容器</b>：<code>main</code> 是模型操作的工作区；<code>sidecar</code> 运行任务的 MCP 服务（外部工具服务）并负责打分。两个容器共享网络（都能用 127.0.0.1 互相访问），但看到的文件不同，这样模型就碰不到数据库和标准答案。</li>
+</ol>
+</div>
+
+<h3 id="xa-1">1. 三方角色与部署位置</h3>
+<pre><code>┌──────────────────────── Ray 集群（GPU 训练机） ─────────────────────────┐
+│                                                                          │
+│  AgentLoopWorker 进程（×32）                                             │
+│   ├ 事件循环 L：GeneralAgentLoop.run()                                   │
+│   ├ 线程 T：agent.run()（mimoagent DefaultAgent 循环）                   │
+│   └ 线程 P：并行执行工具 → ray.get(env_actor.execute_tool.remote(...))  │
+│            │ Ray 远程调用                                                │
+│            ▼                                                             │
+│  DatasetEnvActor 进程（每条轨迹 1 个，num_cpus=0.125，SPREAD 分散调度）  │
+│   ├ tool_registry：Bash/Read/Write/Edit/Grep/Glob + mcp__* 工具          │
+│   ├ dataset_env：GeneralAgentEnvironment（任务逻辑、打分）               │
+│   └ dataset_env.env：SidecarKubernetesEnvironment（k8s 客户端）          │
+│            │                                                             │
+│  SGLang 推理服务 ◀── L 通过 server_manager 调用（与 pod 无关）           │
+└────────────┼─────────────────────────────────────────────────────────────┘
+             │ HTTPS：create / read / delete pod
+             │ WebSocket：pods/exec（执行命令、tar 传文件）
+             ▼
+┌──────────────── k8s 集群 ─────────────────────────────────────────────────┐
+│  API server ──▶ 目标节点上的 kubelet ──▶ 容器运行时                        │
+│                                                                            │
+│  Pod mimoagent-&lt;16位hex&gt;   labels: exp=$EXP_NAME                         │
+│   ├ main    容器：/bin/bash 空闲等待；/work/workspace（读写）             │
+│   └ sidecar 容器：sleep infinity + MCP 服务(127.0.0.1:39101+i)；verifier  │
+│        共享 emptyDir 卷：workspace、system-vol；共享网络                   │
+└────────────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<table>
+  <tr><th>角色</th><th>运行在哪</th><th>由谁创建、谁销毁</th><th>职责</th></tr>
+  <tr><td><code>AgentLoopWorker</code></td><td>Ray 集群</td><td>训练开始时创建 32 个，一直存在</td><td>跑 agent 循环、调用推理服务、记录 token</td></tr>
+  <tr><td><code>DatasetEnvActor</code></td><td>Ray 集群，只占 CPU</td><td><code>GeneralAgentLoop.run()</code> 开头创建；<code>finally</code> 里 <code>ray.kill</code></td><td>pod 的唯一控制者：建 pod、执行工具、打分、删 pod</td></tr>
+  <tr><td>pod</td><td>k8s 集群</td><td>env_actor 调用 k8s API 创建和删除</td><td>提供隔离的执行环境、MCP 服务、verifier</td></tr>
+</table>
+
+<h4>env_actor 怎么连上 k8s 集群</h4>
+<p>连接凭据是通过环境变量一路传下来的。<code>run_general.sh</code> 把 <code>KUBECONFIG</code>、<code>DOCKER_REGISTRY</code>、<code>K8S_NAMESPACE</code> 等写进 Ray 的 <code>runtime_env.env_vars</code>，所有 Ray 进程（包括 env_actor）启动时都会带上这些变量。之后的传递路径是：</p>
+<span class="src">recipes/general/env_actor.py _create</span>
+<pre><code>env_kwargs = dict(self.config.get("environment") or {})        # s3k.yaml 的 environment: 块
+env_kwargs["labels"] = {"exp": os.getenv("EXP_NAME", "unknown"), ...}   # 给 pod 打上实验名标签
+if os.environ.get("KUBECONFIG") and "kubeconfig" not in env_kwargs:
+    env_kwargs["kubeconfig"] = os.environ["KUBECONFIG"]          # 连哪个集群
+if _registry := os.environ.get("DOCKER_REGISTRY"):
+    env_kwargs["image_prefix"] = _registry                        # 镜像仓库前缀
+self.dataset_env = make_dataset_env(self.instance, **env_kwargs)</code></pre>
+<p>mimoagent 的 <code>_setup_kubernetes_client</code> 会为每个环境单独创建一份 k8s 客户端配置，而不是用 kubernetes 库的全局默认配置。这样即使一个进程里有多个环境、分别连不同的集群，也不会互相覆盖。</p>
+
+<div class="box note"><b>为什么不把 agent 放进 pod 里跑？</b>黑盒 harness（真正的 Claude Code CLI）确实是在 <code>main</code> 容器里运行的，同一套 pod 结构两种用法都支持（见 <code>general_agent/environment.py</code> 的 docstring）。但白盒 RL 要求每次调用模型都经过 verl 的 <code>_VerlRolloutModel</code>，由它直接调用 SGLang 并记录 token。如果把循环放进 pod，pod 就需要能访问 SGLang 推理服务，token 记录也得跨网络传回来。把循环留在训练集群里、pod 只负责执行，两个问题都不存在。</div>
+
+<h3 id="xa-2">2. env_actor 内部的对象层次</h3>
+<pre><code>DatasetEnvActor
+ ├ self.tool_registry          mimoagent ToolRegistry：工具名 → 工具对象
+ ├ self.dataset_env            GeneralAgentEnvironment（"任务层"）
+ │    ├ manifest              这个任务要上传哪些文件、怎么启动 MCP、怎么打分
+ │    ├ mcp_servers           {"crm": {"url": "http://127.0.0.1:39101/mcp"}, ...}
+ │    ├ setup_environment()   = env.start() + _setup_dataset_specific()
+ │    └ calculate_reward()
+ │    └ self.env ─────────┐
+ │                         ▼
+ │         SidecarKubernetesEnvironment（"pod 层"，继承 mimoagent 的 KubernetesEnvironment）
+ │              ├ pod_name, config(image, namespace, cwd, timeout, sidecars, ...)
+ │              ├ execute(command, cwd, timeout, container=None) → {"output", "returncode", "reason"}
+ │              ├ copy_to(本地路径, pod 内路径, container=None)
+ │              ├ copy_out(pod 内路径, 本地路径, container=None)
+ │              ├ cleanup()
+ │              └ v1_api = _ContainerRoutingCoreV1Api(CoreV1Api)   ← 包了一层，用来指定目标容器
+ └ self._infra_error           一旦 pod 连接断开，就记在这里</code></pre>
+<p>分两层的原因是：pod 层只负责"怎么操作一个 pod"，和具体任务无关，所以可以复用 mimoagent 原有的代码；任务层负责"这类任务要往 pod 里放什么、怎么打分"。<code>dataset_type: "general_agent"</code> 由 <code>register_general_agent_env()</code> 注册进 mimoagent 的 <code>DATASET_REGISTRY</code>，<code>make_dataset_env</code> 就是根据这个字段找到 <code>GeneralAgentEnvironment</code> 的。</p>
+<p>工具执行时拿到的是<b>pod 层</b>对象：</p>
+<pre><code>result = tool.execute(params, {"env": self.dataset_env.env})   # env_actor._execute_tool_sync
+# Bash 工具内部：env.execute(command, cwd=..., timeout=...)
+# Write 工具内部：先写本地临时文件，再 env.copy_to(local_path, file_path)</code></pre>
+<p>这也是第二课说"工具必须和 pod 客户端在同一个进程"的具体原因：<code>copy_to</code> 读取的是<b>本进程所在机器上</b>的文件路径。</p>
+
+<h3 id="xa-3">3. pod 长什么样：main + sidecar</h3>
+<p>pod 的定义（manifest）由两段代码拼出来：mimoagent 的 <code>KubernetesEnvironment._build_pod_body</code> 生成单容器的基础定义，<code>SidecarKubernetesEnvironment._build_pod_body</code> 再往上追加 sidecar 容器和共享卷。最终大致是：</p>
+<pre><code>kind: Pod
+metadata: {name: mimoagent-3f9a..., labels: {exp: ga_train}}
+spec:
+  automountServiceAccountToken: false     # pod 里拿不到 k8s 凭据，模型没法反过来操作集群
+  hostNetwork: false                      # 有 sidecar 时强制关闭，否则固定端口会和同节点其他 pod 冲突
+  restartPolicy: OnFailure
+  volumes: [{name: workspace, emptyDir: {}}, {name: system-vol, emptyDir: {}}]
+  containers:
+  - name: main
+    image: &lt;DOCKER_REGISTRY&gt;/&lt;instance.docker_image&gt;
+    command: [/bin/bash, -lc], args: [/bin/bash, -lc], stdin: true, tty: true   # 只是保持容器不退出
+    resources: {requests: {cpu: "2", memory: 8Gi}, ...}
+    volumeMounts: [{name: workspace, mountPath: /work/workspace}]               # 只能看到工作区
+  - name: sidecar
+    image: 同上
+    command: [sleep, infinity]
+    volumeMounts:
+    - {name: workspace,  mountPath: /work/workspace, readOnly: true}           # 只读看工作区（打分用）
+    - {name: system-vol, mountPath: /work/system}                               # 数据库状态，只有这里能看到</code></pre>
+<p>两个容器都只是"空转等待"，pod 里没有任何程序主动做事。所有动作都是 env_actor 通过 exec 发进去的命令。</p>
+<table>
+  <tr><th></th><th><code>main</code></th><th><code>sidecar</code></th></tr>
+  <tr><td>谁在用</td><td>模型的工具调用（Bash/Read/Write…）默认都发到这里</td><td>MCP 服务、verifier、答案文件</td></tr>
+  <tr><td>能看到的文件</td><td>只有 <code>/work/workspace</code>（读写）</td><td><code>/work/workspace</code>（只读）、<code>/work/system</code>（数据库）、<code>/work/tools</code></td></tr>
+  <tr><td>网络</td><td colspan="2">同一个 pod 共享网络空间，main 里的程序用 <code>127.0.0.1:39101</code> 就能访问 sidecar 里的 MCP 服务</td></tr>
+</table>
+<div class="box key"><b>隔离是"物理上的"</b>：main 容器根本没有挂载 <code>/work/system</code>，模型无论执行什么命令，都不可能绕过 MCP 工具直接改数据库。标准答案（<code>answer_key.json</code> 等）要等到<b>打分时</b>才上传，而且只传到 sidecar。打分时 verifier 再从数据库的最终状态判断任务有没有完成。</div>
+
+<h4>多容器时，命令怎么发到指定容器</h4>
+<p>k8s 的 exec 接口规定：pod 里有多个容器时，必须指明 <code>container=</code>，否则 API server 返回 400。但 mimoagent 原版的 <code>execute</code>/<code>copy_to</code> 发 exec 请求时不带这个参数。MiMo 没有去改写那约 500 行代码，而是用了一个"代理加线程局部变量"的办法：</p>
+<span class="src">recipes/general/general_agent/k8s_sidecar.py</span>
+<pre><code>_ROUTE = threading.local()          # 每个线程各自一份的"当前目标容器"
+
+class _ContainerRoutingCoreV1Api:   # 包住真正的 k8s 客户端，其他方法原样转发
+    def connect_get_namespaced_pod_exec(self, *args, **kwargs):
+        if "container" not in kwargs and getattr(_ROUTE, "container", None):
+            kwargs["container"] = _ROUTE.container          # 只在发 exec 请求时补上目标容器
+        return self._inner.connect_get_namespaced_pod_exec(*args, **kwargs)
+
+def execute(self, command, cwd="", timeout=None, container=None):
+    with self._route(container):         # 设置 _ROUTE.container：没指定就默认 "main"
+        return super().execute(command, cwd, timeout)       # 调用原版代码，不做任何修改</code></pre>
+<p><b>为什么必须用"线程局部"变量，而不能直接存在对象上？</b>因为 mimoagent 会用最多 8 个线程并行执行工具调用（<code>tool_parallel_workers=8</code>）。这些调用经 Ray 到达 env_actor 后，每个都由 <code>asyncio.to_thread</code> 放到一个单独的线程里执行，<b>共用同一个环境对象</b>。如果把目标容器存在对象上，线程 A 刚设成 sidecar，线程 B 就可能读到这个值，把命令发错容器。线程局部变量让每个线程各用各的。</p>
+
+<h3 id="xa-4">4. 建 pod：setup 的完整时序</h3>
+<pre><code>GeneralAgentLoop.run()  [AgentLoopWorker 的 L]
+ │ DatasetEnvActor.options(num_cpus=0.125, scheduling_strategy="SPREAD").remote(instance, ...)
+ │ await asyncio.wait_for(env_actor.setup.remote(), timeout=ENV_SETUP_TIMEOUT=3600)
+ ▼
+DatasetEnvActor.setup()  最多尝试 2 次，失败时先 cleanup 再重试
+ └ await asyncio.to_thread(self._create)     # 在线程里做阻塞操作，actor 仍能响应其他请求（比如 cleanup）
+    ├ register_general_agent_env()
+    ├ make_dataset_env(instance, **env_kwargs)
+    │    → detect_dataset_type → "general_agent" → GeneralAgentEnvironment
+    │    → resolve_docker_image(instance, image_prefix)   # 镜像 = 仓库前缀 + instance.docker_image
+    │    → SidecarKubernetesEnvironment(**env_kwargs)     # 构造时就校验 sidecar 和卷的配置
+    ├ dataset_env.setup_environment()
+    │    ├ env.start()
+    │    │   ├ _setup_kubernetes_client()                # 每个环境一份独立客户端；包上容器路由代理
+    │    │   └ _start_pod()
+    │    │       ├ pod_name = "mimoagent-" + 16位随机hex
+    │    │       ├ 随机等待 0~10 秒                       # 几百个 pod 同时创建时，错开对 API server 的冲击
+    │    │       ├ create_namespaced_pod(...)             # 遇到 429/5xx 等错误按指数退避重试，最多 10 次
+    │    │       └ _wait_for_pod_ready(timeout=1200)      # 每 4 秒左右查一次，直到 Running 且所有容器 ready
+    │    └ _setup_dataset_specific()
+    │        ├ 按 manifest 上传：workspace/ → main:/work/workspace
+    │        │                   system/、tools/、MCP 启动脚本 → sidecar
+    │        │                   mcp_bridge.py → main:/work/_setup/
+    │        ├ (可选) 权限隔离：建低权限用户，MCP 地址对 agent 隐藏
+    │        └ 在 sidecar 里执行 sidecar_entrypoint.py --start-and-detach   # 启动 MCP 服务
+    ├ 若有 MCP：discover_mcp_tools() → 通过 main 里的 bridge 列出工具 → 注册成 mcp__&lt;server&gt;__&lt;fn&gt;
+    └ _ensure_bridge_in_sidecar()                # verifier 打分时也要用 bridge
+ ▼
+返回 (True, None) → GeneralAgentLoop 接着调用 env_actor.describe.remote() 拿工具定义和 cwd</code></pre>
+<p>几个容易忽略的细节：</p>
+<ul>
+  <li><b>"ready" 只代表进程起来了，不代表端口已经在监听。</b>所以 sidecar 版的 <code>_container_ready</code> 要求<b>所有</b>容器都 ready（原版只看 main），打分前还会用 <code>_liveness_ok</code> 读 <code>/proc/net/tcp</code> 确认 MCP 端口确实在监听。</li>
+  <li><b>上传的源文件必须在 env_actor 所在机器上能读到。</b><code>env_task_dir</code> 必须放在所有 Ray 节点都能访问的共享文件系统上（<code>environment.py</code> 的 docstring 有说明），因为 env_actor 可能被调度到任何一台机器。</li>
+  <li><b>时间预算</b>：<code>ENV_SETUP_TIMEOUT=3600</code> 秒是从 GeneralAgentLoop 这一侧计时的总时限，包括排队、拉镜像、上传、启动 MCP。超时就返回 <code>_failure_output(error_category="setup/failed")</code>，奖励记为 -999。</li>
+</ul>
+
+<h3 id="xa-5">5. 一次工具调用怎么到达 pod</h3>
+<p>以模型调用 <code>Bash(command="ls")</code> 为例，跨了 4 个进程/机器：</p>
+<pre><code>① AgentLoopWorker，线程 P
+   _RemoteToolAgent.execute_action({"tool": "Bash", "params": {"command": "ls"}})
+   → ray.get(env_actor.execute_tool.remote("Bash", {"command": "ls"}))     # 阻塞等待
+② DatasetEnvActor（async actor，可以同时处理多个请求）
+   execute_tool → await asyncio.to_thread(_execute_tool_sync, ...)
+   → tool = tool_registry.get("Bash"); tool.execute(params, {"env": dataset_env.env})
+   → env.execute("ls", cwd="/work/workspace", timeout=60)       # s3k.yaml 里 Bash 的 timeout: 60
+③ SidecarKubernetesEnvironment.execute → 设置 _ROUTE.container="main" → KubernetesEnvironment.execute
+   exec_argv = ["timeout", "60", "/bin/bash", "-lc", "cd /work/workspace &amp;&amp; ls"]
+   resp = stream(v1_api.connect_get_namespaced_pod_exec, pod_name, namespace,
+                 command=exec_argv, container="main", stdout=True, stderr=True, ...)
+   ── WebSocket ──▶ API server ──▶ kubelet ──▶ main 容器里执行 ──▶ 输出沿原路流回
+   单独起一个读取线程不断收 stdout/stderr，直到命令结束或到达截止时间（timeout + 5 秒）
+④ 返回 {"output": "README.md\nsrc\n", "returncode": 0, "reason": "ok"}
+   → Bash 工具包装成 ToolOutput → env_actor 返回 {"kind": "ok", "result": {...}}
+   → 回到 ①，mimoagent 把结果作为 tool 消息加入 messages</code></pre>
+<p><code>execute</code> 的返回值里，<code>reason</code> 字段区分了四种情况，决定这次调用算"模型的问题"还是"基础设施的问题"：</p>
+<table>
+  <tr><th>reason</th><th>含义</th><th>后续处理</th></tr>
+  <tr><td><code>ok</code></td><td>命令正常结束（返回码可以不是 0）</td><td>输出原样交给模型</td></tr>
+  <tr><td><code>pod_timeout</code></td><td>pod 里的 <code>timeout</code> 命令杀掉了进程（返回码 124）</td><td>给模型看"超时"提示，属于模型自己的问题（比如命令太慢）</td></tr>
+  <tr><td><code>client_timeout</code></td><td>客户端等到截止时间还没结束</td><td>同上</td></tr>
+  <tr><td><code>transport_error</code></td><td>exec 通道打不开，或者断开时没有拿到返回码</td><td>s3k.yaml 设置了 <code>raise_on_transport_error: true</code>，会直接抛出 <code>TransportError</code> → 见第 8 节</td></tr>
+</table>
+
+<h4>传文件：tar 打包后通过 exec 的标准输入发送</h4>
+<p><code>copy_to</code> 在本地把文件打成 tar 包放在内存里，然后对 pod 执行 <code>mkdir -p 目标目录 &amp;&amp; head -c &lt;字节数&gt; | tar xmf - -C 目标目录</code>，并把 tar 包通过 exec 的标准输入发过去。<code>head -c</code> 的作用是：读满指定的字节数就结束输入。因为 WebSocket 没办法真正"关闭"标准输入，部分精简镜像（BusyBox）里的 tar 会一直等更多输入，永远不退出。超过阈值的大文件会改为分块传输（<code>copy_file_chunked</code>）。</p>
+<p>Write 工具正是用这个方法写文件：文件内容<b>从不出现在命令行里</b>，所以不会有引号转义的问题，也不会受命令行长度限制。</p>
+
+<h4>MCP 工具：借 main 容器转一次</h4>
+<p>env_actor 访问不到 pod 内部的 127.0.0.1，所以 <code>mcp__crm__search</code> 这类工具（<code>recipes/general/mcp_proxy.py</code> 的 <code>McpProxyTool</code>）的做法是：在 main 容器里执行一次性命令 <code>python mcp_bridge.py --call ...</code>，由这个 bridge 去访问 <code>127.0.0.1:39101</code> 上的 sidecar MCP 服务，再把结果以 <code>__MCP_ONESHOT__{json}</code> 的形式打印出来，由 env_actor 从输出里解析出结果。模型只能看到工具定义和调用结果，MCP 服务的地址只出现在框架自己拼出来的命令行里。</p>
+
+<h3 id="xa-6">6. 打分：在 sidecar 里跑 verifier</h3>
+<p><code>agent.run()</code> 结束后，GeneralAgentLoop 调用 <code>env_actor.calculate_reward.remote()</code>，最终执行到 <code>GeneralAgentEnvironment._do_calculate_reward</code>：</p>
+<pre><code>1. 检查评审模型的密钥 GA_JUDGE_KEY             缺失 → reward/testbed_corrupted
+2. 读 /proc/net/tcp 检查每个 MCP 端口还在监听       已挂 → testbed_corrupted, dead_port
+3. 上传 verifier 文件到 sidecar                    run_verify.py、rubrics.json、answer_key.json ...（这时才上传答案）
+4. 会话日志 main → env_actor 本地 → sidecar       经 env_actor 中转两次，不用共享卷，避免污染被评分的工作区
+5. 把 agent 最后一条回复写成 workspace/answer.md   经 main 写入（sidecar 对工作区只读）；agent 自己写了就不覆盖
+6. 在 sidecar 执行 python3 /work/run_verify.py     规则检查 + LLM 评审（GA_JUDGE_*），默认超时 900 秒
+7. cat /logs/verifier/reward.json                 解析失败或不在 [0,1] 范围内 → testbed_corrupted
+8. 回到 env_actor：REWARD_BINARIZE=true 时，≥ 阈值(1.0) 记 1，否则记 0；原始分数存进 reward_continuous</code></pre>
+<p>可以看到，打分也完全是"env_actor 往 pod 里发命令、再读结果文件"这一个模式。被评分的是<b>任务结束时数据库和工作区的最终状态</b>，而不是模型说了什么，这样模型很难靠嘴上说"我做完了"来骗分。</p>
+
+<h3 id="xa-7">7. 清理：删 pod、杀 actor</h3>
+<span class="src">recipes/general/agent_loop.py run() 的 finally</span>
+<pre><code>finally:
+    model.stopped = True
+    await env_actor.cleanup.remote()          # → dataset_env.cleanup() → KubernetesEnvironment.cleanup()
+    ray.kill(env_actor, no_restart=True)</code></pre>
+<p><code>KubernetesEnvironment.cleanup()</code> 的做法：先关掉执行命令用的客户端连接（里面可能残留半开的连接），再<b>新建一个客户端</b>专门用来删除：第一次用 Foreground 方式删除，之后改用 Background；每次删除后最多轮询 15 秒，直到查询返回 404，最多尝试 5 次。新客户端用的是这个环境自己的集群配置，而不是全局默认配置，否则可能去另一个集群删除，返回 404 后被误判为"已经删掉了"，真正的 pod 就泄漏了。</p>
+<div class="box note"><b>如果训练进程整个崩溃了</b>：<code>finally</code> 来不及执行，pod 会残留在集群里。所有 pod 都带有 <code>exp=$EXP_NAME</code> 标签，可以按标签批量清理，例如 <code>kubectl delete pods -l exp=ga_train -n &lt;namespace&gt;</code>。</div>
+
+<h3 id="xa-8">8. 故障怎么分类（含一个疑似 bug）</h3>
+<p>RL 训练要区分两类失败：<b>模型做错了</b>（应该给 0 分，让模型学习）和<b>基础设施坏了</b>（应该给 -999，让这条样本不参与训练，第一课 §1 讲过）。下面是 pod 相关故障的分类：</p>
+<table>
+  <tr><th>发生在哪个阶段</th><th>故障</th><th>处理路径</th><th>error_category</th><th>最终奖励</th></tr>
+  <tr><td>setup</td><td>pod 创建失败、一直不 ready、上传或启动 MCP 失败</td><td><code>setup()</code> 返回 False → <code>_failure_output</code></td><td><code>setup/failed</code></td><td>-999</td></tr>
+  <tr><td>setup</td><td>超过 3600 秒</td><td><code>wait_for</code> 超时 → <code>_failure_output</code></td><td><code>setup/failed</code></td><td>-999</td></tr>
+  <tr><td>rollout</td><td>命令超时</td><td>reason=pod_timeout，作为普通输出给模型</td><td>—</td><td>正常打分</td></tr>
+  <tr><td>rollout</td><td>exec 通道打不开</td><td>env_actor 先重试 3 次（每次等 2s、4s）</td><td>—</td><td>重试成功则正常</td></tr>
+  <tr><td>rollout</td><td>exec 通道持续失败或中途断开</td><td><code>TransportError</code> → <code>_infra_error</code> 记下 → 返回 <code>KIND_TRANSPORT_ERROR</code> → agent 侧抛 <code>InfraError</code> 终止循环 → 打分时跳过 verifier</td><td><code>rollout/pod_conn_timeout: &lt;错误信息&gt;</code></td><td><b>应为 -999，实际是 0（见下）</b></td></tr>
+  <tr><td>rollout</td><td>env_actor 进程挂了</td><td><code>RayError</code> → <code>InfraError</code>；之后打分调用本身也会失败</td><td>—</td><td>run() 抛异常，这一组标为 failure</td></tr>
+  <tr><td>reward</td><td>打分时 exec 断开、MCP 端口已挂、reward.json 有问题、缺评审密钥</td><td>返回带 error_category 的结果</td><td><code>reward/testbed_corrupted</code></td><td>-999</td></tr>
+  <tr><td>整条轨迹</td><td>超过 <code>TRAJECTORY_TIMEOUT=1200</code> 秒</td><td><code>_failure_output</code></td><td><code>rollout/seq_timeout</code></td><td>-999</td></tr>
+</table>
+
+<div class="box warn" id="xa-bug"><b>疑似 bug：rollout 中途 pod 连接断开，被当成了"模型做错"</b>（只读代码得出的结论，没有实际运行验证）
+<p><code>recipes/general/env_actor.py:282</code> 记录的是带错误信息的完整字符串：</p>
+<pre><code>self._infra_error = f"rollout/pod_conn_timeout: {e}"
+...
+# calculate_reward（第 303-309 行）
+return (0.0, f"infra: {self._infra_error}",
+        {"error_category": self._infra_error, "infra_error": self._infra_error})</code></pre>
+<p>而 <code>recipes/general/agent_loop.py</code> 判断是否属于基础设施错误时，用的是<b>精确匹配</b>：</p>
+<pre><code>if self.invalid_reward_for_infra and reward_extra.get("error_category") in _INFRA_ERROR_CATEGORIES:
+    reward = INVALID_REWARD_VALUE      # _INFRA_ERROR_CATEGORIES 里是不带后缀的 "rollout/pod_conn_timeout"</code></pre>
+<p><code>"rollout/pod_conn_timeout: Error opening exec stream..."</code> 不在这个集合里，所以奖励保持 <b>0.0</b>，这条样本被当成"模型答错了"参与训练，这和 <code>_INFRA_ERROR_CATEGORIES</code> 旁边的注释（"exec stream broke mid-trajectory"）表达的意图相反。<code>recipes/arvo/env_actor.py:220</code> 有同样的写法；而 <code>recipes/design/env_actor.py:272</code> 已经改成了返回不带后缀的 <code>"rollout/pod_conn_timeout"</code>，错误信息单独放在 <code>infra_error</code> 字段里。General 和 arvo 按 design 的写法改即可。</p>
+<p>影响：集群不稳定时，一部分"pod 断连"的轨迹会被记为 0 分。在 GRPO 里这会拉低同组其他样本的基线，并向模型传递"这样做不好"的错误信号，尽管失败与模型的行为无关。</p></div>
+
+<h3 id="xa-9">9. 思考题</h3>
+<details><summary>Q1：一个 pod 要 2 核 CPU、8G 内存，env_actor 却只申请了 0.125 个 CPU，为什么？</summary>
+<p>两者占用的是不同集群的资源。pod 的 CPU 和内存由 k8s 集群提供，命令真正在那里执行。env_actor 只是一个"遥控器"，大部分时间在等网络返回，CPU 消耗很低。申请 0.125 个 CPU 是 Ray 调度用的"记账值"：同时跑 512 条轨迹（64 个 prompt × 8）时，只需要 64 个逻辑 CPU，不会因为 Ray 认为 CPU 不够而让 env_actor 排队。<code>SPREAD</code> 则让这些 actor 分散到各个节点上，避免集中在某一台机器上。</p></details>
+<details><summary>Q2：为什么 env_actor 的 <code>setup</code>、<code>execute_tool</code>、<code>cleanup</code> 都写成 <code>async def</code>，内部再用 <code>asyncio.to_thread</code>？</summary>
+<p>Ray 的 actor 默认一次只处理一个请求。写成 async 方法后，它变成"异步 actor"，可以同时处理多个请求；而 k8s 操作都是阻塞的，所以要用 <code>to_thread</code> 放到线程里执行，避免卡住 actor 自己的事件循环。效果是：并行的工具调用能同时执行；建 pod 时间很长时，外面发来的 <code>cleanup</code> 也能及时得到处理（<code>setup</code> 的 docstring 专门提到了这一点）。这和第三课（上）"在事件循环上不能阻塞"是同一个道理，也正是第 3 节需要线程局部变量的原因。</p></details>
+<details><summary>Q3：如果把 sidecar 的 <code>/work/workspace</code> 改成读写挂载，会有什么风险？</summary>
+<p>verifier 在 sidecar 里运行，打分前还会往里拷文件。如果 sidecar 可以写工作区，打分过程就可能改动被评分的状态，或者在工作区里留下文件，这些文件之后可能被其他步骤读到。设成只读，等于强制规定"打分只能读、不能改"。也正因为如此，<code>answer.md</code> 必须经 main 容器写入（第 6 节第 5 步）。</p></details>
+
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="02-agent-loop-init.html">相关：第二课 ④</a><a href="03b-harness-execution.html">相关：第三课（下）</a></div>
+</main>
+</body>
+</html>

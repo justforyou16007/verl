@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插课 B：Code 环境与 uni-agent 网关 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>插课 B：Code 环境与 uni-agent 网关</h2>
+  <ol>
+    <li><a href="#xb-0">0. 和 General 的根本区别</a></li>
+    <li><a href="#xb-1">1. 替换点：agent_loop_manager_class</a></li>
+    <li><a href="#xb-2">2. 三层结构与进程分布</a></li>
+    <li><a href="#xb-3">3. 一个 session 的生命周期</a></li>
+    <li><a href="#xb-4">4. 网关一次请求做了什么</a></li>
+    <li><a href="#xb-5">5. 链匹配：增量续接的判定</a></li>
+    <li><a href="#xb-6">6. 回退：重写最后一个 assistant</a></li>
+    <li><a href="#xb-7">7. 一个 session 为什么会产出多条轨迹</a></li>
+    <li><a href="#xb-8">8. runner：mimoagent 跑在哪、奖励怎么回传</a></li>
+    <li><a href="#xb-9">9. 四种 harness 混合训练</a></li>
+    <li><a href="#xb-10">10. 写入 TransferQueue 与两道超时</a></li>
+    <li><a href="#xb-11">11. 两条路的对比表</a></li>
+    <li><a href="#xb-12">12. 思考题</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="04-actor-update.html">← 第四课：从奖励到 actor 更新</a></div>
+
+<h2 id="xb">插课 B：Code 环境与 uni-agent 网关</h2>
+<div class="box ask"><b>提问</b>：学习下 uni-agent 那条分支。</div>
+
+<h3 id="xb-0">0. 和 General 的根本区别</h3>
+<p>前面四课讲的 General 环境，是在 verl 的 AgentLoop 内部直接调用 mimoagent，替换掉它的"调模型"和"执行工具"两个点（第二课 §5）。Code 环境走的是另一条路：<b>mimoagent 完全不被修改，连模型对象都是原装的</b>；它照常发 HTTP 请求，只是请求发给了 uni-agent 的网关，由网关负责把文本翻译成 token、调推理服务、把 token 记下来。</p>
+<table>
+  <tr><th></th><th>General（前四课）</th><th>Code（本课）</th></tr>
+  <tr><td>谁管 rollout</td><td>verl 的 <code>AgentLoopManagerTQ</code></td><td><b>换成</b> uni-agent 的 <code>AgentFrameworkRolloutAdapter</code></td></tr>
+  <tr><td>mimoagent 的模型对象</td><td>替换成 <code>_VerlRolloutModel</code>（直接调推理服务）</td><td>原装 <code>get_model()</code>，发标准 HTTP 请求</td></tr>
+  <tr><td>消息 → token</td><td>recipe 自己做（<code>TokenTrace</code> + 锚点渲染）</td><td>网关做（<code>MessageCodec</code> + 链匹配）</td></tr>
+  <tr><td>工具在哪执行</td><td>转发到 <code>DatasetEnvActor</code>（和 pod 客户端同进程）</td><td>mimoagent 自己执行，不转发</td></tr>
+  <tr><td>一条轨迹的产出</td><td>必然 1 条</td><td>可能多条（见 §7）</td></tr>
+  <tr><td>工具调用错误惩罚</td><td>缺少每轮 token 区间，做不到（第三课下 §9）</td><td>网关记了 <code>generation_spans</code>，可以做</td></tr>
+</table>
+<div class="box key"><b>一句话概括</b>：General 是"把 verl 嵌进 mimoagent"，Code 是"在 mimoagent 和 verl 之间插一个假装是 OpenAI 服务的网关"。后者的好处是 harness 完全不用改，所以能同时训练四种不同的 harness（§9），甚至能接真正的 Claude Code CLI（白盒/黑盒问答里提到的那条路）。</div>
+
+<h3 id="xb-1">1. 替换点：agent_loop_manager_class</h3>
+<p>第一课 §2 讲过 <code>TaskRunnerV1.init_agent_loop_manager</code> 有一个扩展点：</p>
+<span class="src">verl/trainer/main_ppo.py</span>
+<pre><code>manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+if manager_class_fqn:
+    agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+else:
+    agent_loop_manager_cls = AgentLoopManagerTQ            # General 走这里
+self.agent_loop_manager = agent_loop_manager_cls.create(
+    config=self.config, llm_client=self.trainer.get_llm_client(), ...)</code></pre>
+<p>Code 的配置填上了这个字段：</p>
+<span class="src">recipes/code/config/train.yaml</span>
+<pre><code>actor_rollout_ref.rollout:
+  agent:
+    agent_loop_manager_class: uni_agent.framework.entry.AgentFrameworkRolloutAdapter   # ← 替换点
+  custom:
+    agent_framework:
+      gateway_count: 1                      # 启动几个网关进程（run_train.sh 默认 8）
+      mask_unfinished_episode: false         # 没跑完的 session 是否整条不参与训练
+      ship_turn_index: false                 # 是否输出每个 token 属于第几轮（deep_failure_mask 要用）
+      agent_runners:
+        mimoagent:
+          runner_fqn: recipes.code.mimoagent_runner.mimoagent_runner   # ← 真正跑 harness 的函数
+          dispatch_mode: ray_task            # runner 作为 Ray task 运行
+          max_concurrent_sessions: 8         # 同时最多几个 session（run_train.sh 默认 512）
+          trajectory_selection: longest      # 一个 session 产出多条时只留最长的
+          session_timeout_seconds: 7200
+          agent_request_idle_timeout_seconds: 720
+data:
+  custom_cls: {path: pkg://recipes.code.dataset, name: MimoAgentSWEDataset}</code></pre>
+<p>只要满足 <code>create()</code> 和 <code>generate_sequences()</code> 这两个方法的约定，trainer 那一侧（第一课的 <code>fit</code> / <code>step</code>、第四课的优势和更新）<b>完全不用改</b>。这就是第一课说的"verl 只要求管理器把结果放进 TransferQueue"。</p>
+
+<h3 id="xb-2">2. 三层结构与进程分布</h3>
+<pre><code>┌─ Ray driver（TaskRunnerV1 所在进程）────────────────────────────────────┐
+│  AgentFrameworkRolloutAdapter                                            │
+│   ├ GatewayManager          ← driver 持有，所以网关比 framework 活得久     │
+│   └ AgentFrameworkWorker.remote(...)                                     │
+└──────────┬───────────────────────────────┬───────────────────────────────┘
+           │                               │
+┌──────────▼────────────────┐   ┌──────────▼──────────────────────────────┐
+│ AgentFrameworkWorker       │   │ GatewayActor × gateway_count（默认 8）  │
+│ （1 个 Ray actor）         │   │  每个是一个 FastAPI 服务（uvicorn）      │
+│  OpenAICompatibleAgent-    │   │  路由：                                  │
+│  Framework                 │   │   POST /sessions/{id}/v1/chat/completions│
+│   ├ 批 → prompt → session  │   │   POST /sessions/{id}/v1/messages        │
+│   ├ 拉起 runner Ray task   │   │   POST /sessions/{id}/v1/responses       │
+│   ├ finalize → 打分        │   │   POST /sessions/{id}/reward_info        │
+│   └ 写 TransferQueue       │   │  每个 session 一个 GatewaySession 对象   │
+└──────────┬─────────────────┘   │   ├ active_chains（多条链）              │
+           │ ray task            │   ├ MessageCodec（tokenizer/模板/解析器）│
+           ▼                     │   └ 调 LLMServerClient → SGLang          │
+┌──────────────────────────────┐ └──────────────────────────────────────────┘
+│ _run_agent_runner_ray_task    │            ▲ HTTP
+│ （每个 session 一个 Ray task，│            │
+│   num_cpus=0.5）              │            │
+│  mimoagent_runner()           │            │
+│   └ asyncio.to_thread(_run_sync)           │
+│       ├ make_dataset_env → 起容器          │
+│       ├ get_model(base_url=网关地址) ──────┘
+│       ├ agent.run(task)  ← 原装 mimoagent 循环
+│       └ environment.calculate_reward()
+│       └ POST reward_info 回网关
+└──────────────────────────────────────────────────────────────────────────┘</code></pre>
+<p>三层各自的职责边界很清楚，<code>framework.py</code> 的注释反复强调：</p>
+<ul>
+  <li><b>GatewayActor</b>：唯一掌握"token 真相"的地方。它知道每次生成对应哪些 token、logprob 是多少、哪些 token 是模型生成的。</li>
+  <li><b>runner（Ray task）</b>：只负责跑 harness。注释写"Gateway token truth, finalization, reward scoring, and TQ writes stay in parent"——token 记账、session 收尾、打分、写 TransferQueue 都不在 runner 里做。</li>
+  <li><b>framework</b>：调度和汇总。它拉起 runner、等它结束、向网关要轨迹、打分、写 TransferQueue。</li>
+</ul>
+<p>网关为什么要由 driver 持有（<code>gateway_manager</code> 建在 <code>create()</code> 里而不是 worker 里）？注释说"so the gateway actors outlive the framework worker"：framework worker 挂掉重建时，网关进程不受影响。</p>
+
+<h3 id="xb-3">3. 一个 session 的生命周期</h3>
+<p>Code 这边的"session"对应 General 的"一条轨迹"：一个 prompt 的第 i 次采样。<code>generate_sequences</code> 的层次是三层展开：</p>
+<pre><code>generate_sequences(prompts)                      ← trainer 调用，不等结果
+ └ _run_batch_to_tq                              批层：一个 prompt 一个任务，并发
+    └ _run_prompt_sessions_to_tq（每个 uid）      prompt 层：n 个 session 并发
+       └ _run_session_with_concurrency_limit      受 max_concurrent_sessions 限制
+          └ _run_session                          ← 单个 session 的完整流程
+             ① session = gateway_manager.create_session(session_id, sampling_params)
+             ②   → 返回 SessionHandle{session_id, base_url, reward_info_url}
+             ③ _run_agent_runner_ray_task.remote(runner_fqn, session, tools_kwargs, ...)
+             ④ await _wait_for_runner_task(...)   两道超时，见 §10
+             ⑤ trajectories = gateway_manager.finalize_session(session_id)
+             ⑥ _select_session_trajectories(..., "longest")
+             ⑦ 打分：优先用 runner POST 的 reward_info，否则用 reward worker
+             ⑧ _annotate_repetition（重复检测）
+             ⑨ 返回给 prompt 层 → _write_session_trajectories_to_tq</code></pre>
+<p>每一层都用 <code>asyncio.gather(..., return_exceptions=True)</code>，<b>一个 session 失败只影响它自己</b>：prompt 层统计失败数，只要这个 uid 还有至少一个成功的 session，就把 tag 标成 <code>finished</code>，否则标 <code>failure</code>（第一课 §4 的 replay_buffer 轮询的就是这个）。整批全失败时才抛异常。</p>
+<p><code>SessionHandle</code> 是交给 runner 的"地址本"，只有三个字段：</p>
+<pre><code>SessionHandle(
+  session_id   = "session-sample-3-rollout-5-a1b2c3...",
+  base_url     = "http://&lt;网关IP&gt;:&lt;端口&gt;/sessions/&lt;session_id&gt;/v1",      # 给 mimoagent 当 OpenAI 服务地址
+  reward_info_url = "http://&lt;网关IP&gt;:&lt;端口&gt;/sessions/&lt;session_id&gt;/reward_info")  # 回传奖励</code></pre>
+<p>注意 base_url 里带了 session_id：<b>每个 session 有自己的一个 URL</b>，网关靠 URL 路径就知道这次请求属于哪条轨迹，不需要 mimoagent 配合传任何标识。</p>
+
+<h3 id="xb-4">4. 网关一次请求做了什么</h3>
+<p>mimoagent 的模型对象照常发一个标准的 chat completions 请求，网关收到后（<code>GatewaySession.run_generation</code>）：</p>
+<pre><code>① 适配器把不同协议的请求统一成内部格式
+   openai_to_internal / anthropic_to_internal / responses_to_internal
+   → {"messages": [...], "tools": [...], "sampling_params": {...}}
+② 加锁，准备输入（_prepare_generation_inputs）
+   ├ 给每条消息算前缀哈希
+   ├ _select_chain：这次请求能不能接到某条已有的链上？（§5）
+   ├ 能接 → 复制那条链的缓冲区，只把新增消息编码成 token，mask 记 0
+   │  不能接 → 整段重新编码，作为一条新链的 prompt_ids
+   └ 检查容量：超过 response_length 就返回空回复、finish_reason="length"
+③ 解锁，调推理服务（锁外执行，所以同一 session 的多个请求可以并发）
+   output = await backend.generate(request_id=session_id, prompt_ids=encoded.context_ids, ...)
+④ 重新加锁，记账
+   buffer.response_ids.extend(生成的 token)
+   buffer.response_mask.extend([1] * 生成长度)            ← 模型生成的记 1
+   buffer.generation_spans.append((起点, 终点))            ← 这一轮生成在 response 里的位置
+   buffer.response_logprobs.extend(logprobs)
+   buffer.generation_versions.append((min_global_steps, max_global_steps))   ← 这一轮用的权重版本
+⑤ 解码成文本、解析工具调用，提交到链上
+⑥ 按 OpenAI 格式返回给 mimoagent</code></pre>
+<p>对比第三课（下）的 <code>TokenTrace</code>，这里的 <code>TrajectoryBuffer</code> 多记了两样东西：</p>
+<table>
+  <tr><th>字段</th><th>作用</th></tr>
+  <tr><td><code>generation_spans</code></td><td>每一轮生成的 <code>(起点, 终点)</code>。<b>这正是 General 缺的那块</b>，有了它才能把"第 k 轮工具调用出错"展开成 token 级的 <code>tool_call_error_mask</code>（第四课 §5）</td></tr>
+  <tr><td><code>generation_versions</code></td><td>每一轮用的权重版本区间。收尾时取最小和最大，得到整条轨迹的 <code>min/max_global_steps</code>，供异步训练判断数据新鲜度</td></tr>
+</table>
+<p>注释特别说明第 ③ 步为什么要放在锁外：同一个 session 的多个请求可以重叠执行，按推理服务返回的顺序提交。所以 mimoagent 并行发多个请求也不会被串行化。</p>
+
+<h3 id="xb-5">5. 链匹配：增量续接的判定</h3>
+<p>这是整个网关最核心的机制。问题是：网关收到一次请求，只有一个消息列表，它怎么知道这是"上一轮的继续"还是"一段全新的对话"？</p>
+<h4>5.1 前缀哈希</h4>
+<span class="src">uni_agent/gateway/session/session.py _extend_message_prefix_hashes</span>
+<pre><code>for message in new_messages:
+    message_hash = self._compute_message_hash(message)              # 单条消息规范化后的哈希
+    prefix_hash = sha256(b"uni-agent-prefix-v1\0" + 上一个前缀哈希 + b"\0" + message_hash)
+    prefix_hashes.append(prefix_hash)</code></pre>
+<p>这是一条哈希链：<code>prefix_hashes[i]</code> 代表"前 i+1 条消息合在一起"的指纹。比较两段对话是否有相同前缀，只要比较对应位置的前缀哈希即可，不用逐条比对内容。</p>
+<p><code>_compute_message_hash</code> 先调 <code>codec.canonicalize_message_for_prefix_comparison(message)</code> 做规范化，再算哈希。规范化很关键：同一条消息在两次请求里可能字段顺序不同、可选字段有无不同，不规范化就会误判成"不一样"。</p>
+<h4>5.2 匹配条件</h4>
+<p><code>_select_chain</code> 遍历所有活跃链，一条链要成为候选必须满足：</p>
+<ol>
+  <li><b>没有被占用</b>：<code>chain_id not in reserved_chain_ids</code>。一条链同一时刻只能被一个请求续写，否则两个请求会写乱同一个缓冲区。</li>
+  <li><b>工具列表完全相同</b>：<code>chain.active_tool_schemas == tools</code>。工具变了意味着 system prompt 里的工具定义也变了，之前的 token 不能复用。</li>
+  <li><b>新请求比链的"最后一个 assistant 起点"更长</b>：如果请求刚好停在那个边界上，说明这是"对同一个 prompt 再采一次"，而不是续写，应该开新链。</li>
+  <li><b>两者在那个位置的哈希一致</b>：确认确实是同一段历史。</li>
+  <li><b>整段前缀匹配</b>（<code>_is_chain_prefix_hash_match</code>）：链的完整历史是新请求的前缀。满足就是"精确续接"。</li>
+</ol>
+<p>多条链都满足时，按 <code>(历史长度, 是否精确匹配, 更新序号, chain_id)</code> 取最大，也就是<b>优先接到最长的那条链上</b>。</p>
+<h4>5.3 匹配成功和失败的区别</h4>
+<pre><code>匹配成功（增量）：
+  复制那条链的缓冲区 → 只编码新增的消息（通常就是一条 tool 消息）
+  buffer.response_ids += 新增 token，response_mask += [0] * 新增长度
+  → 之前所有 assistant 的 token 原样保留，和第三课（下）的做法一致
+
+匹配失败（新链）：
+  image_data, video_data = extract_multi_modal_data(messages)
+  prompt_ids = codec.encode_full(messages, tools=tools, ...)     ← 整段重新编码
+  buffer = TrajectoryBuffer(prompt_ids=prompt_ids)               ← 这些全算 prompt
+  chain_id = None                                                 ← 一条新链</code></pre>
+<div class="box warn"><b>匹配失败的代价</b>：整段历史被当成新的 prompt，之前那些"模型生成的 token"在新链里<b>全部变成 prompt</b>，<code>response_mask</code> 从零开始。它们还在旧链里保留着，收尾时旧链也会产出一条轨迹——这就是 §7 说的"一个 session 多条轨迹"。
+<p>什么情况会匹配失败？harness 压缩了上下文（把前面几轮总结成一条消息）、改写了历史、换了工具列表，或者<code>codec.supports_incremental()</code> 判定新增消息无法增量编码。这也解释了白盒/黑盒问答里的结论：黑盒 harness 更容易触发这种情况，因为它的上下文管理策略我们控制不了。</p></div>
+
+<h3 id="xb-6">6. 回退：重写最后一个 assistant</h3>
+<p>还有一种中间情况：新请求的前缀和某条链<b>只匹配到"最后一个 assistant 之前"</b>。意思是 harness 把上一轮的 assistant 回复丢掉了，想重新生成一次（比如解析失败后重试）。</p>
+<p>配置 <code>enable_last_assistant_rollback: true</code>（默认开）时，网关会把那条链回退到最后一个 assistant 开始的位置，再接着写：</p>
+<pre><code>rollback_dropped_trainable_tokens = sum(buffer.response_mask[回退点:])   # 统计丢掉了多少可训练 token
+del buffer.generation_versions[-1:]        # 一次生成对应一个版本标记，去掉最后一个
+del buffer.response_ids[回退点:]            # 砍掉被丢弃的 token
+del buffer.response_mask[回退点:]
+del buffer.response_logprobs[回退点:]
+kept_spans = [span for span in generation_spans if span.end &lt;= 回退点]   # 只留回退点之前的 span
+...
+buffer.generation_spans.extend([(墓碑位置, 墓碑位置)] * 被丢掉的 span 数)   # 用空 span 占位</code></pre>
+<p>那些"墓碑" span（起点等于终点的空区间）是为了<b>保持 span 的数量不变</b>。因为 harness 那边记的"每轮是否出错"列表长度是按轮数来的，<code>_tool_call_error_mask</code> 要求 <code>len(flags) == len(spans)</code>（第三课下 §9），对不上就整条不标记。用空 span 占位，数量就能继续对齐，而空区间本身标不到任何 token。</p>
+<p>注释里还有一处细节：回退时要把链末尾的 <code>turn_separator + generation_prompt</code> 也砍掉，并且断言"存储的轨迹必须以 assistant 前缀结尾"，否则抛错。这和第三课（下）§6 的 <code>turn_separator</code> 是同一个问题的两面——那边是补上，这边是砍掉。</p>
+
+<h3 id="xb-7">7. 一个 session 为什么会产出多条轨迹</h3>
+<p>收尾时（<code>finalize</code>）把所有活跃链都"物化"成轨迹：</p>
+<pre><code>def _materialize_active_chains(self):
+    for chain in self.active_chains:
+        self.materialized_chains.append(MaterializedChain(
+            trajectory=self._build_materialized_trajectory(chain=chain),
+            order_seq=chain.updated_seq))
+    self.active_chains = []</code></pre>
+<p>所以链有几条，轨迹就有几条。一次会话出现多条链的原因就是 §5 的匹配失败：每次失败都会开一条新链，旧链留在那里等收尾。</p>
+<p>框架不会把它们全部拿去训练。<code>trajectory_selection: longest</code> 时：</p>
+<span class="src">uni_agent/framework/framework.py _select_session_trajectories</span>
+<pre><code>index, trajectory = max(enumerate(trajectories),
+    key=lambda item: (sum(item[1].response_mask),      # 首先比：可训练 token 最多
+                      len(item[1].response_ids),        # 其次比：response 总长
+                      item[1].num_turns, item[0]))
+return [trajectory]                                      # 只留一条</code></pre>
+<p>也就是"留下模型生成内容最多的那一条"。配 <code>all</code> 则全部保留，这时 TransferQueue 的 key 里 <code>index</code> 就会是 0、1、2……这正是第一课讲 key 格式 <code>{uid}_{session_id}_{index}</code> 时提到的那个 index 的用处。第四课 §4.1 说的"只用每个 session 的最后一个输出参与 GRPO 比较，再把优势复制给其他输出"，针对的就是 <code>all</code> 这种情况。</p>
+
+<h3 id="xb-8">8. runner：mimoagent 跑在哪、奖励怎么回传</h3>
+<p><code>recipes/code/mimoagent_runner.py</code> 是这条路上唯一的 recipe 代码，只有 400 多行。它作为 Ray task 运行（<code>num_cpus=0.5</code>）：</p>
+<pre><code>async def mimoagent_runner(*, raw_prompt, session, sample_index, tools_kwargs, **kw):
+    instance = tools_kwargs["instance"]                      # 任务描述，由 MimoAgentSWEDataset 塞进来
+    config_path, selected_harness = _select_config_path(...)  # 选一个 harness（§9）
+    config = _load_config(config_path)
+    reward_info = await asyncio.to_thread(_run_sync, ...)     # 阻塞逻辑放到线程里
+    ...
+    await _post_reward_info_with_retry(session.reward_info_url, reward_info, ...)   # 奖励 POST 回网关</code></pre>
+<p><code>_run_sync</code> 里是完整的 mimoagent 原装流程：</p>
+<pre><code>environment = make_dataset_env(instance, **environment_config)   # 起容器（这里是 SWE-bench 镜像）
+environment.setup_environment()
+agent_type = config["agent"].pop("type", "default")              # "cc-agent" / "codex-agent" / ...
+model = _build_model(config, session.base_url, agent_type=agent_type)
+agent_cls = get_agent_class(agent_type)                          # ← 经过 mimoagent 的工厂！
+agent = agent_cls(model, environment.env, **agent_config)
+status, result = agent.run(task)                                 # 原装循环，一个字都没改
+reward, test_output, reward_extra_info = environment.calculate_reward()</code></pre>
+<div class="box note"><b>和 General 的勘误对照</b>：第二课的勘误说 General 不经过 <code>agents/factory.py</code>，所以 <code>type: cc-agent</code> 不生效。Code 这边<b>调的就是 <code>get_agent_class(agent_type)</code></b>，所以 <code>cc-agent</code> 真的是 <code>CCAgent</code>，antihack、子 agent、Compact 这些都正常工作。同一个配置字段在两条路上一个生效一个不生效，根源就在这里。</div>
+<p>模型对象怎么指向网关：</p>
+<pre><code>def _build_model(config, gateway_url, *, agent_type):
+    model_kwargs["base_url"] = gateway_url          # ← session 专属的 URL
+    model_kwargs["api_key"] = "not-needed"          # 网关不校验
+    if agent_type in _MODEL_BACKED_AGENT_TYPES:     # {"default","bashonly-agent","mimocode-agent","cc-agent","codex-agent"}
+        return get_model(config=model_config)       # 白盒：原装模型对象，走 HTTP
+    return SimpleNamespace(...)                      # 黑盒：空壳，只带连接信息（白盒/黑盒问答 §3）</code></pre>
+<p>奖励的回传路径和 General 完全不同。General 是 <code>calculate_reward</code> 的返回值直接进 <code>AgentLoopOutput.reward_score</code>；Code 是 runner 把奖励 <b>POST 到网关的 <code>reward_info_url</code></b>，网关存进 session，收尾时附在每条轨迹上（<code>reward_info=dict(self.reward_info)</code>），framework 再从里面取出来：</p>
+<pre><code>annotations = self._score_from_reward_info(session_trajectories)      # 优先用 runner POST 的
+reward_source = "reward_info" if annotations is not None else None
+if annotations is None and self.reward_loop_worker_handles:
+    annotations = await self._score_trajectories(...)                  # 退化到 reward worker
+if annotations is None:
+    logger.warning("session %s: no reward available; rm_scores=0")     # 都没有就 0 分</code></pre>
+<p>为什么要绕一圈 HTTP？因为 runner 在另一个 Ray task 里，而轨迹在网关里。奖励必须和轨迹汇合，让它们在网关会合是最简单的做法——runner 本来就在和网关通信。<code>recipes/code/reward.py</code> 里那个 <code>compute_score</code> 是兜底用的，正常流程不走它。</p>
+<p>还有一个状态通知：agent 跑完、开始打分之前，runner 会 POST <code>{"agent_finished": True}</code>。这是给 §10 的空闲超时用的——打分可能要几分钟，这段时间没有任何模型请求，不能被误判为卡死。</p>
+
+<h3 id="xb-9">9. 四种 harness 混合训练</h3>
+<p>Code 这条路最大的收益：同一次训练里混用四种 harness。<code>config/agent/code/mix-four-whitebox.yaml</code>：</p>
+<pre><code>harnesses:
+  - {label: mini-mimocode,     config: ./mini-mimocode.yaml}      # type: mimocode-agent
+  - {label: mini-bash,         config: ./mini-bash.yaml}          # type: bashonly-agent
+  - {label: mini-claude-code,  config: ./mini-claude-code.yaml}   # type: cc-agent
+  - {label: mini-codex,        config: ./mini-codex.yaml}         # type: codex-agent</code></pre>
+<p>每个 session 选哪一个，由 <code>_select_config_path</code> 决定，有三种模式（<code>MIXED_HARNESS_MODE</code>，<code>train.sh</code> 默认 <code>step-hash</code>）：</p>
+<table>
+  <tr><th>模式</th><th>index 怎么算</th><th>效果</th></tr>
+  <tr><td><code>step-hash</code>（默认）</td><td><code>sha256(seed, global_steps, instance_id)</code> 取前 8 字节</td><td>同一个 prompt 的 n 个 session <b>用同一个 harness</b>，但每一步换一个。GRPO 组内可比（同组同 harness），跨步覆盖所有 harness</td></tr>
+  <tr><td><code>paired_validation</code> / <code>session</code></td><td><code>rollout_index</code>（第几次采样）</td><td>同一个 prompt 的 n 个 session <b>分给不同 harness</b>，用于对比各 harness 在同一题上的表现</td></tr>
+  <tr><td>默认（<code>prompt</code>）</td><td><code>seed + dataset_index</code></td><td>按数据行轮转</td></tr>
+</table>
+<p>注释解释了为什么没有"单 harness"的分支：<i>"There is no single-harness branch: the launcher always enables mixing, and a one-armed run is a spec with one entry. Two code paths for one decision is how a run ends up training on a profile nobody chose."</i>——一条路径就只有一种行为，避免配置和实际跑的东西不一致。</p>
+<p>与之配套的是 <code>algorithm.group_advantage_by_harness</code>（第四课 §4.1 提到的 <code>group_suffixes</code>）：打开后 GRPO 的分组键变成 <code>uid::harness</code>，也就是只在同一个 harness 内部做组内比较。<code>train.yaml</code> 里默认 <code>false</code>，因为 <code>step-hash</code> 模式下同组本来就是同一个 harness，不需要再按 harness 细分。</p>
+
+<h3 id="xb-10">10. 写入 TransferQueue 与两道超时</h3>
+<h4>10.1 TQ 字段</h4>
+<p><code>_trajectory_to_tq_field_and_tag</code> 写进去的字段和 General 的后处理基本一致（<code>prompts</code>、<code>responses</code>、<code>input_ids</code>、<code>position_ids</code>、<code>rm_scores</code>、<code>response_mask</code>、<code>loss_mask</code>），额外多了三个：</p>
+<pre><code>field["tool_call_error_mask"] = tool_call_error_mask    # flags × generation_spans 展开（第三课下 §9）
+field["repetition_mask"] = repetition_mask               # n-gram 重复检测的结果
+if self._ship_turn_index:
+    field["turn_index"], _ = _turn_index(trajectory)     # 每个 token 属于第几轮，deep_failure_mask 要用</code></pre>
+<p>还有一个 <code>mask_unfinished_episode</code> 开关：打开时，<code>reward_info["finished"] is False</code> 的 session，整条 <code>response_mask</code> 清零，相当于这条轨迹不参与训练（但还占着 batch 的位置）。<code>train.yaml</code> 里默认关闭。</p>
+<h4>10.2 两道超时</h4>
+<p><code>_wait_for_runner_task</code> 同时盯两个预算：</p>
+<table>
+  <tr><th></th><th>墙钟超时</th><th>请求空闲超时</th></tr>
+  <tr><td>配置</td><td><code>session_timeout_seconds</code>（4800）</td><td><code>agent_request_idle_timeout_seconds</code>（720）</td></tr>
+  <tr><td>判定</td><td>从拉起 runner 算起的总时长</td><td>查网关的 session 状态：没有在途请求、agent 没报告 finished、而且"等外部后续动作"已经超过 720 秒</td></tr>
+  <tr><td>针对</td><td>整体跑太久</td><td>harness 发了工具调用之后就再也不回来了（比如沙箱被 OOM 杀掉，进程既不报错也不退出）</td></tr>
+</table>
+<p>注释说明了为什么必须有这第二道：<i>"Without this cap a single stuck session would hold its concurrency slot forever and stall the whole training batch."</i>——<code>max_concurrent_sessions</code> 是有限的，一个卡死的 session 会一直占着名额。</p>
+<p>超时之后的处理和第三课（上）§5 的"协作式取消"思路相同，但这里能做得更干净：<code>wait_for</code> 只是让父进程不再等，Ray task 必须显式取消，所以 <code>_cancel_runner_task</code> 先发优雅取消（让 runner 的 <code>asyncio.run</code> 正常退栈、容器的上下文管理器能收尾），不听话再强杀。失败路径上还会调 <code>abort_session</code> 把网关里已有的历史抢救出来存盘（但注释明确写了这些不能用于打分和训练）。</p>
+
+<h3 id="xb-11">11. 两条路的对比表</h3>
+<table>
+  <tr><th>环节</th><th>General</th><th>Code</th></tr>
+  <tr><td>rollout 管理器</td><td><code>AgentLoopManagerTQ</code>（verl 自带）</td><td><code>AgentFrameworkRolloutAdapter</code>（uni-agent）</td></tr>
+  <tr><td>进程数（每条轨迹）</td><td>1 个 <code>DatasetEnvActor</code></td><td>1 个 Ray task（runner）+ 共享的网关进程</td></tr>
+  <tr><td>harness 怎么调模型</td><td>Python 直接调用 <code>_VerlRolloutModel.query()</code></td><td>HTTP 请求发到 session 专属 URL</td></tr>
+  <tr><td>谁管 token</td><td><code>TokenTrace</code>（recipe 自己写，约 170 行）</td><td><code>GatewaySession</code> + <code>MessageCodec</code>（uni-agent，上千行）</td></tr>
+  <tr><td>增量编码的依据</td><td>消息游标 <code>_cursor</code>（简单，因为同进程能看到 agent.messages）</td><td>前缀哈希链匹配（复杂，因为只能看到每次请求的消息列表）</td></tr>
+  <tr><td>上下文被改写</td><td>不可能（mimoagent 的列表只追加）</td><td>可能，开新链，产出多条轨迹</td></tr>
+  <tr><td>agent 类</td><td><code>DefaultAgent</code>（不过工厂，<code>type</code> 失效）</td><td>经工厂，<code>type</code> 生效</td></tr>
+  <tr><td>工具执行位置</td><td>转发到 env_actor（和 pod 客户端同进程）</td><td>runner 进程内，mimoagent 自己执行</td></tr>
+  <tr><td>奖励路径</td><td>返回值 → <code>AgentLoopOutput.reward_score</code></td><td>HTTP POST → 网关 session → 附在轨迹上</td></tr>
+  <tr><td>-999 基础设施哨兵</td><td>有（<code>invalid_reward_for_infra</code>）</td><td>没有这套机制；失败的 session 直接不写 TQ</td></tr>
+  <tr><td>token 级惩罚</td><td>做不到（缺 span）</td><td>可以（有 <code>generation_spans</code>），但默认关闭</td></tr>
+  <tr><td>多 harness 混合</td><td>不支持</td><td>支持，四种 whitebox 混训</td></tr>
+  <tr><td>trainer 侧（第四课）</td><td colspan="2">完全一样：GRPO、prompt-mean、PPO 损失、参数同步</td></tr>
+</table>
+<p>两条路的共同点值得强调：<b>它们都只负责把 <code>(prompt_ids, response_ids, response_mask, rm_scores, ...)</code> 放进 TransferQueue</b>。第四课讲的所有内容对两者完全通用。这就是 verl 的 TransferQueue 这层抽象的价值。</p>
+
+<h3 id="xb-12">12. 思考题</h3>
+<details><summary>Q1：为什么 Code 这条路能支持"真正的 Claude Code CLI"，而 General 这条路不能？</summary>
+<p>General 要求 harness 的模型对象能被替换成 <code>_VerlRolloutModel</code>，这需要 harness 是我们能改的 Python 代码。真正的 Claude Code 是一个独立的命令行程序，跑在容器里，只会按 Anthropic 的接口格式发 HTTP 请求——它不可能接受一个 Python 对象。Code 这条路的网关本身就是一个 HTTP 服务，而且三种协议（OpenAI chat、Anthropic messages、OpenAI responses）的适配器都有，所以只要把 <code>ANTHROPIC_BASE_URL</code> 指向 session 的 URL 就行。代价是上下文改写时会开新链（§5），token 记账没有 General 那么确定。</p></details>
+<details><summary>Q2：为什么链匹配要求"工具列表完全相同"？只比较消息不行吗？</summary>
+<p>工具定义是渲染进 system prompt 的（第三课下 §4）。工具列表变了，system prompt 的 token 就变了，而 system prompt 在 <code>prompt_ids</code> 的最前面。这时整条链的 token 序列从头就不一样了，接着往后写就会得到一段模型从未见过的上下文。所以必须开新链、整段重新编码。</p></details>
+<details><summary>Q3：<code>trajectory_selection: longest</code> 只留最长的一条，另外那些链的 token 就浪费了。为什么不全留下来训练？</summary>
+<p>可以全留（配 <code>all</code>），但有两个问题。一是奖励的归属：打分打的是"任务最终有没有完成"，这个结果是整个 session 的，而被丢弃的那条链代表一段<b>被 harness 自己放弃的</b>历史，把同一个奖励加到它上面，信号是错的。<code>run_generation</code> 的注释也提到了这个问题："concurrent siblings share one reward target"。二是组内可比性：同一个 session 产出的多条轨迹共享一个奖励，在 GRPO 组里它们的优势完全相同，相当于把同一个样本重复计入，会让这个 session 在组内的权重变大。留最长的那条，是"取信息量最大、且确实走到最后的那段历史"。</p></details>
+<details><summary>Q4：回退时为什么要用"墓碑" span 占位，直接把 span 删掉不行吗？</summary>
+<p>因为 harness 记录的"每轮工具调用是否出错"是一个按轮数排列的列表，而 <code>_tool_call_error_mask</code> 用 <code>zip(flags, spans)</code> 把两者一一对应，并且在长度不等时<b>整条放弃标记</b>（返回 <code>length_mismatch</code>）。回退丢掉了一次生成，但 harness 那边的计数不会跟着减少，直接删 span 就会导致长度对不上，这条轨迹的工具调用错误信息就全丢了。用空区间占位，长度保持一致，而空区间本身标不到任何 token，等于"这一轮存在但没有对应的 token"，语义是对的。</p></details>
+
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="04-actor-update.html">← 第四课：从奖励到 actor 更新</a></div>
+</main>
+</body>
+</html>

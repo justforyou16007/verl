@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第一课：main_ppo → 训练主循环 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>第一课：main_ppo → 训练主循环</h2>
+  <ol>
+    <li><a href="#l1-0">0. 主线选择</a></li>
+    <li><a href="#l1-1">1. 启动链与配置分层</a></li>
+    <li><a href="#l1-2">2. main_ppo.py 入口</a></li>
+    <li><a href="#l1-3">3. trainer.init()：创建组件</a></li>
+    <li><a href="#l1-4">4. fit() → step() → _step_once()</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="qa-01-whitebox-blackbox.html">问答：白盒 vs 黑盒 harness →</a></div>
+<h2 id="l1">第一课：从 <code>main_ppo</code> 到训练主循环</h2>
+
+<h3 id="l1-0">0. 主线选择</h3>
+<p>这个分支在 verl 之上加了 5 个训练环境（Code / Cyber / General / Visual / Music）。它们驱动 agent 的方式分两类：</p>
+<ul>
+  <li><b>Cyber、General、Visual</b>：沿用 verl 的 AgentLoop 机制，在 <code>recipes/{arvo,general,design}/agent_loop.py</code> 里直接调用 mimoagent 这个 agent 框架（harness）。</li>
+  <li><b>Code</b>：把 verl 的 agent loop 管理器整个换成 uni-agent，走另一条路。</li>
+</ul>
+<p>"main_ppo → agent loop 初始化 → harness 执行 → actor 更新"这条学习路线，和 <b>General（s3k）环境</b>最贴合，所以以它为主线。</p>
+
+<h3 id="l1-1">1. 启动链与配置分层</h3>
+<pre><code>scripts/general/general.sh            # 给环境变量设默认值（模型路径、batch size、超时……）
+  └─ recipes/general/run_general.sh   # 做启动前检查，然后拼出完整命令
+        └─ python3 -m verl.trainer.main_ppo --config-name=general --config-path=recipes/general/config ...</code></pre>
+<p><code>run_general.sh</code> 里有一项检查，到第四阶段会再用到：</p>
+<pre><code>if [ "${GENERAL_MODE}" = "train" ] &amp;&amp; [ "${TRAIN_BATCH_SIZE}" != "${PPO_MINI_BATCH_SIZE}" ]; then
+  echo "loss_agg_mode=prompt-mean needs TRAIN_BATCH_SIZE == PPO_MINI_BATCH_SIZE" &gt;&amp;2</code></pre>
+<p>含义：这个环境的 loss 按"每个 prompt 先求平均"来算（<code>prompt-mean</code>），一次参数更新必须恰好用掉整个 batch，不能再切成更小的 mini-batch。</p>
+
+<h4>配置是分层叠起来的</h4>
+<span class="src">recipes/general/config/general.yaml</span>
+<pre><code>defaults:
+  - ppo_megatron_trainer   # 先加载 verl 自带的 Megatron 训练默认配置
+  - _self_                 # 再用本文件的值覆盖</code></pre>
+<p>优先级：verl 默认配置 &lt; <code>general.yaml</code> &lt; 命令行参数。后面每个阶段都会用到的字段：</p>
+<table>
+  <tr><th>字段</th><th>值</th><th>作用</th></tr>
+  <tr><td><code>rollout.name / mode</code></td><td><code>sglang</code> / <code>async</code></td><td>用 SGLang 做推理服务，以异步服务的形式对外提供生成</td></tr>
+  <tr><td><code>rollout.agent.default_agent_loop</code></td><td><code>mimo_swe_agent</code></td><td>数据里没写用哪个 agent 时，默认用这个名字</td></tr>
+  <tr><td><code>rollout.agent.agent_loop_config_path</code></td><td><code>recipes/general/config/general_agent_loop.yaml</code></td><td>一张"名字 → 具体类"的登记表</td></tr>
+  <tr><td><code>actor.loss_agg_mode</code></td><td><code>prompt-mean</code></td><td>MiMo 新增的 loss 聚合方式（第四阶段）</td></tr>
+  <tr><td><code>algorithm.adv_estimator</code></td><td><code>grpo</code></td><td>同一个 prompt 采 n 条，组内互相比较来算优势</td></tr>
+  <tr><td><code>algorithm.invalid_reward_value</code></td><td><code>-999</code></td><td>基础设施出故障（比如容器起不来）时的特殊奖励值，用来标记这条样本，让它不参与训练</td></tr>
+  <tr><td><code>algorithm.filter_groups.enable</code></td><td><code>true</code></td><td>一组 n 条奖励全部相同时丢掉这一组，因为组内没有差异，算不出有效的优势</td></tr>
+  <tr><td><code>trainer.v1.trainer_mode</code></td><td><code>sync</code></td><td>同步训练：先生成、再训练，交替进行</td></tr>
+</table>
+<span class="src">recipes/general/config/general_agent_loop.yaml</span>
+<pre><code>- name: mimo_swe_agent                                  # default_agent_loop 引用的就是这个名字
+  _target_: recipes.general.agent_loop.GeneralAgentLoop  # 实际会创建的类
+  mimoagent_config_path: config/agent/general/s3k.yaml  # harness 自己的配置
+  trajectory_timeout: ${oc.env:TRAJECTORY_TIMEOUT,1200} # 一条轨迹最多跑 1200 秒
+  ...</code></pre>
+
+<h3 id="l1-2">2. <code>main_ppo.py</code> 入口</h3>
+<span class="src">verl/trainer/main_ppo.py</span>
+<pre><code>@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
+def main(config):
+    auto_set_device(config)
+    validate_config(...)
+    if config.trainer.use_v1:            # ppo_trainer.yaml:230 默认就是 true
+        run_ppo(config, task_runner_class=TaskRunnerV1)</code></pre>
+<p><code>run_ppo</code> 先启动 Ray（分布式框架，负责把任务分配到多台机器、多张卡上），再创建一个远程的 <code>TaskRunnerV1</code>，等它跑完：</p>
+<pre><code>runner = task_runner_class.remote()       # 在 Ray 集群里创建一个独立进程
+ray.get(runner.run.remote(config))        # 让它执行 run，主进程在这里等待</code></pre>
+<pre><code>def run(self, config):
+    trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)  # "sync" → PPOTrainerSync
+    tq.init(config.transfer_queue)          # ① 启动 TransferQueue
+    self.trainer = trainer_cls(config=config)
+    self.trainer.init()                     # ② 创建模型、推理服务等全部组件
+    self.init_agent_loop_manager()          # ③ 创建 agent loop 管理器（第二课）
+    self.trainer.fit(self.agent_loop_manager)  # ④ 进入训练主循环</code></pre>
+
+<div class="box key"><b>TransferQueue（代码里简写为 <code>tq</code>）</b>：可以把它看成一个全局共享的字典。
+<ul>
+  <li><b>key</b>：prompt 的 key 是 <code>uid</code>；轨迹的 key 是 <code>{uid}_{session_id}_{index}</code>。<code>session_id</code> 取 0 到 n-1，表示同一个 prompt 的第几次采样；<code>index</code> 表示这次采样产出的第几条轨迹。</li>
+  <li><b>tag</b>：一个小字典，如 <code>{"status": "running", "global_steps": 3}</code>，用来记录状态。</li>
+  <li><b>value</b>：真正的数据，如 <code>prompt_ids</code>、<code>response_ids</code>、<code>response_mask</code>、reward。</li>
+</ul>
+为什么要这个中间层：生成轨迹的一方（agent loop worker）和训练的一方（trainer）是不同的进程，彼此不直接调用，而是都读写这个"字典"，这样双方可以各跑各的。</div>
+
+<h3 id="l1-3">3. <code>trainer.init()</code>：创建组件</h3>
+<span class="src">verl/trainer/ppo/v1/trainer_base.py:489 _setup()</span>
+<pre><code>self._init_tokenizer()
+self._init_dataloader()                  # 读 parquet，每一行是一个任务
+self._init_resource_pool_mgr()           # 规划 GPU 怎么分配
+...
+self.actor_rollout_wg.init_model()       # ⑥ 在每张卡上加载 Megatron 训练模型
+self.reward_loop_manager = RewardLoopManager(...)      # ⑦ 奖励计算
+self.llm_server_manager = LLMServerManager.create(...) # ⑨ 启动 SGLang 推理服务
+self.checkpoint_manager = CheckpointEngineManager(     # ⑩ 把训练好的权重同步给推理服务
+    actor_wg=self.actor_rollout_wg,
+    replicas=self.llm_server_manager.get_replicas())
+self.checkpoint_manager.sleep_replicas()</code></pre>
+<p><code>hybrid_engine: true</code> 的意思是<b>训练模型和推理服务共用同一批 GPU</b>。显存放不下两份，所以要轮流占用：生成时推理服务"醒来"，加载权重和 KV cache（推理时缓存的中间结果）；训练时推理服务"睡眠"，把显存让给 Megatron。<code>PPOTrainerSync</code> 的钩子就是做这个切换：</p>
+<span class="src">verl/trainer/ppo/v1/trainer_sync.py</span>
+<pre><code>def on_sample_end(self):   # 轨迹采完 → 推理服务睡眠，释放显存
+    self.checkpoint_manager.sleep_replicas()
+
+def on_step_end(self):     # 训练完一步 → 新权重推给推理服务，并唤醒它
+    self.checkpoint_manager.update_weights(self.global_steps)</code></pre>
+<p><code>actor_rollout_wg</code> 里的 <code>wg</code> 是 worker group 的缩写，代表"所有 GPU 上训练进程的集合"。调用 <code>wg.xxx()</code>，就是让所有卡同时执行 <code>xxx</code>。</p>
+
+<h3 id="l1-4">4. <code>fit()</code> → <code>step()</code> → <code>_step_once()</code></h3>
+<pre><code>def step(self, metrics, timing_raw, *, prefetch_next_batch=True):
+    if prefetch_next_batch:
+        self._add_batch_to_generate()      # A. 把一批 prompt 交给 agent loop，不等结果
+    for trigger_idx in range(self.parameter_sync_step):   # sync 模式下为 1
+        batch = self._step_once(...)       # B. 取出生成好的结果，然后训练</code></pre>
+
+<h4>A. 交出 prompt</h4>
+<span class="src">trainer_base.py:1609</span>
+<pre><code>def _submit_batch_to_rollout(self, batch: TensorDict) -&gt; int:
+    tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} ...]
+    tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)  # 登记"这些 prompt 等待处理"
+    self.agent_loop_manager.generate_sequences(batch)   # 分发给各个 worker 后立刻返回</code></pre>
+<p><code>batch</code> 是 <code>TensorDict</code>（可以理解成"每个字段是一列、每一行是一个样本"的字典）。General 环境里比较重要的列有：</p>
+<ul>
+  <li><code>raw_prompt</code>：对话消息列表</li>
+  <li><code>agent_name</code>：用哪个 agent loop，如 <code>mimo_swe_agent</code></li>
+  <li><code>extra_info.instance_json</code>：任务描述（docker 镜像、题面等）</li>
+  <li><code>uid</code>：<code>_fetch_one_gen_batch</code> 给每个 prompt 生成的唯一 id。同一个 prompt 的 n 次采样共享这个 uid，GRPO 靠它分组</li>
+</ul>
+
+<h4>B. <code>_step_once</code>：完整的 PPO 流程</h4>
+<pre><code>batch, _ = self.replay_buffer.sample(...)    # 1. 阻塞等待，直到有足够多完整的组
+batch = self._balance_batch(batch)            # 3. 按序列长度在各张卡之间均衡分配
+batch = self._compute_old_log_prob(batch)     # 4. 用当前模型重新算每个 token 的对数概率
+batch = self._compute_advantage(batch)        # 7. 根据奖励算优势（MiMo 改动最多的地方）
+batch = self._update_actor(batch)             # 9. 计算 loss，反向传播，更新参数</code></pre>
+<p>这里的 <code>batch</code> 是 <code>KVBatchMeta</code>，只包含 <code>partition_id</code>、<code>keys</code>、<code>tags</code>，相当于一张"取货单"。真正的数据还在 TransferQueue 里，各个计算步骤需要时再去取。</p>
+<p><code>replay_buffer.sample</code> 不停轮询每个 prompt 的 <code>status</code>（<code>pending</code> 已登记未开始 / <code>running</code> 正在跑 / <code>finished</code> n 条都成功 / <code>failure</code> 至少一条失败），凑够 <code>train_batch_size</code> 个结束的组后才返回。开了 <code>filter_groups</code> 时，奖励全部相同的组会被丢掉，再补新的 prompt（<code>replay_buffer.py:100</code> 的表：sync 模式下"丢 k 个，补 2k 个"）。</p>
+
+<pre><code>fit 循环
+ └ step
+    ├─ A. _add_batch_to_generate ──▶ tq 登记 prompt(pending) ──▶ agent_loop_manager.generate_sequences
+    │                                                                  │（后台异步执行）
+    │                                                                  ▼
+    │                                                 worker 跑 harness，把轨迹写回 tq
+    └─ B. _step_once
+          replay_buffer.sample  ◀──── 轮询 tq，等组完成 ────┘
+          → on_sample_end（推理服务睡眠）
+          → old_log_prob → advantage → update_actor
+    on_step_end（新权重同步给推理服务，并唤醒）</code></pre>
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="qa-01-whitebox-blackbox.html">问答：白盒 vs 黑盒 harness →</a></div>
+</main>
+</body>
+</html>

@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第三课（下）：harness 执行与 token 记账 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>第三课（下）：harness 执行与 token 记账</h2>
+  <ol>
+    <li><a href="#l3b-0">0. 本课要回答的问题</a></li>
+    <li><a href="#l3b-1">1. 为什么不能每轮重新渲染整段对话</a></li>
+    <li><a href="#l3b-2">2. TokenTrace：一条轨迹的 token 账本</a></li>
+    <li><a href="#l3b-3">3. 一轮里 token 怎么增长</a></li>
+    <li><a href="#l3b-4">4. 第一轮：渲染开头的 prompt</a></li>
+    <li><a href="#l3b-5">5. 后续轮：只渲染新增的环境消息</a></li>
+    <li><a href="#l3b-6">6. 锚点技巧：中途插入的消息怎么渲染才准确</a></li>
+    <li><a href="#l3b-7">7. 生成、解析工具调用、预算控制</a></li>
+    <li><a href="#l3b-8">8. 结束：TokenTrace → AgentLoopOutput → TransferQueue</a></li>
+    <li><a href="#l3b-9">9. 工具调用错误是怎么被标记的</a></li>
+    <li><a href="#l3b-10">10. 思考题</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="03a-thread-eventloop.html">← 第三课（上）：线程与事件循环</a><a href="04-actor-update.html">第四课：从奖励到 actor 更新 →</a></div>
+
+<h2 id="l3b">第三课（下）：harness 执行与 token 记账</h2>
+<div class="box ask"><b>提问</b>：好了，下一课吧。（接第三课上的预告：harness 每一轮里消息怎么变成 token、TokenTrace 怎么拼出 response_mask、工具调用错误怎么标记）</div>
+
+<h3 id="l3b-0">0. 本课要回答的问题</h3>
+<p>上一课讲的是"谁在哪个线程上执行"，这一课讲"每一轮执行时，数据发生了什么变化"。两边对数据的要求很不一样：</p>
+<table>
+  <tr><th></th><th>mimoagent 想要的</th><th>verl 训练想要的</th></tr>
+  <tr><td>形式</td><td>一个消息列表 <code>agent.messages: list[dict]</code>，每次 <code>query()</code> 都把整个列表传给模型</td><td>一条扁平的 token 序列，加上等长的 <code>response_mask</code>：1 表示模型生成的 token，0 表示环境塞进来的 token</td></tr>
+  <tr><td>例子</td><td><code>[{"role":"system",...}, {"role":"user",...}, {"role":"assistant","content":...,"tool_calls":[...]}, {"role":"tool",...}, ...]</code></td><td><code>prompt_ids=[...]</code>，<code>response_ids=[...]</code>，<code>response_mask=[1,1,...,0,0,...,1,1]</code>，<code>response_logprobs=[...]</code></td></tr>
+</table>
+<p>所以 <code>_VerlRolloutModel</code> 除了"替 mimoagent 调用模型"之外，还要<b>在每一轮把消息列表的变化同步到一条 token 序列里</b>。负责记账的就是 <code>TokenTrace</code>（<code>recipes/general/token_trace.py</code>）。</p>
+
+<h3 id="l3b-1">1. 为什么不能每轮重新渲染整段对话</h3>
+<p>最直观的做法是：每轮把 <code>agent.messages</code> 整个用 chat template 渲染一遍，得到 token 序列。这样做会出问题。<code>token_trace.py</code> 开头的注释写道：</p>
+<span class="src">recipes/general/token_trace.py（docstring 摘录）</span>
+<pre><code>Re-rendering the full message list each turn would break RL training -- the token ids
+from ``apply_chat_template(all_messages)`` do not equal ``concat(prompt_ids, response_ids)``
+of the individual turns (tool-call text gets rewritten, thinking gets stripped, decode-
+encode is not a round trip).</code></pre>
+<p>也就是说，重新渲染出来的 token 和模型<b>当时实际生成的 token</b> 不一样，原因有三个：</p>
+<ol>
+  <li><b>工具调用的文本会被改写</b>：模型生成的是一段 XML 文本，解析器把它解析成 <code>tool_calls</code> 字典；渲染时 chat template 会按自己的格式重新写出来，空格、换行、参数顺序都可能变化。</li>
+  <li><b>思考内容会被删掉</b>：很多模板（比如 Qwen3）渲染历史 assistant 消息时，会去掉 <code>&lt;think&gt;...&lt;/think&gt;</code> 部分。</li>
+  <li><b>先解码再编码不一定能还原</b>：token → 文本 → token，同一段文本可能有多种切分方式，tokenizer 不一定选中模型当时生成的那一种。</li>
+</ol>
+<div class="box key"><b>为什么这对 RL 是致命的</b>：PPO 的核心是比较"新策略和采样时的旧策略，对<b>同一个 token</b> 给出的概率"，即 <code>exp(new_logprob - old_logprob)</code>。如果训练时用的 token 序列和采样时模型真正生成的不一致，这个比值就是在拿两段不同的东西比较，梯度方向就是错的。所以规则是：<b>模型生成的 token 原样保存，绝不重新渲染。只有环境新加入的消息（工具结果、错误提示）才需要渲染成 token。</b></div>
+
+<h3 id="l3b-2">2. TokenTrace：一条轨迹的 token 账本</h3>
+<span class="src">recipes/general/token_trace.py</span>
+<pre><code>@dataclass
+class TokenTrace:
+    response_length: int                 # 回复区域的 token 上限 = rollout.response_length（212992）
+    token_ids: list[int]                 # 整条序列：prompt + response，按顺序
+    response_mask: list[int]             # 只覆盖 response 部分：1=模型生成，0=环境注入
+    response_logprobs: list[float]       # 与 response_mask 等长；环境注入的位置填 0.0
+    prompt_len: int = 0                  # 开头 prompt 的长度，只设置一次
+    truncated: bool = False              # 是否因为 token 预算用完而被截断
+    _logprobs_enabled: bool = False      # 推理服务是否返回 logprob，在第一次生成时确定</code></pre>
+<p>可以把它看成这样一条带子：</p>
+<pre><code>token_ids:      [ ── prompt (prompt_len 个) ── | ── response ─────────────────────────────── ]
+response_mask:                                  [ 1 1 1 1 1 | 0 0 0 0 0 0 | 1 1 1 1 | 0 0 0 | ... ]
+                                                  第1轮生成    工具结果       第2轮生成  工具结果
+response_logprobs:                              [ -.1 -2 ...| 0 0 0 0 0 0 | -.3 ...  | 0 0 0 | ... ]</code></pre>
+<p>它只有三个"写入"方法，每个对应一种来源：</p>
+<pre><code>def append_prompt(self, token_ids):           # 只调用一次：开头的 system + 任务
+    self.token_ids = list(token_ids)
+    self.prompt_len = len(token_ids)
+
+def append_observation(self, token_ids):      # 环境注入：mask 记 0，logprob 填 0.0
+    self.token_ids.extend(token_ids)
+    self.response_mask.extend([0] * len(token_ids))
+    if self._logprobs_enabled:
+        self.response_logprobs.extend([0.0] * len(token_ids))
+
+def append_generated(self, token_ids, log_probs=None):   # 模型生成：mask 记 1，保存真实 logprob
+    if log_probs and not self._logprobs_enabled:          # 第一次拿到 logprob 时打开开关，
+        self._logprobs_enabled = True                      # 并为之前已有的位置补 0.0，保持等长
+        self.response_logprobs = [0.0] * len(self.response_mask)
+    self.token_ids.extend(token_ids)
+    self.response_mask.extend([1] * len(token_ids))
+    ...                                                    # logprob 不够长时补 0.0，多了就截掉</code></pre>
+<p>注意一个设计细节：prompt 部分<b>没有</b> mask。<code>response_mask</code> 从第一轮生成开始记，所以第 1 轮之后的工具结果虽然也是"输入"，但它们放在 response 区域里，只是 mask 为 0。这是 verl 多轮 RL 的通用约定：<b>prompt = 第一轮之前的内容；之后所有内容都算 response，靠 mask 区分是否参与训练。</b></p>
+
+<h3 id="l3b-3">3. 一轮里 token 怎么增长</h3>
+<p>结合上一课的时序，每轮 <code>_agenerate</code> 在 L 上做的事情是：</p>
+<span class="src">recipes/general/agent_loop.py _VerlRolloutModel._agenerate（摘要）</span>
+<pre><code>async def _agenerate(self, messages):
+    if self.stopped: raise _RolloutStopped(...)
+    await self._absorb_new_messages(messages)          # ① 把新增的环境消息转成 token，追加进 trace
+    remaining = self._trace.remaining_budget()
+    if remaining &lt;= 1: raise ResponseBudgetExhausted(...)
+    sampling_params["max_tokens"] = min(self._per_turn_max_tokens, remaining)   # ② 本轮最多生成多少
+    sampling_params["stop_token_ids"] = eos + tool_parser.stop_token_ids
+    output = await self._agent_loop.server_manager.generate(
+        request_id=self._request_id,
+        prompt_ids=self._trace.token_ids,              # ③ 把整条 token 序列直接发给 SGLang
+        sampling_params=sampling_params)
+    self._trace.append_generated(output.token_ids, output.log_probs)   # ④ 生成结果原样记入
+    self._absorb_engine_extra_fields(output.extra_fields)              #    记录权重版本号等
+    content, tool_calls = await self._agent_loop.tool_parser.extract_tool_calls(
+        output.token_ids, self._tool_schema_objs)      # ⑤ 解析出工具调用
+    tool_calls = self._cap_tool_calls(tool_calls)
+    return self._build_assistant_payload(content, tool_calls)   # ⑥ 包装成 mimoagent 认识的 dict</code></pre>
+<p>第 ③ 步是关键：发给推理服务的是 <b>token id</b>，不是消息列表。所以推理服务看到的序列，就是 TokenTrace 记的序列，两边一定一致。这就是 verl 文档里说的"token 进、token 出"（token-in-token-out）。</p>
+<p>以 Qwen 风格的模板为例，几轮之后 <code>token_ids</code> 对应的文本大致是这样（示意）：</p>
+<pre><code>┌ prompt（append_prompt）
+│ &lt;|im_start|&gt;system\nYou are an agent, ...cwd is /work/workspace...\n# Tools\n...Bash/Read/...&lt;|im_end|&gt;\n
+│ &lt;|im_start|&gt;user\n{任务原文}&lt;|im_end|&gt;\n
+│ &lt;|im_start|&gt;assistant\n
+├ 第1轮生成（append_generated，mask=1）
+│ &lt;think&gt;...&lt;/think&gt;我先看看目录 &lt;tool_call&gt;&lt;function=Bash&gt;&lt;parameter=command&gt;ls&lt;/parameter&gt;&lt;/function&gt;&lt;/tool_call&gt;&lt;|im_end|&gt;
+├ 工具结果（append_observation，mask=0）
+│ \n&lt;|im_start|&gt;user\n&lt;tool_response&gt;\nREADME.md src ...\n&lt;/tool_response&gt;&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\n
+├ 第2轮生成（mask=1）
+│ ...</code></pre>
+<p>每段 mask=0 的环境注入，结尾都带着下一轮的 <code>&lt;|im_start|&gt;assistant\n</code>（生成提示）。这样模型接着往下写的，正好就是下一个 assistant 回合的内容。</p>
+
+<h3 id="l3b-4">4. 第一轮：渲染开头的 prompt</h3>
+<span class="src">_VerlRolloutModel._absorb_new_messages</span>
+<pre><code>async def _absorb_new_messages(self, messages):
+    delta, self._cursor = select_delta_messages(messages, self._cursor)
+    if self._trace.prompt_len == 0:                      # 第一轮：trace 还是空的
+        prompt_ids = await self._agent_loop.render_first_prompt(delta, self._tool_schema_dicts)
+        self._trace.append_prompt(prompt_ids)
+        return
+    if not delta:
+        return
+    observation_ids = await self._agent_loop.render_injected_turn(delta)   # 后续轮
+    self._trace.check_budget(len(observation_ids))
+    self._trace.append_observation(observation_ids)</code></pre>
+<p>第一次 <code>query()</code> 时，<code>agent.messages</code> 里只有 <code>[system, user(任务)]</code> 两条，<code>delta</code> 就是这两条。<code>render_first_prompt</code> 用 tokenizer 的 chat template 渲染它们，并把工具定义 <code>tools=schema_dicts</code> 一起渲染进 system 部分，最后加上 <code>&lt;|im_start|&gt;assistant\n</code>。</p>
+<div class="box note"><b>prompt 超长怎么办</b>：verl 默认的做法是从左边截断，保留尾部。但这里的 prompt 布局是 system 提示词和工具定义在前、任务在后，从左截断会把工具定义截掉，模型就要去调用自己从没见过的工具，必然得 0 分。所以 <code>render_first_prompt</code> 改为<b>缩短任务文本</b>（<code>_shorten_task_to_fit</code>），让总长度控制在 <code>rollout.prompt_length</code> 以内。注释里的统计：训练集 2438 条任务中，p99 是 5901 token，最长的有 75178 token。</div>
+<p>另外，这里故意不用基类的 <code>AgentLoopBase.apply_chat_template</code>：基类会优先使用多模态 processor，而多模态 processor 不接受 mimoagent 这种纯字符串的消息内容。</p>
+
+<h3 id="l3b-5">5. 后续轮：只渲染新增的环境消息</h3>
+<span class="src">recipes/general/token_trace.py</span>
+<pre><code>def select_delta_messages(messages: list[dict], cursor: int) -&gt; tuple[list[dict], int]:
+    new_messages = messages[cursor:]                                   # 上次处理到哪，这次从哪开始
+    return [m for m in new_messages if m.get("role") != "assistant"], len(messages)</code></pre>
+<p>变量含义：</p>
+<ul>
+  <li><code>messages</code>：mimoagent 的完整 <code>agent.messages</code>，只会追加，不会修改已有内容（第二课提到的约定）。</li>
+  <li><code>cursor</code>：上次已经处理到第几条消息，保存在 <code>_VerlRolloutModel._cursor</code>。</li>
+  <li>返回值 1：新增消息里<b>去掉 assistant</b> 的部分，也就是需要渲染的环境消息。</li>
+  <li>返回值 2：新的 cursor，也就是当前消息总数。</li>
+</ul>
+<p>为什么要去掉 assistant？因为 assistant 消息就是模型上一轮的输出，它的 token 已经在第 ④ 步通过 <code>append_generated</code> 原样记录过了，再渲染一遍就会出现第 1 节说的那些不一致问题。</p>
+<p>以第 2 次 <code>query()</code> 为例，两次调用之间 mimoagent 往 <code>messages</code> 里追加了：</p>
+<pre><code>messages[2]  {"role": "assistant", "content": "我先看看目录", "tool_calls": [...]}   ← 丢弃（token 已有）
+messages[3]  {"role": "tool", "tool_call_id": "...", "content": "README.md src ..."}    ← 需要渲染
+cursor: 2 → 4</code></pre>
+<p>可能出现的环境消息有这几种：</p>
+<ul>
+  <li><code>role="tool"</code>：工具执行结果。一轮里有多个工具调用时，会有多条连续的 tool 消息。</li>
+  <li><code>role="user"</code>：mimoagent 把 <code>NonTerminatingException</code>（比如 <code>FormatError: Unknown tool 'xxx'</code>）的错误文本作为 user 消息加进来，见 <code>base.py</code> 里的 <code>self.add_message("user", str(e))</code>。</li>
+  <li>（不适用于 General）在 Code 环境的 <code>CCAgent</code> 里，antihack 拦截时会返回假结果（<code>dummy_output: Permission denied...</code>），形式上也是工具结果。General 环境里 antihack 实际并未启用，见 <a href="02-agent-loop-init.html#erratum-1">第二课勘误</a>。</li>
+</ul>
+<div class="box warn"><b>新增的环境消息必须在一次调用里一起渲染</b>：chat template 会把连续的多条 tool 消息合并到同一个 <code>&lt;|im_start|&gt;user</code> 块里。如果一条一条单独渲染，就会多出几个本不该有的回合头部，和推理时模型实际看到的格式不一致。</div>
+
+<h3 id="l3b-6">6. 锚点技巧：中途插入的消息怎么渲染才准确</h3>
+<p>现在要把"新增的环境消息"渲染成 token，而且要和"整段对话一起渲染时，这一段对应的 token"<b>完全一致</b>。难点在于：chat template 渲染一条消息时，会参考它<b>前后的消息</b>来决定怎么写。<code>chat_delta.py</code> 的注释列出了两个实际踩过的坑：</p>
+<ol>
+  <li><b>Qwen3-Coder / Qwen3.5 的 tool 消息</b>：只有当"前一条消息存在，并且不是 tool 消息"时，模板才会写出 <code>&lt;|im_start|&gt;user</code> 头部。如果单独渲染，tool 消息就成了第一条，头部被悄悄省略，训练序列里就少了一个回合边界。</li>
+  <li><b>Qwen3 的 assistant 消息</b>：是不是最后一条消息，渲染结果不同（最后一条会插入空的 <code>&lt;think&gt;&lt;/think&gt;</code>）。所以也不能用"先渲染前缀、再渲染全部、取两者长度差"的办法来切分。</li>
+</ol>
+<p>解决办法是在新消息前面放一个固定的<b>锚点</b>消息一起渲染，然后把锚点对应的那部分 token 切掉：</p>
+<span class="src">recipes/general/chat_delta.py</span>
+<pre><code>ANCHOR_MESSAGES = [{"role": "user", "content": ""}]       # 锚点：一条空的 user 消息
+
+def anchor_ids(processing_class, **kw):                   # 锚点单独渲染的 token，只算一次，缓存起来
+    return render_ids(processing_class, ANCHOR_MESSAGES, add_generation_prompt=False, **kw)
+
+def render_injected_turn(processing_class, messages, *, turn_separator, anchor, **kw):
+    full = render_ids(processing_class, ANCHOR_MESSAGES + messages,
+                      add_generation_prompt=True, **kw)    # [锚点, 新消息...] 一起渲染，末尾加 assistant 生成提示
+    assert full[: len(anchor)] == anchor                   # 确认锚点确实是前缀，否则说明这个模板需要换锚点
+    return list(turn_separator) + full[len(anchor):]       # 切掉锚点，前面补上回合分隔符</code></pre>
+<p>为什么选空的 user 消息做锚点：</p>
+<ul>
+  <li>它在支持的这些模板里，无论处在什么位置，渲染结果都一样，所以切掉它不会影响后面的内容。</li>
+  <li>它不是 tool 消息，满足"前一条消息存在且不是 tool"这个条件，后面的 tool 消息就能正确地写出 <code>&lt;|im_start|&gt;user</code> 头部。</li>
+</ul>
+<p><b><code>turn_separator</code> 是什么</b>：模型生成到 <code>&lt;|im_end|&gt;</code> 时就停止了（它是停止 token），不会继续生成模板里紧跟在后面的换行 <code>\n</code>。而切掉锚点时，锚点结尾的 <code>&lt;|im_end|&gt;\n</code> 也一起被切掉了。所以要在注入内容的最前面补上这个分隔符，序列才能和整段渲染的结果对齐。它在 <code>AgentLoopBase.__init__</code> 里用 <code>initialize_turn_separator</code> 算好。</p>
+<p>第 3 节示例里，工具结果那一段开头的 <code>\n</code>，就是这个 <code>turn_separator</code>。</p>
+<div class="box note"><code>__init__</code> 里算好的 <code>self._anchor_ids</code>（第二课提到过）就是这里用到的锚点 token。<code>render_injected_turn</code> 和调试脚本 <code>probe_tool_call_format.py</code> 共用这一份实现，脚本验证通过的格式就是训练时实际产生的格式。</div>
+
+<h3 id="l3b-7">7. 生成、解析工具调用、预算控制</h3>
+<h4>7.1 预算：在消息边界停下，而不是在一轮中间</h4>
+<pre><code>def remaining_budget(self):        return max(0, self.response_length - len(self.response_mask))
+def check_budget(self, incoming):  # 加入工具结果之前先检查
+    if len(self.response_mask) + incoming &gt;= self.response_length:
+        self.truncated = True
+        raise ResponseBudgetExhausted(...)</code></pre>
+<ul>
+  <li><b>加入工具结果之前</b>：<code>check_budget</code> 发现装不下，就直接停止，不加入半截的工具结果。</li>
+  <li><b>生成之前</b>：<code>max_tokens = min(per_turn_max_tokens=65536, remaining)</code>，保证这一轮生成完也不会超出总预算。</li>
+</ul>
+<p>停止的方式是抛出 <code>ResponseBudgetExhausted</code>。按上一课的分析，它会被 mimoagent 包装成 <code>ModelQueryError</code>，<code>agent.run()</code> 正常返回，已经记录的轨迹保持完整，之后照常打分。</p>
+<h4>7.2 停止 token</h4>
+<p><code>stop_token_ids</code> = tokenizer 的 eos，加上解析器额外要求的停止 token。Qwen 系列对话模型的 eos 就是 <code>&lt;|im_end|&gt;</code>，模型写完工具调用后会自然输出它，所以 <code>qwen3_coder</code> 解析器不需要额外的停止 token（<code>tool_parser.py:55</code> 的说明）；像 Gemma4 这种输出工具调用后不会自然停下的模型，才需要把工具调用的结束标记也加进来。模型说完一个回合就停下，把控制权交回 mimoagent 去执行工具。</p>
+<h4>7.3 解析工具调用</h4>
+<p><code>tool_parser</code> 是 <code>qwen3_coder</code> 格式（<code>rollout.multi_turn.format</code>）。它先把 token 解码成文本（交给线程池 D 执行，见上一课 §7），然后从 <code>&lt;tool_call&gt;&lt;function=...&gt;&lt;parameter=...&gt;</code> 这样的 XML 里提取出函数名和参数，参数类型按 <code>schema_objs</code> 做转换。返回：</p>
+<pre><code>content: str                      # 去掉工具调用块之后剩下的文本
+tool_calls: list[FunctionCall]    # 每个元素有 name、arguments（JSON 字符串）、tool_call_id</code></pre>
+<p><code>_build_assistant_payload</code> 把它包装成 OpenAI 格式的 assistant 消息，mimoagent 的 <code>_collect_tool_calls</code> 就能直接识别：</p>
+<pre><code>{"content": "我先看看目录",
+ "tool_calls": [{"id": "call_1_0", "type": "function",
+                 "function": {"name": "Bash", "arguments": "{\"command\": \"ls\"}"}}]}</code></pre>
+<div class="box warn"><b><code>_cap_tool_calls</code> 背后的一次排查</b>：Qwen3.5-9B 一次并行发出多个工具调用时，<code>qwen3_coder</code> 解析器会把 <code>&lt;parameter=command&gt;</code> 误认成 <code>&lt;function=command&gt;</code>。注释里记录的一个回合被解析出 47 个调用，其中只有 3 个是真的。64 条轨迹里，76.6% 的工具调用是"不存在的工具"，89.1% 的轨迹最后因为耗尽 token 预算而结束。<code>max_tool_calls_per_turn</code> 是一个默认关闭的诊断开关，用来验证这个推测；真正的修复要在解析器里做，<code>raw_generations.jsonl</code>（<code>_dump_raw_generation</code>）保存的就是修复所需的原始输出。</div>
+<h4>7.4 回到 mimoagent</h4>
+<p><code>query()</code> 返回这个 dict 之后，mimoagent 的 <code>DefaultAgent.step()</code> 接着执行：</p>
+<span class="src">third_party/mimoagent-osr/src/mimoagent/agents/default.py:124</span>
+<pre><code>def step(self):
+    response = self.query()                          # 内部会把 assistant 消息加入 messages
+    tool_calls = _collect_tool_calls(response)
+    if not tool_calls:
+        self.tool_call_errors.append(False)
+        return None                                  # 没有工具调用 → 整个 run 以 "Idle" 结束
+    outcomes = self._run_tool_calls(tool_calls)      # 并行执行 → execute_action → env_actor
+    self.tool_call_errors.append(any(isinstance(o, FormatError) for o in outcomes))
+    ...                                              # 把每个结果作为 tool 消息加入 messages</code></pre>
+<p>这些新加入的 tool 消息，会在下一次 <code>query()</code> 时被 <code>select_delta_messages</code> 选中，形成闭环。<b>轨迹正常结束的条件是"模型这一轮没有调用任何工具"</b>，也就是模型认为任务已经完成。</p>
+
+<h3 id="l3b-8">8. 结束：TokenTrace → AgentLoopOutput → TransferQueue</h3>
+<p><code>agent.run()</code> 返回后，<code>run()</code> 先调用 <code>env_actor.calculate_reward</code> 打分，然后调用 <code>_build_output</code>：</p>
+<span class="src">recipes/general/agent_loop.py _build_output（摘要）</span>
+<pre><code>prompt_ids, response_ids, response_mask, response_logprobs = trace.finalize()
+tool_call_errors = collect_tool_call_errors([agent])
+extra_fields = dict(engine_extra_fields)       # 包含 min/max_global_steps：这条轨迹用到的权重版本范围
+extra_fields.update({
+    "instance_id": ..., "exit_status": ..., "truncated": trace.truncated,
+    "tool_call_errors": tool_call_errors, "error_category": ..., "true_reward": ...,
+    "reward_extra_info": {"reward": ..., "true_reward": ..., "model_patch_len": ...},
+    ...})
+return AgentLoopOutput(prompt_ids=prompt_ids, response_ids=response_ids,
+                       response_mask=response_mask, response_logprobs=response_logprobs,
+                       reward_score=float(reward), num_turns=len(agent.messages),
+                       metrics=metrics, extra_fields=extra_fields)</code></pre>
+<p><code>trace.finalize()</code> 会先检查 <code>response_ids</code>、<code>response_mask</code>、<code>response_logprobs</code> 三者长度一致，再把它们统一截断到 <code>response_length</code>，保证 <code>AgentLoopOutput</code> 要求的等长约束。</p>
+<p>之后的流程是第二课讲过的 worker 后处理（<code>agent_loop_tq.py</code> 的 <code>_agent_loop_postprocess</code>）：</p>
+<ul>
+  <li><code>as_dict()</code> 把字段改名并转成 tensor：<code>prompt_ids→prompts</code>、<code>response_ids→responses</code>、<code>response_logprobs→rollout_log_probs</code>。</li>
+  <li>拼出 <code>input_ids = prompts + responses</code>，算出 <code>position_ids</code>，并设置 <code>loss_mask = response_mask</code>。</li>
+  <li>以 key <code>{uid}_{session_id}_0</code> 写入 TransferQueue。General 环境每条轨迹只产出一个输出，所以 index 总是 0。</li>
+  <li>tag 里记录 <code>prompt_len</code>、<code>response_len</code>、<code>min/max_global_steps</code>，供 replay_buffer 使用。</li>
+</ul>
+<p>这里的 <code>reward_score</code> 是整条轨迹的一个标量。第四课会讲 trainer 怎么把它变成每个 token 的分数（<code>rm_scores</code>），再计算优势。</p>
+
+<h3 id="l3b-9">9. 工具调用错误是怎么被标记的</h3>
+<p>MiMo 在 trainer 里新增了"工具调用错误惩罚"（<code>algorithm.tool_call_error_penalty</code>）。要用上它，需要一个和 <code>response_mask</code> 等长的 <code>tool_call_error_mask</code>，标出"哪些 token 属于出错的那一轮生成"。这个 mask 是怎么来的？</p>
+<h4>9.1 什么算工具调用错误</h4>
+<p>在 mimoagent 里，判断标准是这一轮的执行结果中是否有 <code>FormatError</code>（<code>default.py</code>）：</p>
+<ul>
+  <li>工具调用缺少函数名；</li>
+  <li>调用了不存在的工具（<code>Unknown tool 'xxx'</code>）；</li>
+  <li>参数不是合法的 JSON，或者不是 JSON 对象。</li>
+</ul>
+<p>注意：<b>工具本身执行失败</b>（比如 Bash 命令返回非零、文件不存在）<b>不算</b>。工具抛出的 <code>ToolException</code> 会被转成普通的 <code>NonTerminatingException</code>（<code>default.py:182</code>），而不是 <code>FormatError</code>，属于正常的环境反馈。它只惩罚"调用格式本身就不对"的情况。</p>
+<p>每一轮 <code>step()</code> 都会往 <code>agent.tool_call_errors</code> 里追加一个布尔值，最终得到一个和轮数等长的列表，例如 <code>[False, False, True, False]</code>。</p>
+<h4>9.2 从"每轮一个布尔值"到"每个 token 一个标记"</h4>
+<p>要把轮级别的标记展开到 token 级别，还需要知道"每一轮生成的 token 在 response 中的起止位置"。各个环境的处理方式不同：</p>
+<table>
+  <tr><th>环境</th><th>记录了什么</th><th>trainer 能否做 token 级惩罚</th></tr>
+  <tr><td><b>General</b>（本课主线）</td><td>只在 <code>extra_fields["tool_call_errors"]</code> 里存了 <code>{上下文哈希: [每轮布尔值]}</code>，<b>没有</b>记录每轮的 token 区间，也没有生成 <code>tool_call_error_mask</code></td><td>❌ 只能用于统计和诊断</td></tr>
+  <tr><td>Code（uni-agent）</td><td>runner 把 <code>agent.tool_call_errors</code> 写进 <code>reward_info["tool_call_error_flags"]</code>；网关自己记录每轮生成的区间 <code>generation_spans</code>；<code>uni_agent/framework/framework.py:507 _tool_call_error_mask</code> 把两者合成 token 级 mask</td><td>✅ 但 <code>recipes/code/config/train.yaml</code> 里默认 <code>enable: false</code></td></tr>
+  <tr><td>Cyber（arvo）</td><td><code>_build_output</code> 额外记录 <code>llm_turn_spans</code> 和 <code>tool_call_error_flags</code>（<code>recipes/arvo/trajectory_metadata.py</code>）</td><td>✅ 由 <code>verl/trainer/ppo/arvo_penalties.py</code> 单独处理</td></tr>
+</table>
+<p>Code 环境的合成逻辑很简单，但很谨慎：</p>
+<span class="src">third_party/uni_agent/uni_agent/framework/framework.py:507</span>
+<pre><code>def _tool_call_error_mask(trajectory):
+    mask = torch.zeros(len(trajectory.response_ids))
+    flags = reward_info.get("tool_call_error_flags")   # [False, True, ...] 每轮一个
+    spans = trajectory.generation_spans                # [(start, end), ...] 每轮生成在 response 中的位置
+    if len(flags) != len(spans):
+        return mask, "length_mismatch", 0              # 对不上就不标，宁可漏标也不错标
+    for flag, (start, end) in zip(flags, spans):
+        if flag:
+            mask[start:end] = 1.0                      # 出错那一轮生成的所有 token 标 1
+    return mask, "ok", marked</code></pre>
+<div class="box key"><b>为什么 General 不能直接做到</b>：要展开到 token，必须知道"第 k 轮生成在 response 里从哪到哪"。General 的 <code>TokenTrace</code> 只记录了 mask，没有记录每段的边界。虽然可以从 mask 里"连续的 1"反推出每一段，但有两个风险：一是第 k 段连续的 1 是否一定对应 <code>tool_call_errors</code> 的第 k 个元素（比如被预算中断的那一轮）；二是生成长度为 0 的轮次。这正是 uni-agent 那段代码"对不上就不标"所防范的问题。如果想在 General 上启用这个惩罚，需要像 arvo 那样，在 <code>_agenerate</code> 里每次 <code>append_generated</code> 时记录 <code>(start, end)</code>，并在 <code>_build_output</code> 里输出 <code>tool_call_error_mask</code>。</div>
+<p>trainer 这一侧如何使用这个 mask（<code>_apply_tool_call_error_strategy</code>，有 monitor / mask / 设定优势等几种策略），放到第四课讲。</p>
+
+<h3 id="l3b-10">10. 思考题</h3>
+<details><summary>Q1：如果每轮都把完整的 messages 重新渲染一遍，作为发给推理服务的 prompt，会出什么问题？（推理时和训练时分别会怎样）</summary>
+<p><b>推理时</b>：模型看到的历史和它自己当初生成的不一样，比如 think 被删掉、工具调用格式被改写。这本身不一定出错，但前缀每轮都在变，SGLang 的前缀缓存会失效，每轮都要从头计算整段上下文，长轨迹会非常慢。<b>训练时</b>：如果用重新渲染的序列训练，assistant 部分的 token 和采样时生成的不一样，<code>rollout_log_probs</code> 对不上号，PPO 的概率比值失去意义。如果只在推理时重新渲染、训练时用另一套序列，又会出现"训练的序列和模型实际看到的不一致"。按增量方式记账，推理和训练用的是同一条序列，两个问题都避免了。</p></details>
+<details><summary>Q2：环境注入部分的 logprob 填了 0.0，这会不会影响训练？</summary>
+<p>不会。这些位置的 <code>response_mask</code> 是 0，计算 loss 时会被乘以 0 或者直接排除，不产生梯度。填 0.0 只是为了让 <code>response_logprobs</code> 和 <code>response_mask</code> 保持等长，方便按位置对齐。唯一受影响的是"推理概率和训练概率差异"这类诊断指标：如果统计时没有按 mask 过滤，数值会被拉偏。</p></details>
+<details><summary>Q3：为什么锚点选一条空的 user 消息，而不是 system 消息？</summary>
+<p>很多模板对 system 消息有特殊处理：只允许出现在开头；或者没有 system 时会自动插入一条默认的 system；有工具定义时还会把工具列表渲染进 system。用 system 做锚点，渲染结果会随这些条件变化，就不能保证"锚点总是同一段前缀"。空的 user 消息在支持的模板里，不管在什么位置渲染结果都一样，而且它不是 tool 消息，后面的 tool 消息就会正确地写出 <code>&lt;|im_start|&gt;user</code> 头部。<code>render_injected_turn</code> 里的 <code>assert</code> 就是为了在换模型、换模板时，及时发现锚点不再成立。</p></details>
+<details><summary>Q4：模型在一轮里只输出了文本、没有调用工具，但任务其实没做完，会怎样？</summary>
+<p><code>step()</code> 返回 None，<code>run()</code> 以 <code>Idle</code> 状态结束。这条轨迹照常打分，通常会因为任务没有完成而得到低分。这正是 RL 要教会模型的：不要过早宣布完成。</p></details>
+
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="03a-thread-eventloop.html">← 第三课（上）：线程与事件循环</a><a href="04-actor-update.html">第四课：从奖励到 actor 更新 →</a></div>
+</main>
+</body>
+</html>

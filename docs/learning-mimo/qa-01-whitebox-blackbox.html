@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>问答：白盒 vs 黑盒 harness · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>问答：白盒 vs 黑盒 harness</h2>
+  <ol>
+
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="01-main-ppo.html">← 第一课：main_ppo → 训练主循环</a><a href="02-agent-loop-init.html">第二课：Agent Loop 初始化 →</a></div>
+<h2 id="qa1">问答：mimoagent 是白盒 agent RL 吗？仓库里有黑盒 RL 吗？</h2>
+<div class="box ask"><b>提问</b>：mimo agent 这里是白盒 agent RL 吧？这个仓库有黑盒 RL 优化部分吗？</div>
+<p><b>结论</b>：是的，5 个环境的训练用的都是白盒 harness。黑盒代码存在，但没有接进本仓库任何一个训练脚本。</p>
+
+<h3>"黑盒/白盒"说的是 agent 框架，不是模型</h3>
+<p>模型始终是"白盒"：权重在我们手里，用 PPO/GRPO 求梯度更新。区别在于<b>驱动模型多轮调用工具的那段循环代码（harness）由谁控制</b>：</p>
+<table>
+  <tr><th></th><th>白盒 harness</th><th>黑盒 harness</th></tr>
+  <tr><td>循环代码</td><td>我们自己的 Python 代码（mimoagent 的 <code>cc-agent</code>、<code>codex-agent</code> 等）</td><td>第三方程序，比如真正的 <code>claude</code> 命令行、Codex CLI，装在沙箱里运行</td></tr>
+  <tr><td>怎么调用模型</td><td>直接调推理服务，拿到 token id</td><td>只发 HTTP 请求（OpenAI/Anthropic 接口格式），内容是整段对话<b>文本</b></td></tr>
+  <tr><td>训练侧能看到什么</td><td>每轮模型生成了哪些 token、哪些 token 是工具返回的，一清二楚</td><td>只看到文本请求，需要自己还原成 token 序列</td></tr>
+</table>
+
+<h3>依据：训练配置全是白盒</h3>
+<pre><code>config/agent/code/mini-bash.yaml        type: bashonly-agent
+config/agent/code/mini-claude-code.yaml type: cc-agent
+config/agent/code/mini-codex.yaml       type: codex-agent
+config/agent/code/mini-mimocode.yaml    type: mimocode-agent
+config/agent/general/s3k.yaml           type: cc-agent
+config/agent/design/webdev.yaml         type: webdev-agent</code></pre>
+<div class="box warn"><code>cc-agent</code> <b>不是真正的 Claude Code</b>，而是 mimoagent 用 Python 重写的"仿 Claude Code"：工具集和提示词风格一样，但循环由我们控制。所以配置文件名叫 <code>mini-claude-code</code>。<br><b>补充（勘误）</b>：<code>s3k.yaml</code> 虽然也写了 <code>type: cc-agent</code>，但 General 环境实际运行的是 <code>DefaultAgent</code> 加上 Claude Code 命名的工具，这一行不生效。详见<a href="02-agent-loop-init.html#erratum-1">第二课勘误</a>。白盒的结论不受影响。</div>
+<span class="src">recipes/code/__init__.py</span>
+<pre><code>"""The four-whitebox code recipe: verl -&gt; Uni-Agent -&gt; MimoAgent.
+
+"Whitebox" is the distinction that matters: all four arms drive their tools
+in-process through the Gateway, so the policy's own tokens are what call them.
+The blackbox harnesses that run a real CLI inside the pod are a different
+mechanism and are not part of this mix.
+"""</code></pre>
+<p>选白盒的理由：执行的每次工具调用，都是从策略模型自己生成的 token 解析出来的。这和 MiMo 的"工具调用级别奖励分配"直接相关：工具调用出错时，能准确定位到是哪段 token 产生的这次调用，再对它加惩罚。黑盒程序可能改写、截断、重新拼接对话历史，这种对应关系就不可靠了。</p>
+
+<h3>黑盒代码在哪里</h3>
+<p><b>① mimoagent 的黑盒适配器</b>：<code>third_party/mimoagent-osr/src/mimoagent/agents/blackbox/</code>，共 14 个（claude-code、codex、opencode、kimi-code……），会在任务容器里安装并运行真正的命令行程序，主要用于<b>评测</b>。本仓库的衔接代码给它们留了一个分支：</p>
+<span class="src">recipes/code/mimoagent_runner.py</span>
+<pre><code>_MODEL_BACKED_AGENT_TYPES = {"default", "bashonly-agent", "mimocode-agent", "cc-agent", "codex-agent"}
+...
+    if agent_type in _MODEL_BACKED_AGENT_TYPES:     # 白盒：创建真正的模型对象，由我们的循环调用
+        return get_model(config=model_config)
+    return SimpleNamespace(                          # 黑盒：只给一个空壳，里面只有 base_url 等连接信息，
+        config=SimpleNamespace(model_name=model_name, model_kwargs=model_kwargs),  # 黑盒程序自己去发请求
+        token_stats=_TokenStats(), n_calls=0)</code></pre>
+<p><b>② uni-agent 的黑盒 RL 示例</b>：<code>third_party/uni_agent/examples/blackbox_recipes/claude_code/</code>，用真正的 Claude Code 做 RL 训练的完整示例：</p>
+<pre><code>runner 创建沙箱 → 把 claude 程序挂载进去
+  → 在沙箱里执行 claude -p &lt;任务&gt;，ANTHROPIC_BASE_URL 指向 uni-agent 网关
+  → claude 每轮把完整对话以文本发给网关
+  → 网关：文本 → token → SGLang 生成 → 记录 token 和 logprob → 把文本回复返回给 claude
+  → 任务结束后在同一沙箱里打分 → 奖励发给网关 → 轨迹写入 TransferQueue</code></pre>
+
+<h3>黑盒 RL 难在哪：网关要把文本还原成 token</h3>
+<p>RL 训练需要知道"模型在每个位置生成了哪个 token、概率是多少"，还需要 <code>response_mask</code> 来区分哪些 token 是模型生成的（要算梯度）、哪些是工具返回的（不算梯度）。网关（<code>uni_agent/gateway/session/session.py</code>）因此要做两件事：</p>
+<ol>
+  <li>用 chat template 把对话编码成 token（<code>codec.py</code>）；</li>
+  <li>给每条消息算哈希（<code>_compute_message_hash</code>），检查新请求的前缀是否和已记录的某条"链"（<code>ChainState</code>）一致（<code>_is_chain_prefix_hash_match</code>）。一致就把新增的 token 接到这条链后面；不一致说明 Claude Code 压缩或改写了历史，只能另开一条新链。所以一次会话可能产出多条轨迹，这正是 key 里有 <code>index</code> 的原因。</li>
+</ol>
+<table>
+  <tr><th>训练路径</th><th>harness</th><th>是否经过网关</th><th>本仓库用来训练</th></tr>
+  <tr><td>General / Cyber / Visual</td><td>白盒（mimoagent 原生循环）</td><td>否，直接用 verl AgentLoop</td><td>✅</td></tr>
+  <tr><td>Code</td><td>白盒（4 种 harness 混合）</td><td>是，经过 uni-agent 网关</td><td>✅</td></tr>
+  <tr><td>黑盒 Claude Code 等</td><td>真正的命令行程序</td><td>是，必须经过网关</td><td>❌ 只在子模块示例里 / 用于评测</td></tr>
+</table>
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="01-main-ppo.html">← 第一课：main_ppo → 训练主循环</a><a href="02-agent-loop-init.html">第二课：Agent Loop 初始化 →</a></div>
+</main>
+</body>
+</html>

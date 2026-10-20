@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第四课：从奖励到 actor 更新 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>第四课：从奖励到 actor 更新</h2>
+  <ol>
+    <li><a href="#l4-0">0. 路线与 General 实际生效的开关</a></li>
+    <li><a href="#l4-1">1. 奖励从一个数变成每个 token 的分数</a></li>
+    <li><a href="#l4-2">2. 采样阶段：丢掉没有区分度的组</a></li>
+    <li><a href="#l4-3">3. old_log_prob：重新算一遍概率</a></li>
+    <li><a href="#l4-4">4. 优势计算：GRPO 与 -999</a></li>
+    <li><a href="#l4-5">5. MiMo 新增的 token 级通道（General 未开启）</a></li>
+    <li><a href="#l4-6">6. prompt-mean：每个 prompt 权重相同</a></li>
+    <li><a href="#l4-7">7. PPO 损失与这里的特殊情况</a></li>
+    <li><a href="#l4-8">8. 更新参数并同步给推理服务</a></li>
+    <li><a href="#l4-9">9. 发现：length_penalty 配了但没有生效</a></li>
+    <li><a href="#l4-10">10. 思考题</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="03b-harness-execution.html">← 第三课（下）：harness 执行</a><a href="xb-uni-agent-gateway.html">插课 B：uni-agent 网关 →</a></div>
+
+<h2 id="l4">第四课：从奖励到 actor 更新</h2>
+<div class="box ask"><b>提问</b>：先暂时不要改（指插课 A 的疑似 bug），我们开始下一阶段学习吧。</div>
+
+<h3 id="l4-0">0. 路线与 General 实际生效的开关</h3>
+<p>第一课讲过，<code>_step_once</code> 依次执行：采样 → 均衡分配 → old_log_prob → 优势 → 更新 actor。这一课沿着这条线，看一条轨迹的奖励分数是怎么一步步变成梯度的。</p>
+<pre><code>AgentLoopOutput.reward_score（一个数）
+  → rm_scores（每个 token 一个分数，只有最后一个位置非零）            §1
+  → replay_buffer.sample：奖励全相同的组被丢掉                        §2
+  → old_log_probs：用当前 actor 重新算每个 token 的对数概率             §3
+  → _compute_advantage：GRPO 组内比较；-999 的样本优势置 0               §4（§5 的通道 General 未开）
+  → prompt_loss_weights：每个 prompt 的总权重相同                        §6
+  → ppo_loss：比值、截断、按权重求和                                     §7
+  → Megatron 反向传播、优化器更新 → 新权重推给 SGLang                    §8</code></pre>
+<p>MiMo 在这一段加了很多可选功能，但 <b>General 环境实际启用的只有一部分</b>。先列清楚，后面就知道哪些是重点：</p>
+<table>
+  <tr><th>配置</th><th>General 的值</th><th>是否生效</th></tr>
+  <tr><td><code>algorithm.adv_estimator</code></td><td><code>grpo</code></td><td>✅</td></tr>
+  <tr><td><code>algorithm.norm_adv_by_std_in_grpo</code></td><td><code>false</code>：优势只减去组均值，不除以标准差（Dr.GRPO 做法）</td><td>✅</td></tr>
+  <tr><td><code>algorithm.invalid_reward_value</code></td><td><code>-999</code></td><td>✅ 见 §4</td></tr>
+  <tr><td><code>algorithm.filter_groups</code></td><td>enable，metric=reward</td><td>✅ 见 §2</td></tr>
+  <tr><td><code>actor.loss_agg_mode</code></td><td><code>prompt-mean</code></td><td>✅ 见 §6</td></tr>
+  <tr><td><code>actor.clip_ratio</code> / <code>ppo_epochs</code></td><td>0.2 / 1（默认）</td><td>✅ 见 §7</td></tr>
+  <tr><td><code>use_kl_loss</code> / <code>use_kl_in_reward</code> / <code>entropy_coeff</code></td><td>false / false / 0</td><td>不用 KL、不加熵奖励</td></tr>
+  <tr><td><code>tool_call_error_penalty</code>、<code>repetition_penalty</code>、<code>deep_failure_mask</code></td><td>未配置，默认 <code>enable: false</code></td><td>❌ 见 §5</td></tr>
+  <tr><td><code>algorithm.length_penalty</code></td><td>enable: true，配了一组参数</td><td>⚠ <b>没有代码读取它</b>，见 §9</td></tr>
+</table>
+
+<h3 id="l4-1">1. 奖励从一个数变成每个 token 的分数</h3>
+<p><code>AgentLoopOutput.as_dict()</code> 转成 tensor 时，把整条轨迹的奖励放到 response 的<b>最后一个位置</b>，其余位置都是 0：</p>
+<span class="src">verl/experimental/agent_loop/agent_loop.py:143</span>
+<pre><code>reward_score = output.pop("reward_score", None)
+if reward_score is not None:
+    rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)   # 形状 = (response 长度,)
+    rm_scores[-1] = reward_score                                                  # 只有最后一个位置非零
+    output["rm_scores"] = rm_scores</code></pre>
+<p>为什么要做成这种"每个 token 一个数"的形式？因为 verl 的接口要兼容按 token 给奖励的算法（比如 PPO 加 GAE）。对 GRPO 来说，下一步马上会对 <code>rm_scores</code> 按行求和，得到的又是原来那个标量，所以放在哪个位置都不影响结果。</p>
+
+<h3 id="l4-2">2. 采样阶段：丢掉没有区分度的组</h3>
+<p>GRPO 的优势是"这条轨迹比同组平均好多少"。如果一组 8 条轨迹的奖励完全相同（全对或全错），每条的优势都是 0，这一组对梯度没有任何贡献，却仍然占着 batch 的位置和计算量。<code>filter_groups</code> 在 <code>replay_buffer.sample</code> 阶段就把这种组丢掉，再补充新的 prompt 去生成（第一课 §4 的"丢 k 个补 2k 个"）。</p>
+<p>结果是：<b>进入训练的每一组，组内奖励一定不全相同</b>。General 打开了 <code>REWARD_BINARIZE</code>（插课 A §6），奖励只有 0 和 1，所以"全对"和"全错"这两种组都会被过滤。</p>
+
+<h3 id="l4-3">3. old_log_prob：重新算一遍概率</h3>
+<p>推理服务 SGLang 生成时已经返回了每个 token 的 logprob（<code>rollout_log_probs</code>），为什么还要用 Megatron 的 actor 重算一遍（<code>old_log_probs</code>）？</p>
+<ul>
+  <li>SGLang 和 Megatron 是两套不同的计算实现（算子、精度、并行切分都不同），对同一个 token 算出来的概率会有微小差异。</li>
+  <li>PPO 的比值 <code>π_θ / π_old</code> 中，分子 <code>π_θ</code> 是训练时 Megatron 算的。如果分母用 SGLang 的值，两者的实现差异就会混进比值里，让比值偏离真实的策略变化。所以分母也要用同一套 Megatron 实现来算。</li>
+  <li>两者的差异可以作为诊断指标：<code>calculate_debug_metrics</code> 会输出 rollout 和 actor 之间的 logprob 差异。如果需要修正这种差异，verl 提供了 <code>algorithm.rollout_correction</code>（重要性采样修正），General 没有配置它。</li>
+</ul>
+<p>第三课（下）讲过，环境注入部分的 logprob 填的是 0.0，那些位置 <code>response_mask=0</code>，不参与这里任何计算。</p>
+
+<h3 id="l4-4">4. 优势计算：GRPO 与 -999</h3>
+<h4>4.1 取数据</h4>
+<span class="src">verl/trainer/ppo/v1/trainer_base.py _compute_advantage（摘要）</span>
+<pre><code>fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+data = DataProto(batch=data.to_padded_tensor())        # 变长序列补齐成 (行数, 最大 response 长度) 的矩阵
+data.batch["token_level_scores"] = data.batch["rm_scores"]
+...                                                     # 各种可选惩罚（General 未开）
+data.batch["token_level_rewards"] = data.batch["token_level_scores"]   # 没有 KL 惩罚，直接等于
+data = compute_advantage_for_multi_trajectories(data, batch_keys=batch.keys, adv_estimator="grpo",
+                                                norm_adv_by_std_in_grpo=False, config=self.config.algorithm, ...)</code></pre>
+<p><code>compute_advantage_for_multi_trajectories</code>（<code>verl/trainer/ppo/v1/utils.py:204</code>）用来处理"一次采样产出多条轨迹"的情况：key 是 <code>{uid}_{session_id}_{index}</code>，只用每个 session 的<b>最后一个</b>输出参与组内比较，算出的优势再复制给这个 session 的其他输出。General 每个 session 只有一个输出（index 总是 0），所以这里等价于直接按 <code>uid</code> 分组做 GRPO。</p>
+
+<h4>4.2 GRPO 的核心计算</h4>
+<span class="src">verl/trainer/ppo/core_algos.py compute_grpo_outcome_advantage（摘要）</span>
+<pre><code>scores = token_level_rewards.sum(dim=-1)                 # 每行一个标量奖励，形状 (行数,)
+
+# ── MiMo 新增：处理 -999 ──
+invalid_mask = scores == invalid_reward_value             # 哪些行是基础设施故障
+for 每个无效行 i:
+    scores[i] = 同组有效行奖励的平均值（同组没有有效行就用 0）
+
+# ── 标准 GRPO ──
+id2mean[uid] = 同组所有行 scores 的平均值
+scores[i] = scores[i] - id2mean[index[i]]                 # norm_adv_by_std_in_grpo=False：不除以标准差
+scores[invalid_mask] = 0.0                                # ── MiMo 新增：无效行的优势强制为 0
+scores = scores.unsqueeze(-1) * response_mask             # 把这个数复制到这一行每个"模型生成"的 token 上</code></pre>
+<p>用一组具体数字走一遍。一个 prompt 的 8 条轨迹，其中第 4 条的 pod 起不来，奖励是 -999：</p>
+<table>
+  <tr><th>轨迹</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th></tr>
+  <tr><td>原始奖励</td><td>1</td><td>0</td><td>1</td><td><b>-999</b></td><td>0</td><td>0</td><td>1</td><td>0</td></tr>
+  <tr><td>替换无效值</td><td>1</td><td>0</td><td>1</td><td>3/7≈0.43</td><td>0</td><td>0</td><td>1</td><td>0</td></tr>
+  <tr><td>组均值</td><td colspan="8">(3 + 0.43) / 8 ≈ 0.43（与 7 个有效值的均值相同）</td></tr>
+  <tr><td>优势</td><td>+0.57</td><td>-0.43</td><td>+0.57</td><td><b>0</b>（强制）</td><td>-0.43</td><td>-0.43</td><td>+0.57</td><td>-0.43</td></tr>
+</table>
+<p>为什么先用有效值的均值替换 -999，而不是直接把那一行删掉？</p>
+<ul>
+  <li><b>如果不做任何处理</b>：-999 会把组均值拉到大约 -124，其他 7 条全部得到一个巨大的正优势，梯度会完全失控。</li>
+  <li><b>替换成有效均值</b>：组均值保持为 7 个有效值的均值，其他轨迹的优势和"这一行根本不存在"时完全一样。然后再把这一行自己的优势置 0，它就不产生梯度。</li>
+  <li><b>为什么不直接删掉</b>：batch 里的行数要按数据并行的份数对齐，后面的流程也假设每组的行数固定。保留这一行、只把它的贡献清零，是改动最小的做法。</li>
+</ul>
+<div class="box note">另一个开关 <code>DROP_INFRA_FROM_GROUP=1</code> 的做法是：把故障行的 <code>uid</code> 改成一个唯一的新值，让它自成一组（组内只有自己，优势为 0）。<code>run_general.sh</code> 明确禁止两者同时打开，因为它们做的是同一件事。</div>
+
+<h4>4.3 优势在 token 上的分布</h4>
+<p><code>scores.unsqueeze(-1) * response_mask</code> 的意思是：这一行所有"模型生成"的 token（mask=1）都得到同一个优势值，所有环境注入的 token（mask=0）得到 0。以第 1 条轨迹为例：</p>
+<pre><code>response_mask: [1 1 1 1 | 0 0 0 0 0 | 1 1 1 | 0 0 0 | 1 1]
+advantages:    [.57 .57 .57 .57 | 0 0 0 0 0 | .57 .57 .57 | 0 0 0 | .57 .57]</code></pre>
+<p>所以在 General 里，<b>一条轨迹中每一轮生成都被同等地奖励或惩罚</b>，不管是哪一轮的哪个动作导致了成功或失败。这正是 §5 那些 token 级通道想要改进的地方：对"工具调用格式出错的那一轮"单独施加惩罚。</p>
+
+<h3 id="l4-5">5. MiMo 新增的 token 级通道（General 未开启）</h3>
+<p>这些功能在 General 的配置下都处于关闭状态，但它们是这个分支新增内容的重点，Code 和 arvo 环境会用到，这里简要说明它们的作用。</p>
+<h4>5.1 有标记 token 的处理策略</h4>
+<p>"工具调用出错的 token"（<code>tool_call_error_mask</code>，第三课下 §9）和"重复生成的 token"（<code>repetition_mask</code>）共用同一套策略（<code>_apply_tool_call_error_strategy</code> / <code>_apply_marked_token_advantage_penalty</code>）：</p>
+<table>
+  <tr><th>strategy</th><th>做法</th><th>时机</th></tr>
+  <tr><td><code>monitor</code></td><td>只统计指标（<code>penalty/*_tokens</code>、<code>*_rate</code>），不改任何东西</td><td>—</td></tr>
+  <tr><td><code>mask</code></td><td>把这些 token 的 <code>response_mask</code> 设为 0，它们不参与训练</td><td>GRPO 之前</td></tr>
+  <tr><td><code>adv_reduction</code></td><td>优势减去 <code>penalty_value</code></td><td>GRPO 之后</td></tr>
+  <tr><td><code>adv_set</code></td><td>优势直接设为 <code>penalty_value</code>（比如 -1）</td><td>GRPO 之后</td></tr>
+  <tr><td><code>adv_signed</code></td><td>按所在轨迹优势的正负分别处理，并且保持总量不变（见 5.2）</td><td>GRPO 之后</td></tr>
+</table>
+<h4>5.2 adv_signed：只改变分配，不改变总量</h4>
+<p><code>verl/trainer/ppo/signed_rebalance.py</code> 的说明：</p>
+<ul>
+  <li><b>优势为正的轨迹</b>（成功了），其中被标记的 token：优势设为 0，不再强化这一段。被拿走的那部分"优势总量"，按同一个比例 α（α ≥ 1，最大到 <code>signed_max_scale=2.0</code>）加回到所有成功轨迹的正常 token 上。</li>
+  <li><b>优势为负的轨迹</b>（失败了），其中被标记的 token：优势乘以 κ（κ ≥ 1），对这一段惩罚得更重。多出来的那部分惩罚，按比例 β（β ≤ 1，最小到 <code>signed_min_scale=0.5</code>）从所有失败轨迹的正常 token 上扣回来。</li>
+</ul>
+<p>为什么要"保持总量不变"？注释给出的理由是：如果直接把出错的那一轮设为 -1（<code>adv_set</code>），等于往整个 batch 里额外注入了一批负的优势。在不使用 KL 约束、也没有熵奖励的情况下，这会让策略整体变得更平坦，输出也越来越长。保持正负两边各自的总量不变，只是在轨迹内部重新分配"该怪哪一段"，不改变 batch 整体的训练信号强度。在 prompt-mean 模式下，"总量"是按 §6 的权重加权计算的。</p>
+<h4>5.3 deep_failure_mask（实验性）</h4>
+<p>对每个 prompt 组，取成功轨迹轮数的中位数，乘以 α 得到 k。对失败的轨迹，把第 k 轮之后的 token 从训练中去掉（<code>mask_failure</code>）。依据是：失败轨迹的后半段往往在"原地打转"，这些 token 本身未必是错误的行为，只是因为整条轨迹失败才被惩罚，把它们去掉可以减少错误的惩罚信号。</p>
+
+<h3 id="l4-6">6. prompt-mean：每个 prompt 权重相同</h3>
+<h4>6.1 问题：token-mean 会让长 prompt 占主导</h4>
+<p>verl 默认的 <code>token-mean</code> 是"所有 token 的损失直接求平均"，每个 token 权重相同。长任务 agent 场景下，不同 prompt 的轨迹长度差异极大。假设一个 batch 里只有两个 prompt：</p>
+<table>
+  <tr><th></th><th>8 条轨迹的生成 token 总数</th><th>token-mean 下的总权重</th><th>prompt-mean 下的总权重</th></tr>
+  <tr><td>prompt A（难题，轨迹很长）</td><td>80,000</td><td>80000/88000 ≈ 91%</td><td>50%</td></tr>
+  <tr><td>prompt B（简单题，轨迹很短）</td><td>8,000</td><td>8000/88000 ≈ 9%</td><td>50%</td></tr>
+</table>
+<p>在 token-mean 下，训练信号几乎全部来自 prompt A，B 上学到的东西被稀释掉了。prompt-mean 先在每个 prompt 内部求平均，再在 prompt 之间求平均，每个 prompt 的总权重都相同。</p>
+
+<h4>6.2 权重怎么算</h4>
+<span class="src">verl/trainer/ppo/core_algos.py:1162</span>
+<pre><code>def compute_prompt_loss_weights(loss_mask, prompt_ids):
+    lengths = loss_mask.to(torch.bool).sum(dim=-1).tolist()      # 每一行有多少个参与训练的 token
+    totals[uid] += length                                         # 每个 prompt（uid）的 token 总数 T_u
+    prompt_count = sum(total &gt; 0 for total in totals.values())   # 有 token 的 prompt 数 P
+    return [1.0 / (prompt_count * totals[uid]) if length else 0.0 for 每一行]</code></pre>
+<p>每个 token 的权重 = <code>1 / (P × T_u)</code>，其中：</p>
+<ul>
+  <li><code>P</code>：这个 batch 里有多少个 prompt（General 是 64）；</li>
+  <li><code>T_u</code>：这个 token 所属的 prompt，8 条轨迹参与训练的 token 加起来的总数。</li>
+</ul>
+<p>所以一个 prompt 的所有 token 权重之和 = <code>T_u × 1/(P×T_u)</code> = <code>1/P</code>，全部 token 的权重加起来正好是 1，日志里的 <code>loss/prompt_mean_weight_sum</code> 应该约等于 1。注意，<b>在同一个 prompt 内部仍然是按 token 平均的</b>：同组里更长的轨迹贡献的 token 更多，总权重也更大。</p>
+
+<h4>6.3 为什么要求 TRAIN_BATCH_SIZE == PPO_MINI_BATCH_SIZE</h4>
+<p>这就是第一课 <code>run_general.sh</code> 那项检查的原因。权重中的 <code>P</code> 和 <code>T_u</code> 都是<b>在整个 batch 上</b>统计出来的（<code>_compute_advantage</code> 末尾算好，作为 <code>prompt_loss_weights</code> 存进 TransferQueue）。如果再把 batch 切成多个 mini-batch 分别做优化，每次优化只用到一部分行，这些行的权重加起来就不是 1，这个权重也就不再代表"每个 prompt 平均"。所以 <code>_update_actor</code> 在开头直接检查：</p>
+<pre><code>if loss_agg_mode == "prompt-mean" and len(batch) != ppo_mini_batch_size * rollout.n:
+    raise ValueError("prompt-mean requires one optimizer minibatch containing the complete sampled batch")</code></pre>
+<p>但这并不妨碍把 batch 分到多张卡、切成多个 micro-batch 依次计算：权重是先在整个 batch 上算好、跟着每一行走的，各张卡按自己分到的行取对应的权重即可，梯度累加之后结果不变。</p>
+
+<h4>6.4 在多张卡上怎么保证结果正确</h4>
+<span class="src">core_algos.py agg_loss</span>
+<pre><code>if loss_agg_mode == "prompt-mean":
+    loss = masked_sum(loss_mat * weights.unsqueeze(-1), loss_mask) * dp_size</code></pre>
+<p>每张卡只负责一部分行，算出的是"本卡这些行的加权和"。数据并行的梯度同步（all-reduce）会对各卡的梯度<b>取平均</b>，也就是除以 <code>dp_size</code>。这里先乘以 <code>dp_size</code>，取平均之后正好等于"所有行的加权和"，结果与在单卡上处理整个 batch 相同。</p>
+
+<h3 id="l4-7">7. PPO 损失与这里的特殊情况</h3>
+<span class="src">verl/workers/utils/losses.py ppo_loss → core_algos.compute_policy_loss_vanilla（摘要）</span>
+<pre><code>ratio = exp(log_prob - old_log_prob)                        # 新旧策略对同一个 token 的概率比
+pg_losses1 = -advantages * ratio
+pg_losses2 = -advantages * clamp(ratio, 1 - 0.2, 1 + 0.2)   # clip_ratio=0.2
+clip_pg_losses1 = max(pg_losses1, pg_losses2)               # 标准 PPO 截断
+pg_losses3 = -advantages * 3.0                               # clip_ratio_c=3.0：双重截断
+pg_losses = where(advantages &lt; 0, min(pg_losses3, clip_pg_losses1), clip_pg_losses1)
+pg_loss = agg_loss(pg_losses, response_mask, "prompt-mean", prompt_loss_weights=...)</code></pre>
+<p>逐项解释：</p>
+<ul>
+  <li><b>比值 ratio</b>：如果参数更新后，某个 token 的概率比采样时高了 10%，ratio 就是 1.1。</li>
+  <li><b>截断</b>：优势为正时，ratio 最多按 1.2 计算；优势为负时，最少按 0.8 计算。这样单次更新不会把策略推得太远。</li>
+  <li><b>双重截断</b>：优势为负、而 ratio 又非常大时（新策略反而大幅提高了一个坏动作的概率），损失最多按 3 倍优势计算，防止出现极端大的梯度。</li>
+</ul>
+<div class="box key"><b>在 General 的配置下，PPO 实际上退化成了"带组内基线的策略梯度"。</b>原因是三个条件同时成立：
+<ol>
+  <li><b>sync 模式</b>：生成用的是当前权重，没有旧数据；</li>
+  <li><b>整个 batch 只做一次优化</b>（mini-batch = 整个 batch，<code>ppo_epochs=1</code>）；</li>
+  <li>所以计算损失时，模型参数 <code>θ</code> 还没有更新，就等于计算 <code>old_log_prob</code> 时的参数。</li>
+</ol>
+这意味着 <code>ratio = exp(logπ_θ − logπ_old)</code> 理论上恒等于 1（实际只有数值误差），截断永远不会触发，<code>actor/pg_clipfrac</code> 应该接近 0。此时每个 token 的梯度 = <code>-A × 权重 × ∇logπ(token)</code>，也就是 REINFORCE 加上 GRPO 的组均值作为基线。截断机制只在多次更新同一批数据、或者使用异步训练、数据来自旧策略时才真正起作用。</div>
+
+<h3 id="l4-8">8. 更新参数并同步给推理服务</h3>
+<pre><code>_update_actor(batch)
+  → batch.extra_info: global_batch_size = mini_batch_size = 64 × 8 = 512 行, epochs = 1
+  → self.actor_rollout_wg.update_actor(batch)                     # 所有 GPU 同时执行
+       每张卡：按 ppo_max_token_len_per_gpu=262144 动态切分 micro-batch（use_dynamic_bsz）
+              前向 → ppo_loss → 反向，梯度在 micro-batch 之间累加
+       数据并行 all-reduce → 优化器 step（lr=2e-6）
+       参数 / 梯度 / 优化器状态平时放在 CPU 内存里，用时才搬到 GPU（param/grad/optimizer_offload: true）
+  → 返回 actor/pg_loss, actor/pg_clipfrac, actor/ppo_kl, actor/grad_norm ... 指标
+fit 循环：on_step_end → checkpoint_manager.update_weights(global_steps)   # 新权重推给 SGLang 并唤醒推理服务</code></pre>
+<p>至此，一个完整的训练步结束，回到第一课的主循环：下一批 prompt 用更新后的权重生成。</p>
+
+<h3 id="l4-9">9. 发现：length_penalty 配了但没有生效</h3>
+<div class="box warn"><b>只读代码得出的结论，没有实际运行验证。</b>
+<p><code>recipes/general/config/general.yaml</code> 配置了：</p>
+<pre><code>algorithm:
+  length_penalty:
+    enable: true
+    max_penalty: 0.1
+    deadzone: 0.3
+    saturate: 1.0
+    pass_threshold: 0.5
+    penalty_exponent: 1.5
+    anchor_quantile: 0.5
+    min_pass_rate: 0.5</code></pre>
+<p><code>general.sh</code> 也默认设置了 <code>LENGTH_PENALTY_ENABLE=True</code>。但在整个仓库里（不含子模块）搜索：</p>
+<ul>
+  <li>trainer 代码中<b>没有任何地方</b>读取 <code>algorithm.length_penalty</code>；</li>
+  <li>长度惩罚的实现在 <code>verl/utils/length_penalty.py</code>，唯一的调用方是 <code>verl/trainer/ppo/arvo_penalties.py</code>，读的是另一个路径 <code>reward_model.length_penalty</code>，并且只在 <code>algorithm.arvo_penalties.enable=true</code> 时才启用；</li>
+  <li>连字段名都对不上：<code>LengthPenaltyConfig</code> 用的是 <code>excess_threshold</code> / <code>excess_saturate</code>，而 General 配置写的是 <code>deadzone</code> / <code>saturate</code>。</li>
+</ul>
+<p>所以在 General 环境里，<b>长度惩罚实际没有生效</b>。如果实验记录里写着"开启了长度惩罚"，需要先核实这一点。</p></div>
+<p>这个长度惩罚本来要做什么（来自 <code>length_penalty.py</code> 的说明）：在同一组里，以"成功轨迹长度的中位数"为基准，对比基准长得多的<b>成功</b>轨迹，从奖励里扣掉最多 <code>max_penalty</code> 的分数。目的是抵消 GRPO 的长度偏好，鼓励模型用更短的轨迹解决问题。</p>
+
+<h3 id="l4-10">10. 思考题</h3>
+<details><summary>Q1：如果一组 8 条轨迹里有 7 条是 -999，只有 1 条有效，会怎样？如果 8 条全是 -999 呢？</summary>
+<p><b>7 条无效</b>：无效行都被替换成那条有效轨迹的奖励，组内 8 个值完全相同，所有优势都是 0，这一组不贡献梯度。<b>8 条全无效</b>：每个无效行都被替换成 0（同组没有有效行），优势也全是 0。两种情况都不会出错，只是浪费了这一组的位置。不过这种组是否在采样阶段就被 <code>filter_groups</code> 过滤掉，取决于 replay buffer 怎么比较 -999（本课没有展开）。日志里 <code>training/infra/*</code> 相关的指标可以看出这类组的比例。</p></details>
+<details><summary>Q2：prompt-mean 下，同一个 prompt 里一条 30000 token 的失败轨迹和一条 3000 token 的成功轨迹，谁对梯度的影响更大？</summary>
+<p>同一个 prompt 内部的每个 token 权重相同（都是 <code>1/(P×T_u)</code>），所以长轨迹的总权重是短轨迹的 10 倍。失败轨迹的优势为负，它的总"惩罚量"会远大于成功轨迹的总"奖励量"，在这个 prompt 内部，模型主要学到的是"降低那条长轨迹里各种动作的概率"。这也是 §5.3 的 deep_failure_mask、§9 的长度惩罚想要处理的问题之一。prompt-mean 只解决了 prompt <b>之间</b>的不平衡，没有解决 prompt <b>内部</b>的不平衡。</p></details>
+<details><summary>Q3：既然 ratio 恒等于 1，为什么还要算 old_log_prob？直接用 ratio=1 不行吗？</summary>
+<p>数学上，计算损失需要的是 <code>∇logπ_θ</code>，而这个梯度只能通过训练时的前向计算得到，跟 old_log_prob 无关。old_log_prob 的作用是：(1) 作为 PPO 公式的一部分，保证改成多 epoch 或者异步模式时，代码不用修改就是正确的；(2) 与 SGLang 返回的 rollout_log_probs 对比，监控推理和训练之间的概率差异。对于当前这种特殊配置，确实可以省掉这次前向计算来节约时间，但会失去 (1) 的通用性和 (2) 的监控能力。</p></details>
+
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="03b-harness-execution.html">← 第三课（下）：harness 执行</a><a href="xb-uni-agent-gateway.html">插课 B：uni-agent 网关 →</a></div>
+</main>
+</body>
+</html>

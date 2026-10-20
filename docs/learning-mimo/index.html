@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verl mimo 分支学习笔记 · 总览</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2>总览</h2>
+  <ol>
+    <li><a href="#about">说明</a></li>
+    <li><a href="#map">全景图</a></li>
+    <li><a href="#progress">进度</a></li>
+    <li><a href="#lessons">各课要点</a></li>
+    <li><a href="#qa">问答索引</a></li>
+    <li><a href="#todo">待学内容</a></li>
+    <li><a href="#changelog">更新记录</a></li>
+  </ol>
+  <h2 style="margin-top:20px">分篇</h2>
+  <ol>
+    <li><a href="01-main-ppo.html">第一课：main_ppo → 训练主循环</a></li>
+    <li><a href="qa-01-whitebox-blackbox.html">问答：白盒 vs 黑盒</a></li>
+    <li><a href="02-agent-loop-init.html">第二课：Agent Loop 初始化</a></li>
+    <li><a href="03a-thread-eventloop.html">第三课（上）：线程与事件循环</a></li>
+    <li><a href="03b-harness-execution.html">第三课（下）：harness 执行与 token 记账</a></li>
+    <li><a href="xa-ray-k8s-pod.html">插课 A：Ray 环境进程与 k8s pod</a></li>
+    <li><a href="04-actor-update.html">第四课：从奖励到 actor 更新</a></li>
+    <li><a href="xb-uni-agent-gateway.html">插课 B：Code 环境与 uni-agent 网关</a></li>
+  </ol>
+</nav>
+<main>
+<h1>verl mimo 分支学习笔记 · 总览</h1>
+
+<h2 id="about">说明</h2>
+<p class="meta">仓库：<code>/home/liu/projects/verl</code>，分支 <code>mimo-oss</code>（基于 verl 0.9.0.dev @ 2781c1e4，MiMo 的改动集中在 commit <code>e2b9fc03</code>）。</p>
+<ul>
+  <li>采用"总—分"结构：本页记录全景、进度和每课要点；细节在各分篇里，每篇对应一课或一次问答。</li>
+  <li>学习方式是交互式的，每篇里用紫色框标出当时的提问。</li>
+  <li>代码位置写成 <code>文件:行号</code>，行号以写笔记时的代码为准，代码更新后可能会偏移。</li>
+  <li>主线环境是 <b>General（s3k）</b>，因为它直接在 verl 的 AgentLoop 里驱动 mimoagent，和"main_ppo → agent loop → harness → actor 更新"这条学习路线最贴合。</li>
+</ul>
+
+<h2 id="map">全景图</h2>
+<pre><code>scripts/general/general.sh → recipes/general/run_general.sh
+  └ python -m verl.trainer.main_ppo --config-name=general                 <a href="01-main-ppo.html#l1-1">[第一课 §1]</a>
+     └ TaskRunnerV1.run                                                     <a href="01-main-ppo.html#l1-2">[第一课 §2]</a>
+        ├ tq.init                       TransferQueue：trainer 和 worker 之间共享的"字典"
+        ├ trainer.init                  Megatron actor / SGLang 推理服务 / 权重同步     <a href="01-main-ppo.html#l1-3">[第一课 §3]</a>
+        ├ init_agent_loop_manager       32 个 AgentLoopWorkerTQ                         <a href="02-agent-loop-init.html#l2-1">[第二课 ①②]</a>
+        └ trainer.fit
+           └ step
+              ├ A. 提交 prompt → worker._run_prompt → 8 × _run_agent_loop
+              │     └ new GeneralAgentLoop → run()                              <a href="02-agent-loop-init.html#l2-3">[第二课 ③]</a>
+              │          ├ DatasetEnvActor 起 pod，describe 拿工具定义          <a href="02-agent-loop-init.html#l2-4">[第二课 ④]</a> <a href="xa-ray-k8s-pod.html#xa-4">[插课A §4]</a>
+              │          ├ _VerlRolloutModel + _RemoteToolAgent(DefaultAgent) 组装 harness  <a href="02-agent-loop-init.html#erratum-1">[勘误]</a>
+              │          ├ agent.run() 在 _AGENT_POOL 线程里循环               <a href="03a-thread-eventloop.html">[第三课上]</a>
+              │          │    每轮 query → 切回事件循环 → 只渲染新增环境消息 → SGLang 生成 → 解析工具调用  <a href="03b-harness-execution.html#l3b-3">[第三课下]</a>
+              │          │    → 执行工具 → env_actor → k8s API server exec → pod(main/sidecar)  <a href="xa-ray-k8s-pod.html#xa-5">[插课A §5]</a>
+              │          ├ calculate_reward（sidecar 里打分，基础设施故障记 -999）  <a href="xa-ray-k8s-pod.html#xa-6">[插课A §6]</a>
+              │          └ TokenTrace → AgentLoopOutput → 写入 TransferQueue    <a href="03b-harness-execution.html#l3b-8">[第三课下 §8]</a>
+              └ B. _step_once
+                   replay_buffer.sample → old_log_prob → advantage → update_actor  <a href="01-main-ppo.html#l1-4">[第一课 §4]</a> <a href="04-actor-update.html">[第四课]</a></code></pre>
+
+<h2 id="progress">进度</h2>
+<table>
+  <tr><th>阶段</th><th>内容</th><th>分篇</th><th>状态</th></tr>
+  <tr><td>1</td><td>main_ppo → TaskRunnerV1 → trainer.init → fit 主循环</td><td><a href="01-main-ppo.html">01-main-ppo</a></td><td>✅</td></tr>
+  <tr><td>插曲</td><td>白盒 / 黑盒 harness 的区别，黑盒代码在哪</td><td><a href="qa-01-whitebox-blackbox.html">qa-01</a></td><td>✅</td></tr>
+  <tr><td>2</td><td>Agent Loop 初始化：manager → worker → GeneralAgentLoop → 开 pod、组装 harness</td><td><a href="02-agent-loop-init.html">02-agent-loop-init</a></td><td>✅</td></tr>
+  <tr><td>3（上）</td><td>线程与事件循环的来回切换（含答疑：generate 会不会卡住事件循环）</td><td><a href="03a-thread-eventloop.html">03a-thread-eventloop</a></td><td>✅</td></tr>
+  <tr><td>3（下）</td><td>harness 执行：消息 → token、TokenTrace、锚点渲染、response_mask、AgentLoopOutput、工具调用错误标记</td><td><a href="03b-harness-execution.html">03b-harness-execution</a></td><td>✅</td></tr>
+  <tr><td>插课 A</td><td>Ray 环境进程（DatasetEnvActor）与 k8s pod 的配合：部署位置、pod 结构、建 pod、exec 执行工具、打分、清理、故障分类</td><td><a href="xa-ray-k8s-pod.html">xa-ray-k8s-pod</a></td><td>✅</td></tr>
+  <tr><td>4</td><td>从奖励到 actor 更新：rm_scores、filter_groups、old_log_prob、GRPO 与 -999、token 级通道、prompt-mean、PPO 损失、参数同步</td><td><a href="04-actor-update.html">04-actor-update</a></td><td>✅</td></tr>
+  <tr><td>插课 B</td><td>Code 环境走 uni-agent：替换 rollout 管理器、网关 session、链匹配与回退、runner、四 harness 混训、两条路对比</td><td><a href="xb-uni-agent-gateway.html">xb-uni-agent-gateway</a></td><td>✅</td></tr>
+</table>
+
+<h2 id="lessons">各课要点</h2>
+<div class="cards">
+  <div class="card">
+    <h3><a href="01-main-ppo.html">第一课：main_ppo → 训练主循环</a></h3>
+    <ul>
+      <li>配置分层：verl 默认配置 &lt; general.yaml &lt; 命令行参数。</li>
+      <li>v1 trainer 里，生成和训练通过 TransferQueue 解耦：trainer 只登记 prompt、发出生成请求，然后由 replay_buffer 轮询状态取回结果。</li>
+      <li>hybrid engine：训练和推理共用 GPU，用睡眠/唤醒轮流占用显存。</li>
+      <li><code>_step_once</code>：sample → old_log_prob → advantage → update_actor。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="qa-01-whitebox-blackbox.html">问答：白盒 vs 黑盒 harness</a></h3>
+    <ul>
+      <li>黑盒/白盒指的是 agent 循环由谁控制，与模型本身无关。</li>
+      <li>5 个环境的训练都用白盒；<code>cc-agent</code> 是用 Python 仿写的 Claude Code，不是真正的 Claude Code。</li>
+      <li>黑盒代码在 mimoagent 的 <code>agents/blackbox/</code> 和 uni-agent 的 <code>blackbox_recipes/</code>。</li>
+      <li>黑盒 RL 的难点：网关要把文本请求还原成 token，靠前缀哈希判断能否续接到已有的链上。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="02-agent-loop-init.html">第二课：Agent Loop 初始化</a></h3>
+    <ul>
+      <li>四层：manager → worker（读登记表）→ 每条轨迹一个 GeneralAgentLoop → run() 里开 pod、组装 harness。</li>
+      <li>"桥"的设计：mimoagent 循环原样运行，只替换两点——模型换成 <code>_VerlRolloutModel</code>，执行工具转发给 env_actor。</li>
+      <li>pod 放在单独的 <code>DatasetEnvActor</code> 进程：工具必须和 pod 客户端同进程，并且卡死时可以直接 kill。</li>
+      <li>失败时返回格式完整的 <code>_failure_output</code>（reward=-999），避免连累整个 batch。</li>
+      <li>⚠ <a href="02-agent-loop-init.html#erratum-1">勘误</a>：General 实际运行的是 <code>DefaultAgent</code> 加 Claude Code 命名的工具；yaml 里的 <code>type: cc-agent</code> 和 <code>antihack</code> 不生效。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="03a-thread-eventloop.html">第三课（上）：线程与事件循环</a></h3>
+    <ul>
+      <li>异步切到同步用 <code>run_in_executor</code>，同步切回异步用 <code>run_coroutine_threadsafe</code>。</li>
+      <li>不死锁的三个条件：query 不在 L 上调用；T 等待时 L 空闲；agent.run 用专用线程池。</li>
+      <li>T 和 L 严格轮流执行，所以共享数据不用加锁。</li>
+      <li>线程杀不掉，超时后靠停止开关加 kill env_actor，让线程自己退出（协作式取消）。</li>
+      <li>generate 在 L 上 <code>await</code> 是挂起而不是占用，真正阻塞等待的是 T。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="03b-harness-execution.html">第三课（下）：harness 执行与 token 记账</a></h3>
+    <ul>
+      <li>模型生成的 token 原样保存，绝不重新渲染；只把新增的环境消息渲染成 token（token 进、token 出）。</li>
+      <li><code>TokenTrace</code>：prompt 只记一次；之后生成部分 mask=1，环境注入部分 mask=0，logprob 填 0.0。</li>
+      <li><code>select_delta_messages</code> 用游标取新增消息并丢掉 assistant；多条 tool 消息要一次性渲染。</li>
+      <li>锚点技巧：在新消息前加一条空 user 消息一起渲染，再切掉锚点，补上 <code>turn_separator</code>。</li>
+      <li>预算在消息边界检查，超了就抛 <code>ResponseBudgetExhausted</code>，正常结束。</li>
+      <li>工具调用错误 = <code>FormatError</code>（格式不对），每轮一个布尔值；General <b>没有</b>生成 token 级的 <code>tool_call_error_mask</code>，Code 和 arvo 有。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="xa-ray-k8s-pod.html">插课 A：Ray 环境进程与 k8s pod</a></h3>
+    <ul>
+      <li>agent 循环不在 pod 里；每条轨迹 = 1 个 <code>DatasetEnvActor</code>（只占 0.125 CPU）+ 1 个 pod。</li>
+      <li>actor 与 pod 之间没有直接网络连接，全部经过 API server：HTTPS 管理 pod 生命周期，exec（WebSocket）执行命令、用 tar 传文件。</li>
+      <li>pod = main（工作区，模型的工具都发到这里）+ sidecar（MCP 服务、数据库、verifier），共享网络，文件物理隔离；答案在打分时才上传到 sidecar。</li>
+      <li>多容器 exec 必须指定目标容器：用代理加线程局部变量实现，保证并行的工具调用各自发到正确的容器。</li>
+      <li>⚠ <a href="xa-ray-k8s-pod.html#xa-bug">疑似 bug</a>：General/arvo 在 rollout 中途 pod 断连时，error_category 带了错误信息后缀，精确匹配不上，奖励记成 0 而不是 -999。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="04-actor-update.html">第四课：从奖励到 actor 更新</a></h3>
+    <ul>
+      <li>奖励放在 response 最后一个位置（rm_scores），GRPO 再按行求和还原成标量。</li>
+      <li>GRPO（不除以标准差）：优势 = 奖励 − 组均值，复制到这一行每个生成 token 上；-999 先替换成有效均值再把自身优势置 0，其他行不受影响。</li>
+      <li>prompt-mean：每个 token 权重 1/(P×T_u)，每个 prompt 总权重相同；权重在整个 batch 上算好，所以 batch 不能再切成多个 mini-batch 分别优化。</li>
+      <li>sync + 单次优化 ⇒ ratio≈1，截断不会触发，PPO 退化为带组内基线的策略梯度。</li>
+      <li>token 级通道（工具调用错误、重复、deep_failure_mask、adv_signed 保持总量不变）在 General 均未开启。</li>
+      <li>⚠ <a href="04-actor-update.html#l4-9">发现</a>：General 配置的 <code>algorithm.length_penalty</code> 没有任何代码读取，实际不生效。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="xb-uni-agent-gateway.html">插课 B：Code 环境与 uni-agent 网关</a></h3>
+    <ul>
+      <li>通过 <code>agent.agent_loop_manager_class</code> 把 verl 的 rollout 管理器整个换掉；trainer 侧（第四课）完全不变。</li>
+      <li>mimoagent 一个字没改：原装模型对象发 HTTP，发给 session 专属 URL，网关假装是 OpenAI 服务。</li>
+      <li>网关靠<b>消息前缀哈希链</b>判断能否增量续接；匹配失败就开新链，所以一个 session 可能产出多条轨迹（默认只留最长那条）。</li>
+      <li>网关额外记了 <code>generation_spans</code>（每轮生成的 token 区间）——General 缺的正是这个，所以 Code 能做 token 级工具调用惩罚。</li>
+      <li>奖励由 runner HTTP POST 回网关，在网关和轨迹会合。</li>
+      <li>四种 whitebox harness 混训，<code>step-hash</code> 模式保证同组同 harness、跨步轮换。</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="qa">问答索引</h2>
+<table>
+  <tr><th>问题</th><th>位置</th></tr>
+  <tr><td>mimoagent 是白盒 agent RL 吗？仓库里有黑盒 RL 吗？</td><td><a href="qa-01-whitebox-blackbox.html">qa-01</a></td></tr>
+  <tr><td>讲一下 mimo 的 agent loop 初始化</td><td><a href="02-agent-loop-init.html">第二课</a></td></tr>
+  <tr><td>线程和事件循环之间来回切换的细节</td><td><a href="03a-thread-eventloop.html">第三课（上）§1-6</a></td></tr>
+  <tr><td>generate 在事件循环上执行，不是应该在 agent.run 里吗？多轮时会不会卡住事件循环？</td><td><a href="03a-thread-eventloop.html#l3a-7">第三课（上）§7</a></td></tr>
+  <tr><td>（下一课）消息怎么变成 token、response_mask 怎么拼、工具调用错误怎么标记</td><td><a href="03b-harness-execution.html">第三课（下）</a></td></tr>
+  <tr><td>mimo 的 agent 执行进程（Ray）和 k8s 管理的 pod 是怎么配合的</td><td><a href="xa-ray-k8s-pod.html">插课 A</a></td></tr>
+  <tr><td>（下一阶段）奖励怎么变成梯度、actor 怎么更新</td><td><a href="04-actor-update.html">第四课</a></td></tr>
+  <tr><td>学习下 uni-agent 那条分支</td><td><a href="xb-uni-agent-gateway.html">插课 B</a></td></tr>
+</table>
+
+<h2 id="todo">待学内容</h2>
+<ul>
+  <li>可选：真正的黑盒 harness（Claude Code CLI 跑在容器里）端到端走一遍，<code>examples/blackbox_recipes/claude_code/</code>。链匹配机制已在<a href="xb-uni-agent-gateway.html#xb-5">插课 B §5</a> 讲过。</li>
+  <li>待处理：<a href="xa-ray-k8s-pod.html#xa-bug">插课 A 的 pod 断连匹配失败</a>、<a href="04-actor-update.html#l4-9">length_penalty 未接线</a>（已确认暂不修改）。</li>
+</ul>
+
+<h2 id="changelog">更新记录</h2>
+<ul>
+  <li>2026-10-13：第一课、白盒/黑盒问答、第二课。</li>
+  <li>2026-10-14：新增第三课（上）。文档从单个 <code>docs/learning_mimo.html</code> 改为 <code>docs/learning-mimo/</code> 目录下的总—分结构；第三课（上）新增 §7 答疑（generate 会不会卡住事件循环）。</li>
+  <li>2026-10-14：新增第三课（下）。<b>勘误</b>：General 实际运行的是 <code>DefaultAgent</code>，<code>type: cc-agent</code> 和 antihack 不生效（第二课、白盒/黑盒问答已加注）。</li>
+  <li>2026-10-15：新增插课 A（Ray 环境进程与 k8s pod 的配合）；记录疑似 bug：General/arvo 的 <code>rollout/pod_conn_timeout</code> 精确匹配失败。</li>
+  <li>2026-10-15：新增第四课（从奖励到 actor 更新）；记录发现：General 的 <code>algorithm.length_penalty</code> 不生效。主线四个阶段全部完成。</li>
+  <li>2026-10-15：新增插课 B（Code 环境与 uni-agent 网关），含两条路的逐项对比。</li>
+</ul>
+</main>
+</body>
+</html>
