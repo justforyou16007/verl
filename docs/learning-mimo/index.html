@@ -28,6 +28,7 @@
     <li><a href="xa-ray-k8s-pod.html">插课 A：Ray 环境进程与 k8s pod</a></li>
     <li><a href="04-actor-update.html">第四课：从奖励到 actor 更新</a></li>
     <li><a href="xb-uni-agent-gateway.html">插课 B：Code 环境与 uni-agent 网关</a></li>
+    <li><a href="xc-k8s-api.html">插课 C：仓库如何调用 k8s API</a></li>
   </ol>
 </nav>
 <main>
@@ -74,6 +75,7 @@
   <tr><td>插课 A</td><td>Ray 环境进程（DatasetEnvActor）与 k8s pod 的配合：部署位置、pod 结构、建 pod、exec 执行工具、打分、清理、故障分类</td><td><a href="xa-ray-k8s-pod.html">xa-ray-k8s-pod</a></td><td>✅</td></tr>
   <tr><td>4</td><td>从奖励到 actor 更新：rm_scores、filter_groups、old_log_prob、GRPO 与 -999、token 级通道、prompt-mean、PPO 损失、参数同步</td><td><a href="04-actor-update.html">04-actor-update</a></td><td>✅</td></tr>
   <tr><td>插课 B</td><td>Code 环境走 uni-agent：替换 rollout 管理器、网关 session、链匹配与回退、runner、四 harness 混训、两条路对比</td><td><a href="xb-uni-agent-gateway.html">xb-uni-agent-gateway</a></td><td>✅</td></tr>
+  <tr><td>插课 C</td><td>仓库如何调用 k8s API：唯一出口、接口清单、独立客户端、创建与就绪轮询、exec 全过程、文件进出、删除、detached exec、RBAC</td><td><a href="xc-k8s-api.html">xc-k8s-api</a></td><td>✅</td></tr>
 </table>
 
 <h2 id="lessons">各课要点</h2>
@@ -159,6 +161,16 @@
       <li>四种 whitebox harness 混训，<code>step-hash</code> 模式保证同组同 harness、跨步轮换。</li>
     </ul>
   </div>
+  <div class="card">
+    <h3><a href="xc-k8s-api.html">插课 C：仓库如何调用 k8s API</a></h3>
+    <ul>
+      <li>官方 Python 客户端（<code>kubernetes==36.0.3</code>），只操作 Pod、只用 <code>CoreV1Api</code>；全部集中在 mimoagent 的 <code>environments/kubernetes.py</code>。</li>
+      <li>训练路径只用 4 个接口：create / read / delete pod，以及 <code>pods/exec</code>（WebSocket）。</li>
+      <li>每个环境一份独立的 <code>Configuration</code>/<code>ApiClient</code>，避免多集群互相覆盖、删错集群。</li>
+      <li>执行命令、传文件进出都建在 exec 上：<code>timeout N bash -lc</code>、读线程 + 截止时间、<code>head -c</code> 绕过无法关闭标准输入、≥32MB 分块 + <code>dd seek</code> 幂等 + sha256 校验。</li>
+      <li>删除以查询返回 404 为准；4 小时连接上限用 detached exec 绕过（只有黑盒 harness 用）。</li>
+    </ul>
+  </div>
 </div>
 
 <h2 id="qa">问答索引</h2>
@@ -172,6 +184,7 @@
   <tr><td>mimo 的 agent 执行进程（Ray）和 k8s 管理的 pod 是怎么配合的</td><td><a href="xa-ray-k8s-pod.html">插课 A</a></td></tr>
   <tr><td>（下一阶段）奖励怎么变成梯度、actor 怎么更新</td><td><a href="04-actor-update.html">第四课</a></td></tr>
   <tr><td>学习下 uni-agent 那条分支</td><td><a href="xb-uni-agent-gateway.html">插课 B</a></td></tr>
+  <tr><td>这个仓库是如何调用 k8s 的 api 的</td><td><a href="xc-k8s-api.html">插课 C</a></td></tr>
 </table>
 
 <h2 id="todo">待学内容</h2>
@@ -188,6 +201,7 @@
   <li>2026-10-15：新增插课 A（Ray 环境进程与 k8s pod 的配合）；记录疑似 bug：General/arvo 的 <code>rollout/pod_conn_timeout</code> 精确匹配失败。</li>
   <li>2026-10-15：新增第四课（从奖励到 actor 更新）；记录发现：General 的 <code>algorithm.length_penalty</code> 不生效。主线四个阶段全部完成。</li>
   <li>2026-10-15：新增插课 B（Code 环境与 uni-agent 网关），含两条路的逐项对比。</li>
+  <li>2026-10-22：新增插课 C（仓库如何调用 k8s API）。</li>
 </ul>
 </main>
 </body>

@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插课 C：仓库如何调用 k8s API · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>插课 C：仓库如何调用 k8s API</h2>
+  <ol>
+    <li><a href="#xc-0">0. 结论先行</a></li>
+    <li><a href="#xc-1">1. 代码在哪：只有一个"出口"</a></li>
+    <li><a href="#xc-2">2. 用到的全部 API（一张表）</a></li>
+    <li><a href="#xc-3">3. 连接：每个环境一份独立客户端</a></li>
+    <li><a href="#xc-4">4. 创建 pod：退避重试 + 轮询就绪</a></li>
+    <li><a href="#xc-5">5. exec：执行一条命令的完整过程</a></li>
+    <li><a href="#xc-6">6. 传文件进 pod：tar、head -c、分块</a></li>
+    <li><a href="#xc-7">7. 传文件出 pod：binary 模式</a></li>
+    <li><a href="#xc-8">8. 删除 pod：以 404 为准</a></li>
+    <li><a href="#xc-9">9. 长时间命令：detached exec</a></li>
+    <li><a href="#xc-10">10. 兜底清扫与多容器路由</a></li>
+    <li><a href="#xc-11">11. 需要哪些 RBAC 权限</a></li>
+    <li><a href="#xc-12">12. 值得留意的几点</a></li>
+    <li><a href="#xc-13">13. 思考题</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xa-ray-k8s-pod.html">相关：插课 A（Ray 与 pod 的配合）</a></div>
+
+<h2 id="xc">插课 C：这个仓库是如何调用 k8s API 的</h2>
+<div class="box ask"><b>提问</b>：帮我看下这个仓库是如何调用 k8s 的 api 的。</div>
+<p class="meta">插课 A 讲的是"谁在什么时候操作 pod"（进程和时序）；这一课只看"具体怎么调 k8s API"（调用了哪些接口、每个接口怎么用、踩过哪些坑）。两者有少量重叠，这里不重复插课 A 已讲的部分，需要时给链接。</p>
+
+<h3 id="xc-0">0. 结论先行</h3>
+<div class="box key">
+<ol>
+  <li><b>用的是 k8s 官方 Python 客户端</b>（<code>kubernetes==36.0.3</code>，在 mimoagent 的 <code>pyproject.toml</code> 里精确锁定），没有调用 <code>kubectl</code> 命令行，也没有手写 HTTP 请求。</li>
+  <li><b>只操作 Pod 这一种资源</b>，只用 <code>CoreV1Api</code>。没有 Deployment、Job、Service、PVC，也没有自定义资源（CRD），没有用 watch 机制。</li>
+  <li><b>所有代码集中在一个文件</b>：<code>third_party/mimoagent-osr/src/mimoagent/environments/kubernetes.py</code>（约 1070 行）。verl 本体和 uni-agent 都不直接碰 k8s；recipes 只在它外面包了一层（General 的 sidecar 支持）。</li>
+  <li><b>真正的工作量在 exec 上</b>：创建和删除 pod 各只是一两个接口，而执行命令、传文件进出、长时间运行的命令，全都建立在 <code>pods/exec</code> 这一个 WebSocket 接口之上。代码里大部分的复杂度，都是在弥补这个通道的各种缺陷。</li>
+</ol>
+</div>
+
+<h3 id="xc-1">1. 代码在哪：只有一个"出口"</h3>
+<pre><code>verl 训练进程
+ ├─ General / Cyber / Visual：DatasetEnvActor（插课 A）
+ │     └─ make_dataset_env(...) → SidecarKubernetesEnvironment     recipes/general/general_agent/k8s_sidecar.py
+ │                                    └─ 继承 ↓
+ ├─ Code：uni-agent runner（插课 B §8）
+ │     └─ make_dataset_env(...) → KubernetesEnvironment
+ │                                    ↓
+ └──────────────▶ mimoagent/environments/kubernetes.py  ← 唯一调用 k8s 客户端的地方
+                    from kubernetes import client, config
+                    from kubernetes.stream import stream
+
+mimoagent 自己的批量评测工具（不在 RL 训练路径上）
+ └─ mimoagent/run/extra/ray_batch.py：_sweep_namespace   ← 第二个、也是最后一个调用点（§10）</code></pre>
+<p>在整个仓库（含子模块、不含测试）里搜索 <code>from kubernetes</code>，只有上面这两个文件。uni-agent 子模块里没有任何 k8s 相关代码——它的沙箱抽象（<code>uni_agent/sandbox</code>）只有 docker、local、modal、openyuanrong、vefaas 这几种后端，Code 环境的 pod 依然是 mimoagent 在 runner 里创建的。</p>
+<p>环境后端是可插拔的：mimoagent 的 <code>environment_class</code> 可以选 <code>kubernetes</code> / <code>docker</code> / <code>local</code> / <code>cube</code> / <code>modal</code>，它们都实现同一组方法（<code>start</code>、<code>execute</code>、<code>copy_to</code>、<code>copy_out</code>、<code>cleanup</code>）。工具代码只调用这几个方法，不知道底下是不是 k8s。所以"调 k8s API"这件事被完全封装在这一个后端类里。</p>
+
+<h3 id="xc-2">2. 用到的全部 API（一张表）</h3>
+<table>
+  <tr><th>客户端方法</th><th>对应的 k8s REST 接口</th><th>HTTP</th><th>谁调用、做什么</th></tr>
+  <tr><td><code>create_namespaced_pod</code></td><td><code>/api/v1/namespaces/{ns}/pods</code></td><td>POST</td><td><code>_start_pod</code>：创建 pod</td></tr>
+  <tr><td><code>read_namespaced_pod</code></td><td><code>/api/v1/namespaces/{ns}/pods/{name}</code></td><td>GET</td><td><code>_wait_for_pod_ready</code>：轮询是否就绪；<code>cleanup</code>：轮询是否已删除</td></tr>
+  <tr><td><code>delete_namespaced_pod</code></td><td>同上</td><td>DELETE</td><td><code>cleanup</code>：删除 pod</td></tr>
+  <tr><td><code>connect_get_namespaced_pod_exec</code>（经 <code>stream()</code> 包装）</td><td><code>/api/v1/namespaces/{ns}/pods/{name}/exec</code></td><td>GET → 升级为 WebSocket</td><td><code>execute</code>、<code>copy_to</code>、<code>_write_chunk</code>、<code>copy_out</code>；detached exec 也建立在 <code>execute</code> 上</td></tr>
+  <tr><td><code>list_namespaced_pod</code></td><td><code>/api/v1/namespaces/{ns}/pods?labelSelector=</code></td><td>GET</td><td>只在 <code>ray_batch.py</code> 的兜底清扫里</td></tr>
+  <tr><td><code>delete_collection_namespaced_pod</code></td><td>同上</td><td>DELETE</td><td>只在 <code>ray_batch.py</code> 的兜底清扫里</td></tr>
+</table>
+<p>RL 训练路径实际用到的只有前四个。</p>
+
+<h3 id="xc-3">3. 连接：每个环境一份独立客户端</h3>
+<span class="src">mimoagent/environments/kubernetes.py _setup_kubernetes_client</span>
+<pre><code>self._kube_configuration = client.Configuration()                  # ← 新建一份配置对象，不用全局默认
+kubeconfig = self.config.kubeconfig
+default_kubeconfig = os.getenv("KUBECONFIG") or os.path.expanduser("~/.kube/config")
+if kubeconfig is None and not os.path.exists(default_kubeconfig) and os.getenv("KUBERNETES_SERVICE_HOST"):
+    config.load_incluster_config(client_configuration=self._kube_configuration)   # 自己就跑在 pod 里：用服务账号
+else:
+    config.load_kube_config(config_file=kubeconfig, client_configuration=self._kube_configuration)
+self._api_client = client.ApiClient(configuration=self._kube_configuration)
+self.v1_api = client.CoreV1Api(api_client=self._api_client)</code></pre>
+<p>kubeconfig 的查找顺序：配置里显式写的路径 → 环境变量 <code>KUBECONFIG</code> → <code>~/.kube/config</code> → 都没有、而且当前进程本身跑在 k8s 集群里时，用 pod 的服务账号（in-cluster 模式）。训练时走的是第二条：<code>run_general.sh</code> 把 <code>KUBECONFIG</code> 写进 Ray 的 <code>runtime_env</code>，env_actor 再把它显式填进 <code>env_kwargs["kubeconfig"]</code>（插课 A §1）。</p>
+<p><b>为什么不用库的全局默认配置？</b>kubernetes Python 客户端有一个进程级的默认 <code>Configuration</code>，最常见的写法 <code>config.load_kube_config()</code> 就是改写它。注释说明了问题：同一个进程里可能有多个环境、分别连不同的集群（按实例路由到不同 kubeconfig），每调用一次 <code>load_kube_config</code> 就覆盖一次全局配置，创建和删除就可能"悄悄打到最后一次加载的那个集群上"。每个环境持有自己的 <code>Configuration</code> 和 <code>ApiClient</code>，就不存在这个问题。</p>
+<p>pod 所在的命名空间来自 <code>config.namespace</code>，默认取环境变量 <code>K8S_NAMESPACE</code>，没有就是 <code>default</code>。</p>
+
+<h3 id="xc-4">4. 创建 pod：退避重试 + 轮询就绪</h3>
+<p>pod 的定义（manifest）由 <code>_build_pod_body</code> 生成，是一个纯函数，只根据配置拼字典，方便测试（插课 A §3 有完整 YAML）。这里看创建和等待的调用方式：</p>
+<span class="src">kubernetes.py _start_pod（摘要）</span>
+<pre><code>self.pod_name = f"mimoagent-{uuid.uuid4().hex[:16]}"      # 名字由客户端生成，不用 generateName
+pod_body = self._build_pod_body(self._build_env_vars())
+time.sleep(random.uniform(0, 10))                          # 随机错开：几百个 pod 同时创建时，避免同时冲击 API server
+for attempt in range(10):
+    try:
+        pod = self.v1_api.create_namespaced_pod(namespace=ns, body=pod_body, _request_timeout=120)
+        break
+    except client.ApiException as e:
+        if e.status in (406, 409, 429, 500, 503) and attempt &lt; 9:
+            time.sleep(5 * 2**attempt + random.uniform(0, 3))   # 指数退避：5, 10, 20, 40 ... 秒
+            continue
+        raise
+self._wait_for_pod_ready()                                 # 默认最多 1200 秒</code></pre>
+<p>可重试的状态码各有含义：<code>429</code> 是 API server 限流（请求太多）；<code>500</code>/<code>503</code> 是服务端临时故障；<code>409</code> 是冲突。其他状态码（比如 <code>403</code> 没权限、<code>422</code> manifest 不合法）重试也没用，直接抛出。</p>
+<p><code>body</code> 直接传的是 Python 字典而不是 <code>V1Pod</code> 对象，客户端会原样序列化成 JSON。</p>
+<h4>等待就绪：轮询而不是 watch</h4>
+<span class="src">kubernetes.py _wait_for_pod_ready（摘要）</span>
+<pre><code>time.sleep(random.uniform(1, 7))
+while 未超时:
+    pod = self.v1_api.read_namespaced_pod(name=self.pod_name, namespace=ns, _request_timeout=10)
+    if pod.status.phase in ["Failed", "Succeeded", "Unknown"]:
+        raise RuntimeError(...)                            # 进入终止状态，不会再好了
+    if pod.status.phase == "Running" and self._container_ready(pod):
+        return
+    time.sleep(4 + random.uniform(-1, 1))                  # 大约每 4 秒查一次，带抖动
+# 超时：再读一次，把 Pending 的原因（调度失败、拉镜像失败……）拼进错误信息里</code></pre>
+<p>就绪的判定是两个条件同时满足：<code>status.phase == "Running"</code>（pod 已经被调度、容器已经启动），并且 <code>container_statuses</code> 里 <code>main</code> 容器的 <code>ready</code> 为 True。General 的 sidecar 版本把第二个条件改成"所有容器都 ready"（插课 A §4）。</p>
+<p>为什么不用 watch？watch 是一条长连接，API server 一有变化就推送过来，效率更高。但几百个 pod 同时等待时，就要同时维持几百条长连接，连接中断后还要自己处理续接。每 4 秒查一次，单次请求 10 秒超时，失败了下一轮再查，实现简单，容错也好。超时的时候还会把 <code>pod.status.conditions</code> 和每个容器的 <code>state.waiting.reason</code> 拼进错误信息，比如 <code>ImagePullBackOff</code>、<code>Unschedulable</code>，排查时一眼就能看出原因。</p>
+
+<h3 id="xc-5">5. exec：执行一条命令的完整过程</h3>
+<p>这是调用最频繁的接口，模型的每次 Bash/Read/Grep 调用都会走一次（Write 走 §6）。</p>
+<h4>5.1 exec 接口的本质</h4>
+<p>k8s 的 exec 不是普通的"请求—响应"接口。客户端发一个 GET 请求，要求升级为 WebSocket；之后 API server 把这条连接转发到 pod 所在节点的 kubelet，kubelet 再接到容器运行时上。WebSocket 里的每一帧数据都带一个"通道号"：0 是标准输入，1 是标准输出，2 是标准错误，3 是错误/状态（命令结束时在这里给出退出码）。</p>
+<p>kubernetes Python 客户端的 <code>stream()</code> 函数负责完成这个升级，并把连接包装成一个 <code>WSClient</code> 对象，提供 <code>update()</code>（收数据）、<code>peek_stdout()</code>/<code>read_stdout()</code>、<code>write_stdin()</code>、<code>returncode</code> 等方法。</p>
+<h4>5.2 拼命令</h4>
+<span class="src">kubernetes.py execute（摘要）</span>
+<pre><code>full_command = f"cd {shlex.quote(cwd)} &amp;&amp; {command}"            # 总是先 cd，因为有些镜像没设工作目录
+if as_user:
+    full_command = f"su {shlex.quote(as_user)} -s /bin/sh -c {shlex.quote(full_command)}"
+exec_argv = ["timeout", str(timeout), "/bin/bash", "-lc", full_command]</code></pre>
+<p>exec 接口的 <code>command</code> 参数是一个字符串数组，直接作为进程的参数执行，<b>不经过 shell</b>。所以要显式套一层 <code>/bin/bash -lc</code>，模型写的管道、重定向、<code>&amp;&amp;</code> 才能生效。外面再套一层 <code>timeout N</code>，作用是在 pod 里设置一道超时：即使客户端断开了，命令也会在 N 秒后被杀掉，不会在 pod 里一直跑下去。</p>
+<h4>5.3 打开连接、收输出</h4>
+<pre><code>deadline = time.monotonic() + timeout + 5                       # 客户端截止时间 = pod 侧超时 + 5 秒余量
+resp = stream(self.v1_api.connect_get_namespaced_pod_exec, self.pod_name, ns,
+              command=exec_argv, stderr=True, stdin=False, stdout=True, tty=False,
+              _preload_content=False,                           # ← 返回 WSClient，由我们自己读，而不是等它读完
+              _request_timeout=min(30, timeout + 3))
+# 打开失败 → transport_error
+
+def reader():                                                   # 单独开一个线程读输出
+    while not done.is_set() and resp.is_open():
+        if time.monotonic() &gt;= deadline: break
+        resp.update(timeout=1)                                  # 最多等 1 秒新数据
+        if resp.peek_stdout(): output_chunks.append(resp.read_stdout())
+        if resp.peek_stderr(): output_chunks.append(resp.read_stderr())
+        if output_size &gt; 50MB: 丢掉最早的那部分输出               # 防止输出爆内存，只保留尾部
+        self._drain_ws_all_buffer(resp)                         # ← 见 5.5
+t = threading.Thread(target=reader, daemon=True); t.start()
+done.wait(timeout=deadline - now)                               # 主线程最多等到截止时间
+resp.close()
+rc_stream = resp.returncode                                     # 来自通道 3 的退出码，没收到就是 None</code></pre>
+<p>几个参数的含义：</p>
+<ul>
+  <li><code>tty=False</code>：不分配伪终端，标准输出和标准错误分开传，而且不会出现终端控制字符。</li>
+  <li><code>stdin=False</code>：这里不需要输入。（§6 传文件时要 <code>stdin=True</code>。）</li>
+  <li><code>_preload_content=False</code>：如果设成 True（默认值），<code>stream()</code> 会阻塞到命令结束、把全部输出读成一个字符串再返回，那就没法设置截止时间，也没法限制输出大小。</li>
+</ul>
+<h4>5.4 结果分类</h4>
+<pre><code>client_timed_out   → {"returncode": None, "reason": "client_timeout"}    客户端等到截止时间还没结束
+rc_stream is None  → transport_error                                      通道断了，没收到退出码
+rc_stream == 124   → {"returncode": 124, "reason": "pod_timeout"}         pod 里的 timeout 命令杀掉了它
+其他               → {"returncode": rc_stream, "reason": "ok"}</code></pre>
+<p>注释特别强调："Callers must NOT coerce returncode to 0; check reason first"——调用方要先看 <code>reason</code>，不能把 <code>None</code> 当成 0（成功）。<code>transport_error</code> 时，如果配置了 <code>raise_on_transport_error: true</code>（s3k.yaml 就是这样），会直接抛 <code>TransportError</code>，在 agent 那一侧变成 <code>InfraError</code>，整条轨迹终止（插课 A §8）。</p>
+<h4>5.5 一个客户端库的内存泄漏</h4>
+<span class="src">kubernetes.py _drain_ws_all_buffer 的说明</span>
+<pre><code>The kubernetes ``WSClient`` accumulates every channel's data into an
+internal ``_all`` StringIO regardless of whether it is consumed. We only
+ever read per-channel (``read_stdout`` / ``read_stderr``), so ``_all`` is
+never drained and would otherwise grow to tens of GB over long-running
+agent sessions. Truncate it on every read iteration.</code></pre>
+<p>也就是说，<code>WSClient</code> 除了按通道分别缓存数据，还会把所有通道的数据<b>再额外存一份</b>在内部的 <code>_all</code> 缓冲区里。只按通道读取的话，<code>_all</code> 永远不会被清空。长时间运行的 agent 会话里，这份副本会涨到几十 GB。所以每读一轮就把它清空一次。这是直接修改库的私有属性，属于针对锁定版本的补丁，升级 kubernetes 客户端版本时需要重新确认。</p>
+
+<h3 id="xc-6">6. 传文件进 pod：tar、head -c、分块</h3>
+<p>k8s API 本身<b>没有</b>"上传文件"这个接口。<code>kubectl cp</code> 的实现也是 exec 一个 <code>tar</code> 命令，再把 tar 包通过标准输入发过去。这里做法相同。</p>
+<h4>6.1 小文件（&lt; 32MB）和目录</h4>
+<pre><code>buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as tf:
+    tf.add(src_path, arcname=目标文件名, recursive=True)       # 在内存里打 tar 包
+tar_bytes = buf.getvalue()
+untar_script = f"mkdir -p {dest_dir} &amp;&amp; head -c {len(tar_bytes)} | tar xmf - -C {dest_dir}"
+resp = stream(..., command=["/bin/sh", "-c", untar_script], stdin=True, ...)
+resp.write_stdin(tar_bytes)                                      # 整个 tar 包写进标准输入
+resp.write_stdin("")                                             # 想表示"输入结束"，但其实做不到（见下）
+... 读输出直到连接关闭，检查 returncode == 0，否则重试（最多 10 次，间隔 5 秒）</code></pre>
+<p><b>为什么要 <code>head -c 字节数</code>？</b>正常情况下，<code>tar</code> 会一直读标准输入，直到收到"输入结束"（EOF）为止。但 WebSocket 版的 exec 协议<b>没有办法只关闭标准输入</b>：<code>write_stdin("")</code> 只是发了一个空帧，pod 那边收不到 EOF。GNU tar 读到 tar 包末尾的结束标记就会退出，所以没问题；但 Alpine 镜像里的 BusyBox tar 会一直等更多输入，永远不退出，最后耗光超时。<code>head -c N</code> 读满 N 个字节就退出，并关闭管道，这样 tar 就能收到一个真正的 EOF。</p>
+<p><code>tar xmf</code> 里的 <code>m</code> 是"不还原文件修改时间"，避免本地和 pod 时钟不一致带来的告警。</p>
+<h4>6.2 大文件（≥ 32MB）：分块写入并校验</h4>
+<p>注释记录了一次实测：经过某些入口网关时，单个 WebSocket 帧超过约 33MB 就会断开。评测时所有 ≤ 33.1MB 的上传都成功了，所有 ≥ 35.1MB 的都失败了，失败的 101 个任务全部被记了 0 分——和"模型答错"的分数一样，无法区分。所以 ≥ 32MB 的普通文件改走 <code>copy_file_chunked</code>：</p>
+<pre><code>先 exec 一次：mkdir -p 目录 &amp;&amp; : &gt; 目标文件                  # 创建或清空目标文件
+每 16MB 一块，每块单独一次 exec：
+    head -c {n} &gt; /tmp/_chunk_xxx
+    &amp;&amp; [ "$(stat -c %s /tmp/_chunk_xxx)" = "{n}" ]             # 确认这一块收全了
+    &amp;&amp; dd if=/tmp/_chunk_xxx of=目标 bs=16M seek={块号} conv=notrunc   # 写到固定偏移
+    &amp;&amp; rm -f /tmp/_chunk_xxx
+全部写完：exec sha256sum 目标文件，和本地算的哈希比较；不一致就删掉文件并报错
+最后：chmod 还原文件权限</code></pre>
+<p>注释解释了每一处设计的原因：</p>
+<ul>
+  <li><b>为什么检查块大小</b>：<code>head -c</code> 即使只读到一部分数据（连接中途断了），也会正常退出、返回 0。所以要再比较一次文件大小，把"写了一半"变成一个失败的返回码，交给重试逻辑处理。</li>
+  <li><b>为什么用 <code>dd seek</code> 而不是追加（<code>&gt;&gt;</code>）</b>：exec 是"至少执行一次"的语义。如果一块数据其实已经写进去了、只是退出码在回传途中丢了，重试时用追加就会把同一块数据写两遍，只有最后的哈希校验能发现，整个文件就得作废。写到固定偏移位置，重试就是覆盖，结果和只写一次一样（幂等）。</li>
+  <li><b>为什么校验失败要删除文件</b>：留下一个不完整的文件比没有文件更糟——使用方看到文件存在，会把它当成完整的来用，出错后还会以为是模型的问题。</li>
+</ul>
+
+<h3 id="xc-7">7. 传文件出 pod：binary 模式</h3>
+<pre><code>tar_script = f"test -e {src} &amp;&amp; tar cf - -C {src_dir} {src_base}"     # 先确认存在，再打包输出到标准输出
+resp = stream(..., command=["/bin/sh", "-c", tar_script],
+              stdin=False, stdout=True, binary=True, _preload_content=False, ...)
+收集 stdout 的字节 → 检查 returncode == 0 且内容非空
+→ 在本地解压到临时目录 → 把唯一的顶层条目原子地移动到目标路径</code></pre>
+<p>关键是 <code>binary=True</code>。默认情况下，<code>WSClient</code> 会把收到的数据按 UTF-8 解码成字符串；tar 包是二进制数据，解码就会被破坏。打开 binary 模式后，<code>read_stdout()</code> 返回原始字节。</p>
+<p>这个方法目前在 RL 训练路径上只用在 General 的打分阶段：把 main 容器里的会话日志拷出来，再传进 sidecar（插课 A §6 第 4 步）。</p>
+
+<h3 id="xc-8">8. 删除 pod：以 404 为准</h3>
+<pre><code>先关掉执行命令用的那个 ApiClient（连接池里可能有半开的 WebSocket 连接）
+新建一个 ApiClient，用同一份 self._kube_configuration                  # 不用全局配置，见 §3
+for attempt in 1..5:
+    v1.delete_namespaced_pod(name, ns,
+        body=V1DeleteOptions(grace_period_seconds=0,                     # 不等容器优雅退出，立即删除
+                             propagation_policy="Foreground" if attempt == 1 else "Background"))
+    # 返回 404 → 已经不存在了，结束
+    每秒查一次 read_namespaced_pod，最多 15 秒：
+        返回 404 → 确认已删除，结束
+# 5 轮都没删掉 → 记错误日志，放弃</code></pre>
+<p>几个设计点：</p>
+<ul>
+  <li><b>为什么要新建客户端</b>：执行命令用的那个 <code>ApiClient</code> 里，可能残留着没关干净的 WebSocket 连接，会干扰普通的 REST 请求。</li>
+  <li><b>为什么用同一份配置</b>：如果删除请求发到了别的集群，那边会返回 404，被误判为"已经删掉了"，真正的 pod 就泄漏了（注释原话："A wrong-cluster delete would 404 and be mistaken for 'already gone', silently leaking the real pod"）。</li>
+  <li><b>为什么要轮询到 404</b>：DELETE 请求返回成功，只代表 k8s 接受了删除请求，pod 可能还处于"正在终止"的状态（设置了 <code>deletionTimestamp</code>，但有 finalizer 拖着）。只有查询返回 404，才能确认它真的没了。</li>
+  <li><b>Foreground 和 Background</b>：Foreground 是"先删依赖它的子资源，再删它自己"，Background 是"先删它自己，子资源由后台回收"。第一次用 Foreground，卡住了就改用 Background，更容易成功。对单个 pod 来说两者差别不大，主要是为了多给一种机会。</li>
+</ul>
+
+<h3 id="xc-9">9. 长时间命令：detached exec</h3>
+<p>exec 是一条长连接，命令跑多久，连接就要保持多久。注释记录了一个硬限制：</p>
+<span class="src">kubernetes.py 类定义处的注释</span>
+<pre><code>The exec websocket crosses a regional load balancer that hard-closes every
+connection after ~4h. That is a lifetime cap, not an idle timeout, and an
+exec session cannot be re-attached, so a command that outlives the
+connection loses its exit status even though it keeps running in the pod.</code></pre>
+<p>也就是说，中间的负载均衡器会在大约 4 小时后强制断开<b>所有</b>连接（不管有没有数据在传），而 exec 会话断开后<b>无法重新连上</b>。命令还在 pod 里跑，但客户端再也拿不到它的退出码了。黑盒 harness（真正的 Claude Code CLI）一次会话就可能跑几个小时，所以有了 <code>execute_detached</code>（<code>environments/detached.py</code>）：</p>
+<pre><code>1. 上传一个包装脚本，用 setsid 在后台、单独的进程组里启动它，标准输出和错误都写到 pod 里的文件
+   包装脚本：记下自己的进程组号 → timeout N bash -lc "命令" → 把退出码写进 rc.tmp，再 mv 成 rc（原子写入）
+2. 之后只用很短的 exec 轮询：rc 文件出现了吗？进程组还活着吗？
+3. 结束时读 rc 和输出文件的尾部
+4. 超时或输出长时间不变（卡住）时：用短 exec 发 kill -TERM / -KILL 给整个进程组</code></pre>
+<p>这样，任何一条 exec 连接都只持续几秒，4 小时的上限也就不再是问题。轮询连续失败超过 600 秒（API server 不可达、pod 消失）才算传输故障，偶尔一次失败不影响。</p>
+<p>它只被黑盒 harness 使用（<code>agents/blackbox/detached.py</code>）。本仓库的 RL 训练全是白盒 harness，每个工具调用都是普通的 <code>execute</code>，不走这条路径。</p>
+
+<h3 id="xc-10">10. 兜底清扫与多容器路由</h3>
+<h4>10.1 按标签批量清扫（不在 RL 训练路径上）</h4>
+<span class="src">mimoagent/run/extra/ray_batch.py _sweep_namespace（摘要）</span>
+<pre><code>for _ in range(3):
+    pods = v1.list_namespaced_pod(namespace=ns, label_selector=label_selector).items
+    pods = [p for p in pods if p.metadata.deletion_timestamp is None]   # 已经在终止的不用再删
+    if not pods: break
+    v1.delete_collection_namespaced_pod(namespace=ns, label_selector=label_selector,
+                                        grace_period_seconds=0, propagation_policy="Background")
+    time.sleep(5)                                                         # 等一下，抓住那些"创建请求还在路上"的 pod
+# 还剩的话，打印一条可以直接复制执行的 kubectl delete pods -l ... 命令</code></pre>
+<p>这是 mimoagent 自己的分布式评测工具在结束或被中断时调用的：Ray 强制杀掉 worker 时，每个环境的 <code>finally: cleanup()</code> 来不及执行，pod 会泄漏，所以最后按标签统一清扫一遍。<b>verl 的训练路径没有这个兜底</b>，训练进程崩溃后残留的 pod 需要手动按 <code>exp=$EXP_NAME</code> 标签清理（插课 A §7）。</p>
+<h4>10.2 多容器路由（recipes 一侧）</h4>
+<p>exec 接口规定：pod 里有多个容器时，必须用 <code>container</code> 参数指定目标容器，否则返回 400。mimoagent 的代码发 exec 时不带这个参数。General 的 <code>SidecarKubernetesEnvironment</code> 用一个代理对象包住 <code>CoreV1Api</code>，只拦截 <code>connect_get_namespaced_pod_exec</code>，从线程局部变量里取出目标容器名补上去（详见插课 A §3）。因为分块上传（<code>_write_chunk</code>）也调用的是同一个 <code>self.v1_api</code>，这层代理自动覆盖了它，注释说上游实现恰好漏掉了这一处。</p>
+
+<h3 id="xc-11">11. 需要哪些 RBAC 权限</h3>
+<p>根据上面用到的接口，kubeconfig 对应的账号在目标命名空间里至少需要：</p>
+<pre><code>apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: mimoagent-rollout, namespace: &lt;K8S_NAMESPACE&gt;}
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "delete"]          # 训练路径：创建、轮询就绪/删除、删除
+  # 如果要用 ray_batch 的兜底清扫，再加 "list", "deletecollection"
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get"]                    # exec 子资源；新版本集群要求 create，部分旧版本 get 即可</code></pre>
+<p>这是根据代码推出来的最小集合，没有在真实集群上逐条验证。<code>run_general.sh</code> 里的提示只写了"a kubeconfig with pod-create permission"，实际上 exec 的权限同样必需，否则 pod 能创建出来，但第一个工具调用就会失败。</p>
+<p>另外，pod 定义里设置了 <code>automountServiceAccountToken: false</code>：pod 里拿不到任何 k8s 凭据，模型在容器里执行什么命令都不可能反过来操作集群。</p>
+
+<h3 id="xc-12">12. 值得留意的几点</h3>
+<div class="box note"><b>一、单次 exec 的开销不小。</b>每次工具调用都是一次完整的 WebSocket 建立过程（TLS 握手、协议升级、API server 转发到 kubelet）。Read 工具一次调用内部可能执行好几次 <code>execute</code>（先判断路径类型、再检查可读、再读内容、再数行数，见 <code>recipes/general/tools/read.py</code>）。几百条轨迹并发时，API server 承受的 exec 请求量是"轨迹数 × 每条的工具调用数 × 每个工具的 exec 次数"。如果 API server 出现限流或延迟升高，这是首先要看的地方。</div>
+<div class="box note"><b>二、<code>stream()</code> 的线程安全问题，在这里基本不会触发。</b><code>k8s_sidecar.py</code> 的注释确认了一个库内部细节：<code>stream()</code> 会临时替换 <code>api_client.request</code>，调用结束后再换回来。这种"临时改共享对象"的写法不是线程安全的。General 的 env_actor 里，最多 8 个线程会同时用同一个 <code>ApiClient</code> 发 exec（并行工具调用）。理论上，两个线程的替换和还原交错执行，可能让一个线程用上另一个线程的设置；最可能出问题的是 <code>binary</code> 参数不同的两个调用交错。但在训练路径上，工具调用阶段只用 <code>execute</code> 和 <code>copy_to</code>（两者都是 <code>binary=False</code>），用 <code>binary=True</code> 的 <code>copy_out</code> 只在打分阶段顺序执行，所以设置即使串了也是同一个值。删除 pod 时又专门新建了客户端。这一点是根据库的公开源码推断的（本机没有安装 kubernetes 包，无法核对 36.0.3 版本的具体实现），如果以后在并行工具调用里加入 <code>copy_out</code>，需要重新评估。</div>
+<div class="box note"><b>三、几个针对锁定版本的补丁。</b><code>_drain_ws_all_buffer</code> 直接修改 <code>WSClient</code> 的私有属性 <code>_all</code>；代理对象依赖 <code>stream()</code> 通过 <code>api_method.__self__.api_client</code> 找到客户端这一实现细节。两者都和 <code>kubernetes==36.0.3</code> 绑定，mimoagent 的 <code>CLAUDE.md</code> 也写明要"Pin the Kubernetes client to the audited release; upgrade it deliberately with the Kubernetes environment tests"。</div>
+
+<h3 id="xc-13">13. 思考题</h3>
+<details><summary>Q1：exec 里为什么同时需要 pod 侧的 <code>timeout N</code> 和客户端的截止时间？只留一个行不行？</summary>
+<p>两者防的是不同的故障。只有客户端截止时间：客户端放弃等待、关闭连接之后，命令在 pod 里<b>还在继续跑</b>，可能一直占着 CPU，甚至修改工作区，影响后面的工具调用和打分。只有 pod 侧 timeout：如果连接本身卡住了（比如网络中断但 TCP 没有断开），客户端会一直等下去，拿不到任何结果。所以 pod 侧负责"把命令杀掉"，客户端负责"不要无限等"。客户端多留 5 秒余量，是为了让 pod 侧的 timeout 先触发、正常返回 124，这样能区分"命令超时"（模型的问题）和"连接出问题"（基础设施的问题）。</p></details>
+<details><summary>Q2：为什么大文件分块不直接用 <code>cat &gt;&gt; 文件</code> 追加，非要用 <code>head -c</code> + <code>dd seek</code>？</summary>
+<p>两个原因叠加。第一，<code>cat</code> 要等到输入结束（EOF）才会退出，而这个客户端没办法单独关闭标准输入，所以每一块都会耗尽超时（注释里实测 16MB 一块要等 3.75 分钟）；<code>head -c N</code> 读满就退出。第二，追加不是幂等的：一块数据实际写成功了、但返回码丢了，重试就会把它再追加一遍；<code>dd seek=块号</code> 写到固定位置，重试只是覆盖同一段内容。</p></details>
+<details><summary>Q3：如果把创建 pod 的随机等待（0~10 秒）去掉，会发生什么？</summary>
+<p>一个训练步开始时，512 条轨迹（64 个 prompt × 8）几乎同时开始创建 pod，同一秒内会有几百个 POST 请求打到 API server。API server 有限流保护，会返回大量 429，每个请求再按指数退避重试——如果大家的退避时间一样，下一轮又会同时撞上。随机等待和退避里的随机抖动，作用都是把请求在时间上打散，避免这种"同时失败、同时重试"的循环。</p></details>
+
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="xa-ray-k8s-pod.html">相关：插课 A（Ray 与 pod 的配合）</a></div>
+</main>
+</body>
+</html>
