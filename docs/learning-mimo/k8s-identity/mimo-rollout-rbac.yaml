@@ -1,0 +1,72 @@
+# Identity for the MiMo RL rollout controller (DatasetEnvActor / uni-agent runner).
+# Derived from the API calls in third_party/mimoagent-osr/src/mimoagent/environments/kubernetes.py.
+# Not yet validated against a real cluster -- run the checks in xd-k8s-identity.html §5 after applying.
+#
+# Replace every "mimo-rl" with your namespace if you pick a different name.
+#   kubectl apply -f mimo-rollout-rbac.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mimo-rl
+  labels:
+    # Task pods run as root in their image (General's privilege-isolation setup calls useradd/sudo),
+    # so "restricted" would reject them. "baseline" still forbids privileged / hostNetwork / extra caps.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: baseline
+---
+# The identity the *controller* uses to call the API. Task pods do not use it:
+# the pod spec sets automountServiceAccountToken: false and names no serviceAccount.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mimo-rollout
+  namespace: mimo-rl
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mimo-rollout
+  namespace: mimo-rl
+rules:
+  # Training path: create_namespaced_pod / read_namespaced_pod / delete_namespaced_pod.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  # Cleanup by label after a crash (kubectl delete pods -l exp=...) and mimoagent's ray_batch sweep.
+  # Remove these two verbs for strict least privilege if an admin does the cleanup instead.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "deletecollection"]
+  # Every tool call, file copy and grading step goes through pods/exec (WebSocket GET).
+  # Newer API servers authorize the WebSocket upgrade as "create"; older ones as "get". Grant both.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mimo-rollout
+  namespace: mimo-rl
+subjects:
+  - kind: ServiceAccount
+    name: mimo-rollout
+    namespace: mimo-rl
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mimo-rollout
+---
+# Long-lived token for the kubeconfig. A training run lasts days; a time-bound token from
+# `kubectl create token` would expire mid-run and fail every pod operation at once.
+# Rotate by deleting this Secret (the controller loses access immediately) and re-applying.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mimo-rollout-token
+  namespace: mimo-rl
+  annotations:
+    kubernetes.io/service-account.name: mimo-rollout
+type: kubernetes.io/service-account-token

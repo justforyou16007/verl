@@ -29,6 +29,7 @@
     <li><a href="04-actor-update.html">第四课：从奖励到 actor 更新</a></li>
     <li><a href="xb-uni-agent-gateway.html">插课 B：Code 环境与 uni-agent 网关</a></li>
     <li><a href="xc-k8s-api.html">插课 C：仓库如何调用 k8s API</a></li>
+    <li><a href="xd-k8s-identity.html">插课 D：agent 配置来源与 k8s 身份</a></li>
   </ol>
 </nav>
 <main>
@@ -76,6 +77,7 @@
   <tr><td>4</td><td>从奖励到 actor 更新：rm_scores、filter_groups、old_log_prob、GRPO 与 -999、token 级通道、prompt-mean、PPO 损失、参数同步</td><td><a href="04-actor-update.html">04-actor-update</a></td><td>✅</td></tr>
   <tr><td>插课 B</td><td>Code 环境走 uni-agent：替换 rollout 管理器、网关 session、链匹配与回退、runner、四 harness 混训、两条路对比</td><td><a href="xb-uni-agent-gateway.html">xb-uni-agent-gateway</a></td><td>✅</td></tr>
   <tr><td>插课 C</td><td>仓库如何调用 k8s API：唯一出口、接口清单、独立客户端、创建与就绪轮询、exec 全过程、文件进出、删除、detached exec、RBAC</td><td><a href="xc-k8s-api.html">xc-k8s-api</a></td><td>✅</td></tr>
+  <tr><td>插课 D</td><td>agent 配置 yaml 的来源与读取位置（General / Code）；身份三参数；创建命名空间、账号、Role、令牌；生成 kubeconfig、验证、接入训练；pod 启动配置来源、namespace 约束、kubeconfig 要求、防误删分层方案与检查清单</td><td><a href="xd-k8s-identity.html">xd-k8s-identity</a></td><td>✅</td></tr>
 </table>
 
 <h2 id="lessons">各课要点</h2>
@@ -169,6 +171,22 @@
       <li>每个环境一份独立的 <code>Configuration</code>/<code>ApiClient</code>，避免多集群互相覆盖、删错集群。</li>
       <li>执行命令、传文件进出都建在 exec 上：<code>timeout N bash -lc</code>、读线程 + 截止时间、<code>head -c</code> 绕过无法关闭标准输入、≥32MB 分块 + <code>dd seek</code> 幂等 + sha256 校验。</li>
       <li>删除以查询返回 404 为准；4 小时连接上限用 detached exec 绕过（只有黑盒 harness 用）。</li>
+      <li>没有 pod 的 YAML 文件：pod 定义由 agent 配置 yaml 的 <code>environment:</code> 块 → 配置类 → <code>_build_pod_body</code> 拼成字典；kubeconfig 由客户端库读取。</li>
+      <li>⚠ <a href="xc-k8s-api.html#xc-14">发现</a>：General 的 <code>K8S_TOLERATION_*</code> / <code>K8S_NODE_LABEL_*</code> / <code>K8S_IMAGE_PULL_SECRET</code> 没有代码读取，设置了也不生效。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="xd-k8s-identity.html">插课 D：agent 配置来源与 k8s 身份</a></h3>
+    <ul>
+      <li>General：<code>general_agent_loop.yaml</code> 的 <code>mimoagent_config_path</code> → <code>s3k.yaml</code>，每条轨迹读两次（agent loop 与 env_actor）。</li>
+      <li>Code：<code>MIMOAGENT_HARNESS_SPEC</code> → 启动时复制到 <code>$RUN_DIR/harness.*</code> → runner 每个 session 读选中的 <code>mini-*.yaml</code> 副本。</li>
+      <li>身份 = kubeconfig + namespace + Role；kubeconfig 里 context 的 namespace 不起作用。</li>
+      <li>最小权限：pods create/get/delete + pods/exec create/get；命名空间用 PSA baseline；长期令牌 Secret。可用文件在 <code>k8s-identity/</code>（未在真实集群执行过）。</li>
+      <li>⚠ Code 的 <code>run_train.sh</code> 不传 <code>K8S_NAMESPACE</code>，需把 <code>namespace</code> 写进 mini-*.yaml。</li>
+      <li>pod 启动配置没有 YAML 文件：代码写死部分 + agent yaml 的 <code>environment:</code> + 数据行；代码对 namespace 无约束，只能靠 RBAC。</li>
+      <li>训练路径只按自己生成的精确 pod 名删除；误删风险来自配置和人工清理。<code>pod_timeout</code> 未使用、无 ownerReferences，残留 pod 不会自动过期；Code 的 pod 没有标签。</li>
+      <li>RBAC = "角色定义能做什么 + 绑定决定给谁、在哪生效"，只有允许没有禁止、权限叠加、不能按名字/标签授权；所以"低权限账号"必须配合专用命名空间，并排查宽泛绑定。</li>
+      <li>防误删：专用命名空间 + Role（决定性）→ 单 context kubeconfig 并验证边界 → 可选准入策略限定 <code>mimoagent-*</code> → 限定范围的清理脚本（默认只预览）。</li>
     </ul>
   </div>
 </div>
@@ -185,12 +203,16 @@
   <tr><td>（下一阶段）奖励怎么变成梯度、actor 怎么更新</td><td><a href="04-actor-update.html">第四课</a></td></tr>
   <tr><td>学习下 uni-agent 那条分支</td><td><a href="xb-uni-agent-gateway.html">插课 B</a></td></tr>
   <tr><td>这个仓库是如何调用 k8s 的 api 的</td><td><a href="xc-k8s-api.html">插课 C</a></td></tr>
+  <tr><td>k8s 的加载 yaml 在哪个地方</td><td><a href="xc-k8s-api.html#xc-14">插课 C §14</a></td></tr>
+  <tr><td>agent 配置 yaml 在哪加载、来源是什么；给 k8s 集群配置命名空间、账号和权限</td><td><a href="xd-k8s-identity.html">插课 D</a></td></tr>
+  <tr><td>（澄清）pod 启动的 yaml 配置从哪里加载、namespace 有无约束、kubeconfig 要求，如何避免误删生产 pod</td><td><a href="xd-k8s-identity.html#xd-9">插课 D §9–§16</a></td></tr>
+  <tr><td>集群的 RBAC 是什么；给训练新建一个权限小的用户是不是就可以了</td><td><a href="xd-k8s-identity.html#xd-17">插课 D §17</a></td></tr>
 </table>
 
 <h2 id="todo">待学内容</h2>
 <ul>
   <li>可选：真正的黑盒 harness（Claude Code CLI 跑在容器里）端到端走一遍，<code>examples/blackbox_recipes/claude_code/</code>。链匹配机制已在<a href="xb-uni-agent-gateway.html#xb-5">插课 B §5</a> 讲过。</li>
-  <li>待处理：<a href="xa-ray-k8s-pod.html#xa-bug">插课 A 的 pod 断连匹配失败</a>、<a href="04-actor-update.html#l4-9">length_penalty 未接线</a>（已确认暂不修改）。</li>
+  <li>待处理：<a href="xd-k8s-identity.html#xd-10">pod_timeout 未使用（pod 不自动过期）</a>、<a href="xd-k8s-identity.html#xd-12">Code 路径 KUBECONFIG 可为空、会回退到节点默认凭据</a>、<a href="xd-k8s-identity.html#xd-6">Code 路径未传 K8S_NAMESPACE</a>、<a href="xc-k8s-api.html#xc-14">K8S_* 环境变量未接线</a>、<a href="xa-ray-k8s-pod.html#xa-bug">插课 A 的 pod 断连匹配失败</a>、<a href="04-actor-update.html#l4-9">length_penalty 未接线</a>（已确认暂不修改）。</li>
 </ul>
 
 <h2 id="changelog">更新记录</h2>
@@ -201,7 +223,10 @@
   <li>2026-10-15：新增插课 A（Ray 环境进程与 k8s pod 的配合）；记录疑似 bug：General/arvo 的 <code>rollout/pod_conn_timeout</code> 精确匹配失败。</li>
   <li>2026-10-15：新增第四课（从奖励到 actor 更新）；记录发现：General 的 <code>algorithm.length_penalty</code> 不生效。主线四个阶段全部完成。</li>
   <li>2026-10-15：新增插课 B（Code 环境与 uni-agent 网关），含两条路的逐项对比。</li>
-  <li>2026-10-22：新增插课 C（仓库如何调用 k8s API）。</li>
+  <li>2026-10-22：新增插课 C（仓库如何调用 k8s API）；插课 C 新增 §14 答疑（k8s 的 yaml 在哪加载），记录发现：General 的 K8S_* 环境变量未接线。第二课勘误措辞修正：未知字段被丢弃时会打 warning，并非完全静默。</li>
+  <li>2026-10-22：新增插课 D（agent 配置来源与 k8s 身份配置），附 <code>k8s-identity/mimo-rollout-rbac.yaml</code> 与 <code>make-kubeconfig.sh</code>；记录发现：Code 路径未把 <code>K8S_NAMESPACE</code> 传进 Ray。</li>
+  <li>2026-10-23：插课 D 追加 §9–§16（问题澄清：pod 启动配置来源、namespace 约束、kubeconfig 要求、全部删除路径分析、防误删分层方案、检查清单），新增 <code>k8s-identity/mimo-rollout-guardrails.yaml</code> 与 <code>cleanup-stale-pods.sh</code>；原 §0–§8 保留。</li>
+  <li>2026-10-23：插课 D 追加 §17 答疑（RBAC 是什么；只建低权限用户够不够）。</li>
 </ul>
 </main>
 </body>

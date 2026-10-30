@@ -1,0 +1,43 @@
+# Optional second guardrail for the mimo-rollout identity: even inside the namespaces it may
+# reach, it can only create or delete pods whose name starts with "mimoagent-" (the prefix
+# hardcoded in KubernetesEnvironment._start_pod). Use it when the training must share a
+# namespace with other workloads, or as defense in depth on top of the dedicated namespace.
+#
+# Requires ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1, GA since Kubernetes 1.30).
+# Not yet validated against a real cluster -- run the checks in xd-k8s-identity.html §13.
+#
+# Exec (pods/exec, a CONNECT request) is deliberately not covered here; scope exec with the
+# namespace-bound Role instead.
+#
+#   kubectl apply -f mimo-rollout-guardrails.yaml
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mimo-rollout-pod-name-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "DELETE"]
+        resources: ["pods"]
+  matchConditions:
+    # Only the training identity is constrained; admins and other workloads are untouched.
+    # Change the namespace / name here if you renamed them in mimo-rollout-rbac.yaml.
+    - name: only-mimo-rollout
+      expression: "request.userInfo.username == 'system:serviceaccount:mimo-rl:mimo-rollout'"
+  validations:
+    - expression: >-
+        (request.operation == 'CREATE' && object.metadata.name.startsWith('mimoagent-')) ||
+        (request.operation == 'DELETE' && oldObject.metadata.name.startsWith('mimoagent-'))
+      message: "mimo-rollout may only create or delete pods named mimoagent-*"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mimo-rollout-pod-name-scope
+spec:
+  policyName: mimo-rollout-pod-name-scope
+  validationActions: [Deny]

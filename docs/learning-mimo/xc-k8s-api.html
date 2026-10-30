@@ -25,6 +25,7 @@
     <li><a href="#xc-11">11. 需要哪些 RBAC 权限</a></li>
     <li><a href="#xc-12">12. 值得留意的几点</a></li>
     <li><a href="#xc-13">13. 思考题</a></li>
+    <li><a href="#xc-14">14. 答疑：k8s 的 yaml 在哪里加载</a></li>
   </ol>
 </nav>
 <main>
@@ -291,6 +292,91 @@ rules:
 <p>两个原因叠加。第一，<code>cat</code> 要等到输入结束（EOF）才会退出，而这个客户端没办法单独关闭标准输入，所以每一块都会耗尽超时（注释里实测 16MB 一块要等 3.75 分钟）；<code>head -c N</code> 读满就退出。第二，追加不是幂等的：一块数据实际写成功了、但返回码丢了，重试就会把它再追加一遍；<code>dd seek=块号</code> 写到固定位置，重试只是覆盖同一段内容。</p></details>
 <details><summary>Q3：如果把创建 pod 的随机等待（0~10 秒）去掉，会发生什么？</summary>
 <p>一个训练步开始时，512 条轨迹（64 个 prompt × 8）几乎同时开始创建 pod，同一秒内会有几百个 POST 请求打到 API server。API server 有限流保护，会返回大量 429，每个请求再按指数退避重试——如果大家的退避时间一样，下一轮又会同时撞上。随机等待和退避里的随机抖动，作用都是把请求在时间上打散，避免这种"同时失败、同时重试"的循环。</p></details>
+
+<h3 id="xc-14">14. 答疑：k8s 的 yaml 在哪里加载</h3>
+<div class="box ask"><b>提问</b>：k8s 的加载 yaml 在哪个地方？</div>
+<div class="box key"><b>结论</b>：仓库里<b>没有 pod 的 YAML 文件</b>，也没有调用 <code>kubectl apply</code> 或客户端的 <code>create_from_yaml</code>。发给 k8s 的 pod 定义是 Python 代码里现拼的一个字典（<code>_build_pod_body</code>，§4）。和"k8s + yaml"沾边的其实是两种不同的文件：
+<ol>
+  <li><b>kubeconfig</b>：决定"连哪个集群、用什么身份"。由 kubernetes 客户端库自己读，入口是 <code>_setup_kubernetes_client</code> 里的 <code>config.load_kube_config(...)</code>（§3）。</li>
+  <li><b>agent 配置 yaml 里的 <code>environment:</code> 块</b>：决定"pod 长什么样"（资源、标签、sidecar、超时等）。由 recipe 用 <code>yaml.safe_load</code> 读进来，变成构造参数，一路传到 <code>KubernetesEnvironmentConfig</code>，最后由 <code>_build_pod_body</code> 拼成字典。</li>
+</ol></div>
+
+<h4>14.1 第一种：kubeconfig</h4>
+<span class="src">mimoagent/environments/kubernetes.py _setup_kubernetes_client</span>
+<pre><code>config.load_kube_config(config_file=kubeconfig, client_configuration=self._kube_configuration)</code></pre>
+<p><code>kubeconfig</code> 这个路径来自（优先级从高到低）：数据行里 <code>instance.routing.kubeconfig</code>（按任务路由到不同集群）→ yaml <code>environment.kubeconfig</code> → env_actor 从环境变量 <code>KUBECONFIG</code> 补上的值 → 库的默认查找（<code>$KUBECONFIG</code>、<code>~/.kube/config</code>）→ in-cluster 服务账号。这个文件里只有集群地址、证书和凭据，和 pod 长什么样无关。</p>
+
+<h4>14.2 第二种：environment 块的读取链路</h4>
+<p>两条训练路径各有一个读取入口，之后汇合到同一个函数 <code>make_dataset_env</code>：</p>
+<pre><code>【General】recipes/general/env_actor.py
+  load_mimoagent_config("config/agent/general/s3k.yaml")       ← yaml.safe_load，整份 agent 配置
+  DatasetEnvActor._create():
+    env_kwargs = dict(config["environment"])                   ← 取出 environment: 块
+    env_kwargs["labels"] = {"exp": $EXP_NAME, ...}             ← 运行时补充
+    env_kwargs["kubeconfig"] = $KUBECONFIG                      （yaml 没写时）
+    env_kwargs["image_prefix"] = $DOCKER_REGISTRY               （yaml 没写时）
+    make_dataset_env(instance, **env_kwargs)
+
+【Code】recipes/code/mimoagent_runner.py
+  _load_config(harness 配置路径)                                ← yaml.safe_load，如 config/agent/code/mini-claude-code.yaml
+  _run_sync():
+    environment_config = dict(config["environment"]) + environment_overrides
+    make_dataset_env(instance, **environment_config)
+
+【汇合】mimoagent/environments/utils.py make_dataset_env
+  ① 显式参数先"截走"不属于 pod 的键：anti_hack_cleanup / git_leak_prevention / judge_agent / reward_mode / image_prefix
+  ② environment_class = kwargs.pop("environment_class") or "kubernetes"
+     get_environment_class(...)：
+       "kubernetes" → mimoagent.environments.kubernetes.KubernetesEnvironment
+       其他字符串当成模块路径 import，如 General 的
+       "recipes.general.general_agent.k8s_sidecar.SidecarKubernetesEnvironment"
+  ③ env_kwargs = {**kwargs, "image": resolve_docker_image(instance, ..., image_prefix)}
+     instance 里有 cwd 就覆盖；instance.routing 里的 kubeconfig / node_selector 也覆盖
+  ④ filter_env_kwargs：只保留配置类（dataclass）认识的字段，其余丢弃并打 warning
+  ⑤ base_env_class(**env_kwargs)
+       → self.config = KubernetesEnvironmentConfig(**kwargs)     ← yaml 的值到这里落地
+       → _setup_kubernetes_client()                               ← 第一种 yaml（kubeconfig）在这里读
+  ⑥ 之后 setup_environment() → start() → _start_pod() → _build_pod_body() → create_namespaced_pod(body=字典)</code></pre>
+
+<h4>14.3 yaml 字段最后落到 pod 的哪里</h4>
+<table>
+  <tr><th>yaml（environment: 下）</th><th>配置类字段</th><th>pod 定义里的位置</th></tr>
+  <tr><td>（来自数据行 <code>docker_image</code> + <code>image_prefix</code>）</td><td><code>image</code></td><td><code>spec.containers[0].image</code></td></tr>
+  <tr><td><code>cpu_request</code> / <code>memory_request</code> / <code>cpu_limit</code> / <code>memory_limit</code></td><td>同名</td><td><code>containers[0].resources.requests / limits</code></td></tr>
+  <tr><td><code>env</code> / <code>forward_env</code></td><td>同名</td><td><code>containers[0].env</code>（<code>forward_env</code> 是从本机环境变量里转发）</td></tr>
+  <tr><td><code>labels</code> / <code>annotations</code></td><td>同名</td><td><code>metadata.labels / annotations</code>（标签值会被自动修正成合法格式）</td></tr>
+  <tr><td><code>node_selector</code> / <code>tolerations</code> / <code>image_pull_secrets</code></td><td>同名</td><td><code>spec.nodeSelector / tolerations / imagePullSecrets</code>（为 None 时不出现）</td></tr>
+  <tr><td><code>host_network</code> / <code>capabilities</code></td><td>同名</td><td><code>spec.hostNetwork</code> / <code>containers[0].securityContext.capabilities.add</code></td></tr>
+  <tr><td><code>namespace</code></td><td>同名，默认取 <code>$K8S_NAMESPACE</code></td><td>不在 pod 体里，是调用 API 时的路径参数</td></tr>
+  <tr><td><code>sidecars</code> / <code>shared_volumes</code> / <code>main_volume_mounts</code></td><td>只有 <code>SidecarKubernetesEnvironmentConfig</code> 有</td><td>追加的容器、<code>spec.volumes</code>（emptyDir）、各容器的 <code>volumeMounts</code></td></tr>
+  <tr><td><code>cwd</code> / <code>timeout</code> / <code>raise_on_transport_error</code> / <code>max_exec_budget</code></td><td>同名</td><td><b>不进 pod 定义</b>，只影响 exec 的行为（§5）</td></tr>
+  <tr><td><code>kubeconfig</code></td><td>同名</td><td><b>不进 pod 定义</b>，决定连哪个集群（14.1）</td></tr>
+</table>
+
+<h4>14.4 想看实际发出去的 pod 定义</h4>
+<p>因为 pod 定义是代码拼出来的，仓库里找不到对应的文件。最直接的办法是看日志：创建失败时会打印错误；成功时只打印 pod 名和镜像。如果想在不连集群的情况下预览，可以绕过构造函数（构造函数会去读 kubeconfig），直接调用这个纯函数。下面这段<b>没有实际运行过</b>（本机没装 kubernetes 包），仅示意思路：</p>
+<pre><code>import yaml
+from mimoagent.environments.kubernetes import KubernetesEnvironment, KubernetesEnvironmentConfig
+
+env = object.__new__(KubernetesEnvironment)            # 不调用 __init__，所以不会去连集群
+env.config = KubernetesEnvironmentConfig(image="registry.example.com/ns/repo:tag",
+                                         cpu_request="2", memory_request="8Gi")
+env.pod_name = "preview"
+print(yaml.safe_dump(env._build_pod_body(env._build_env_vars())))
+# General 的 sidecar 版本：把类换成 SidecarKubernetesEnvironment / SidecarKubernetesEnvironmentConfig</code></pre>
+
+<h4>14.5 两个容易踩的坑</h4>
+<div class="box warn"><b>一、yaml 里写错字段名，不会报错。</b>第 ④ 步 <code>filter_env_kwargs</code> 对不认识的键只打一条 warning（<code>Ignoring config keys not accepted by KubernetesEnvironmentConfig: [...]</code>）然后丢掉。比如把 <code>cpu_request</code> 写成 <code>cpu_requst</code>，pod 会悄悄用默认值 0.5 核。日志量大时这条 warning 很容易被淹没，改了 yaml 之后建议搜一下这句日志。</div>
+<div class="box warn"><b>二、发现：General 的几个 K8S_* 环境变量没有任何代码读取。</b>（只读代码得出的结论，未实际运行验证）
+<p><code>scripts/general/general.env.example</code> 第 36–40 行注释说明了五个变量：</p>
+<pre><code># export K8S_IMAGE_PULL_SECRET=my-regcred          # private registry
+# export K8S_TOLERATION_KEY=dedicated              # tainted nodes
+# export K8S_TOLERATION_VALUE=my-pool
+# export K8S_NODE_LABEL_KEY=node-pool              # pin a node pool
+# export K8S_NODE_LABEL_VALUE=gpu-a100</code></pre>
+<p><code>run_general.sh</code> 第 127–131 行也把它们写进了 Ray 的环境变量。但在整个仓库（含两个子模块）里搜索这五个名字，<b>没有任何 Python 代码读取它们</b>：<code>env_actor._create</code> 只处理了 <code>KUBECONFIG</code>、<code>DOCKER_REGISTRY</code>、<code>EXP_NAME</code>，<code>KubernetesEnvironmentConfig</code> 只认 <code>K8S_NAMESPACE</code>。而 <code>s3k.yaml</code> 里写的是 <code>node_selector: {}</code>，没有 <code>tolerations</code> 和 <code>image_pull_secrets</code>。</p>
+<p>影响：按 env.example 的提示设置了这些变量的人，会以为 pod 已经能调度到带污点的节点、能从私有仓库拉镜像，实际都没有生效。症状正如 env.example 自己那句话所说——"an unset one surfaces only as a pod event minutes later"：pod 一直 Pending（<code>Unschedulable</code>）或者 <code>ImagePullBackOff</code>，直到 setup 超时，轨迹记为 -999。</p>
+<p>目前能生效的做法是直接改 <code>s3k.yaml</code> 的 <code>environment:</code> 块，写上 <code>node_selector</code>、<code>tolerations</code>（原样的 k8s 字典列表）和 <code>image_pull_secrets</code>（secret 名字列表），这些字段配置类都认识。</p></div>
 
 <div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="xa-ray-k8s-pod.html">相关：插课 A（Ray 与 pod 的配合）</a></div>
 </main>

@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插课 D：agent 配置的来源与 k8s 身份配置 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>插课 D：agent 配置来源与 k8s 身份</h2>
+  <ol>
+    <li><a href="#xd-0">0. 结论先行</a></li>
+    <li><a href="#xd-1">1. General：agent yaml 从哪来、在哪读</a></li>
+    <li><a href="#xd-2">2. Code：agent yaml 从哪来、在哪读</a></li>
+    <li><a href="#xd-3">3. 身份相关的三个参数各从哪里取</a></li>
+    <li><a href="#xd-4">4. 创建命名空间、账号和权限</a></li>
+    <li><a href="#xd-5">5. 生成 kubeconfig 并验证</a></li>
+    <li><a href="#xd-6">6. 接入训练：两条路径分别怎么配</a></li>
+    <li><a href="#xd-7">7. 安全与容量的注意事项</a></li>
+    <li><a href="#xd-8">8. 思考题</a></li>
+    <li><a href="#xd-9">9. 补充答疑：问题澄清</a></li>
+    <li><a href="#xd-10">10. pod 启动配置从哪里来</a></li>
+    <li><a href="#xd-11">11. namespace 有没有约束</a></li>
+    <li><a href="#xd-12">12. kubeconfig 有什么要求</a></li>
+    <li><a href="#xd-13">13. 会不会误删生产 pod：全部删除路径</a></li>
+    <li><a href="#xd-14">14. 防误删的分层方案</a></li>
+    <li><a href="#xd-15">15. 上线前检查清单</a></li>
+    <li><a href="#xd-16">16. 补充思考题</a></li>
+    <li><a href="#xd-17">17. 答疑：RBAC 是什么；只建一个低权限用户够不够</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xc-k8s-api.html">相关：插课 C（仓库如何调用 k8s API）</a></div>
+
+<h2 id="xd">插课 D：agent 配置 yaml 的来源，以及给 k8s 集群配置身份</h2>
+<div class="box ask"><b>提问</b>：agent 配置 yaml 是在哪个位置加载的？加载的 yaml 来源是什么？我现在要给我的 k8s 集群设置身份，需要创建命名空间、账号和权限。</div>
+<div class="box note"><b>补充（2026-10-23）</b>：第二次提问澄清了真正关心的问题——pod 的启动配置从哪里来、namespace 有没有约束、kubeconfig 有什么要求，以及<b>如何避免误删生产环境的其他 pod</b>。这部分写在 <a href="#xd-9">§9–§16</a>；§0–§8 保留原样，其中的 RBAC 文件和 kubeconfig 生成步骤仍然适用。</div>
+
+<h3 id="xd-0">0. 结论先行</h3>
+<div class="box key">
+<ol>
+  <li><b>agent 配置 yaml 有两个入口</b>，都是用 <code>yaml.safe_load</code> 直接读的，<b>不展开 <code>${VAR}</code> 环境变量</b>：
+    <ul>
+      <li>General：<code>config/agent/general/s3k.yaml</code>。路径写在 <code>recipes/general/config/general_agent_loop.yaml</code> 的 <code>mimoagent_config_path</code> 里，<b>每条轨迹读两次</b>：<code>GeneralAgentLoop.__init__</code> 一次，<code>DatasetEnvActor.__init__</code> 一次。</li>
+      <li>Code：<code>config/agent/code/mini-*.yaml</code> 四个文件。启动时被<b>复制</b>到 <code>$RUN_DIR/harness.XXXXXX/</code>，训练实际读的是副本；每个 session 在 runner 里按混合策略选一个、读一次。</li>
+    </ul>
+  </li>
+  <li><b>k8s 身份由三个参数决定</b>：kubeconfig（谁、连哪个集群）、namespace（在哪个命名空间建 pod）、Role（能做什么）。代码需要的权限很少：pods 的 create/get/delete，加上 pods/exec。</li>
+  <li><b>两条路径传 namespace 的方式不一样</b>：General 的启动脚本把 <code>K8S_NAMESPACE</code> 传进了 Ray；Code 的启动脚本<b>没有传</b>，runner 里拿不到这个变量时 pod 会建到 <code>default</code> 命名空间。用专用命名空间时，Code 需要把 <code>namespace</code> 直接写进 yaml（§6）。</li>
+  <li>可直接使用的文件放在 <code>docs/learning-mimo/k8s-identity/</code>：<code>mimo-rollout-rbac.yaml</code>（命名空间、账号、权限、令牌）和 <code>make-kubeconfig.sh</code>（生成 kubeconfig）。<b>这两个文件只做过语法检查，还没有在真实集群上执行过。</b></li>
+</ol>
+</div>
+
+<h3 id="xd-1">1. General：agent yaml 从哪来、在哪读</h3>
+<p>一共三层配置，逐层指向下一个文件：</p>
+<pre><code>recipes/general/config/general.yaml                     ← main_ppo 的 --config-name=general
+  actor_rollout_ref.rollout.agent.agent_loop_config_path: recipes/general/config/general_agent_loop.yaml
+                                ↓  AgentLoopWorker.__init__ 读这个"登记表"（第二课 ②）
+recipes/general/config/general_agent_loop.yaml
+  - name: mimo_swe_agent
+    _target_: recipes.general.agent_loop.GeneralAgentLoop
+    mimoagent_config_path: config/agent/general/s3k.yaml   ← agent 配置 yaml 的路径
+                                ↓  hydra.utils.instantiate 把它作为构造参数传入（第二课 ③）
+config/agent/general/s3k.yaml                           ← 真正的 agent 配置（agent: / environment:）</code></pre>
+<p>实际读取发生在两个地方：</p>
+<span class="src">recipes/general/agent_loop.py GeneralAgentLoop.__init__</span>
+<pre><code>self.mimoagent_config_path = self._resolve_config_path(mimoagent_config_path)   # 相对路径 → 绝对路径
+self.mimoagent_config = load_mimoagent_config(self.mimoagent_config_path)       # 第一次读：取 agent: 块组装 harness</code></pre>
+<span class="src">recipes/general/env_actor.py DatasetEnvActor.__init__</span>
+<pre><code>self.config = load_mimoagent_config(mimoagent_config_path)    # 第二次读（同一个绝对路径）：取 environment: 块建 pod
+# load_mimoagent_config = open + yaml.safe_load + 两项校验（不允许子 agent 工具；工具列表不能为空）</code></pre>
+<p><b>相对路径怎么解析</b>：<code>_resolve_config_path</code> 调用 <code>verl/utils/import_utils.py</code> 的 <code>resolve_config_path</code>，顺序是：绝对路径直接用 → 相对当前工作目录 → 相对 verl 项目根目录。<code>run_general.sh</code> 启动前会 <code>cd "${GA_TASK_ROOT}"</code>，所以当前目录下找不到 <code>config/agent/general/s3k.yaml</code>，最终落到第三条，解析成仓库里的那个文件。</p>
+<div class="box note"><b>两个实用的推论</b>
+<ul>
+  <li><b>想换一份 agent 配置</b>：改 <code>general_agent_loop.yaml</code> 里的 <code>mimoagent_config_path</code>，写成绝对路径最稳妥。</li>
+  <li><b>训练中途改 s3k.yaml 会生效</b>：每条轨迹都会 new 一个 <code>GeneralAgentLoop</code> 和一个 <code>DatasetEnvActor</code>，各自重新读文件。改动会从之后开始的新轨迹起生效，同一个训练步内可能出现新旧配置混用的情况。修改 environment 块（比如 namespace）最好在训练开始前完成。</li>
+</ul></div>
+
+<h3 id="xd-2">2. Code：agent yaml 从哪来、在哪读</h3>
+<pre><code>scripts/code/train.sh
+  MIMOAGENT_HARNESS_SPEC 默认 = config/agent/code/mix-four-whitebox.yaml
+  如果是默认值：
+    复制 config/agent/code/*.yaml → $RUN_DIR/harness.XXXXXX/
+    用 sed 改写四个 mini-*.yaml 副本里的 model_kwargs（max_tokens / timeout / max_retries）
+    MIMOAGENT_HARNESS_SPEC = 副本里的 mix-four-whitebox.yaml
+                                ↓
+recipes/code/run_train.sh
+  +ray_kwargs.ray_init.runtime_env.env_vars.MIXED_HARNESS_SPEC="${MIMOAGENT_HARNESS_SPEC}"   ← 传进 Ray
+                                ↓
+recipes/code/mimoagent_runner.py（每个 session 一个 Ray task）
+  _mixed_harness_specs()          读 $MIXED_HARNESS_SPEC（yaml.safe_load）
+                                  harnesses[].config 是相对路径时，相对 spec 文件所在目录解析
+  _select_config_path(...)        按 MIXED_HARNESS_MODE 选一个（插课 B §9）
+  _load_config(那个 mini-*.yaml)  yaml.safe_load
+  _run_sync(...)                  config["environment"] → make_dataset_env(...)</code></pre>
+<div class="box warn"><b>改哪个文件才生效</b>：使用默认 spec 时，训练读的是 <code>$RUN_DIR/harness.XXXXXX/</code> 下的<b>副本</b>。所以要在<b>启动前</b>改 <code>config/agent/code/mini-*.yaml</code> 原文件；启动后再改原文件不起作用。反过来，启动后改副本，会从之后新开的 session 起生效。如果把 <code>MIMOAGENT_HARNESS_SPEC</code> 指向自己的 spec 文件，就不会复制，读的就是那份文件本身。</div>
+<p>另外，<code>scripts/code/env.example</code> 里写着"The harness profiles in config/agent/code/ also name one [kubeconfig]"，但实际上这四个 mini-*.yaml 里都没有 <code>kubeconfig</code> 字段，这句注释和现状不符。</p>
+
+<h3 id="xd-3">3. 身份相关的三个参数各从哪里取</h3>
+<p>结合插课 C §14 的读取链路，三个参数的来源（同一行内越靠左优先级越高）：</p>
+<table>
+  <tr><th>参数</th><th>决定什么</th><th>来源与优先级</th></tr>
+  <tr><td>kubeconfig</td><td>用什么身份、连哪个集群</td><td>数据行 <code>instance.routing.kubeconfig</code> → yaml <code>environment.kubeconfig</code> → 环境变量 <code>KUBECONFIG</code>（General 的 env_actor 会显式补上；Code 靠客户端库自己查找）→ <code>~/.kube/config</code> → 集群内服务账号</td></tr>
+  <tr><td>namespace</td><td>pod 建在哪个命名空间</td><td>yaml <code>environment.namespace</code> → 环境变量 <code>K8S_NAMESPACE</code> → <code>default</code><br>⚠ kubeconfig 里 context 设置的 namespace <b>不起作用</b>：代码每次调用都显式传 <code>namespace=self.config.namespace</code></td></tr>
+  <tr><td>权限</td><td>能做哪些操作</td><td>集群上绑定到 kubeconfig 身份的 Role/ClusterRole</td></tr>
+</table>
+<p>环境变量要在<b>创建 pod 的那个进程</b>里可见：General 是 <code>DatasetEnvActor</code>，Code 是 runner 的 Ray task。它们都由 Ray 启动，能看到的环境变量只有两类：<code>runtime_env.env_vars</code> 里显式传入的，以及当初在这台机器上执行 <code>ray start</code> 时 shell 里已有的。你在提交训练的终端里 <code>export</code> 的变量，如果没有经过 <code>runtime_env</code> 传进去，远端节点上是看不到的。</p>
+<table>
+  <tr><th>启动脚本</th><th>传进 Ray 的 k8s 相关变量</th></tr>
+  <tr><td><code>recipes/general/run_general.sh</code></td><td><code>KUBECONFIG</code>（必填，脚本开头检查）、<code>K8S_NAMESPACE</code>（默认 default）、<code>DOCKER_REGISTRY</code>，以及不生效的 <code>K8S_TOLERATION_*</code> 等（插课 C §14.5）</td></tr>
+  <tr><td><code>recipes/code/run_train.sh</code></td><td>只有 <code>KUBECONFIG</code>（可以为空）。<b>没有 <code>K8S_NAMESPACE</code></b></td></tr>
+</table>
+
+<h3 id="xd-4">4. 创建命名空间、账号和权限</h3>
+<p>完整清单在 <code>docs/learning-mimo/k8s-identity/mimo-rollout-rbac.yaml</code>，命名空间叫 <code>mimo-rl</code>，账号叫 <code>mimo-rollout</code>，换名字时全文替换即可。下面逐个说明为什么这样写。</p>
+
+<h4>4.1 Namespace</h4>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: mimo-rl
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: baseline</code></pre>
+<p>单独建一个命名空间有三个好处：权限可以只授予这一个命名空间；可以用 ResourceQuota 限制总资源；出问题时可以整个命名空间一起清理。</p>
+<p>两个 label 是 k8s 内置的 Pod 安全准入（Pod Security Admission）级别，有三档：</p>
+<ul>
+  <li><code>privileged</code>：不限制。</li>
+  <li><code>baseline</code>：禁止特权容器、hostNetwork、额外的 Linux capability 等明显危险的配置，但<b>允许以 root 运行</b>。</li>
+  <li><code>restricted</code>：还要求必须以非 root 运行、丢弃所有 capability 等。</li>
+</ul>
+<p>选 <code>baseline</code> 是因为任务镜像默认以 root 运行，General 的权限隔离步骤还要执行 <code>useradd</code>、写 <code>/etc/sudoers.d</code>（插课 A），<code>restricted</code> 会直接拒绝这些 pod。而代码生成的 pod 定义里 <code>hostNetwork: false</code>、没有特权容器、各环境配置的 <code>capabilities</code> 都是空列表，满足 <code>baseline</code>。如果以后哪个环境给 pod 加了 capability，比如调试需要 <code>SYS_PTRACE</code>，要先确认 baseline 是否允许，否则 pod 会被准入控制拒绝，表现为创建时返回 403。</p>
+
+<h4>4.2 ServiceAccount：这是"控制器"的身份，不是 pod 的身份</h4>
+<pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata: {name: mimo-rollout, namespace: mimo-rl}
+automountServiceAccountToken: false</code></pre>
+<p>这个账号是给<b>训练集群里的 env_actor / runner</b> 调用 k8s API 用的。任务 pod 本身不使用它：代码生成的 pod 定义里没有 <code>serviceAccountName</code>，并且设置了 <code>automountServiceAccountToken: false</code>，pod 里拿不到任何 k8s 凭据。账号上也设了 <code>automountServiceAccountToken: false</code>，即使以后有人误用它启动 pod，令牌也不会被挂载进去。</p>
+
+<h4>4.3 Role：按代码实际调用推出的最小权限</h4>
+<pre><code>rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["create", "get", "delete"]        # 创建 pod；轮询就绪/确认删除；删除
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list", "deletecollection"]       # 可选：按标签批量清理残留 pod
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get"]                  # 执行命令、传文件、打分都靠它</code></pre>
+<p>每条权限对应插课 C §2 的接口表：</p>
+<table>
+  <tr><th>权限</th><th>代码中的调用</th><th>缺了会怎样</th></tr>
+  <tr><td>pods: create</td><td><code>create_namespaced_pod</code></td><td>每条轨迹 setup 失败，奖励全部 -999</td></tr>
+  <tr><td>pods: get</td><td><code>read_namespaced_pod</code>（就绪轮询、删除确认）</td><td>永远等不到就绪；删除时无法确认</td></tr>
+  <tr><td>pods: delete</td><td><code>delete_namespaced_pod</code></td><td>pod 全部泄漏，直到 namespace 配额耗尽</td></tr>
+  <tr><td>pods: list, deletecollection</td><td>训练路径不用；手动 <code>kubectl delete pods -l exp=...</code> 清理时要用</td><td>只影响清理；去掉它们权限更小，清理交给管理员做</td></tr>
+  <tr><td>pods/exec: create, get</td><td><code>connect_get_namespaced_pod_exec</code>（WebSocket）</td><td><b>pod 能建出来，但第一个工具调用就失败</b></td></tr>
+</table>
+<p>为什么 <code>pods/exec</code> 要同时给 create 和 get？Python 客户端用的是 WebSocket，发起的是 HTTP GET 请求。较早版本的 API server 按 <code>get</code> 鉴权；较新版本出于安全考虑，对 WebSocket 方式的 exec 也要求 <code>create</code>（和 kubectl 早期用的 SPDY 方式一致）。不确定集群版本时两个都给，不会多出实际权限。</p>
+<p>用的是 <b>Role</b>（命名空间级）而不是 ClusterRole（集群级），所以这个身份在 <code>mimo-rl</code> 之外什么也做不了。</p>
+
+<h4>4.4 RoleBinding 和令牌 Secret</h4>
+<pre><code>kind: RoleBinding        # 把 Role 授予 mimo-rollout 账号
+...
+kind: Secret
+metadata:
+  name: mimo-rollout-token
+  annotations: {kubernetes.io/service-account.name: mimo-rollout}
+type: kubernetes.io/service-account-token     # 由 k8s 自动填入一个长期有效的令牌</code></pre>
+<p>令牌有两种获取方式，这里选择长期令牌是有意为之：</p>
+<table>
+  <tr><th></th><th><code>kubectl create token</code>（有时效的令牌）</th><th>service-account-token 类型的 Secret（长期令牌）</th></tr>
+  <tr><td>有效期</td><td>有上限，由 API server 配置决定，经常是几小时到一天</td><td>不过期，直到删除这个 Secret</td></tr>
+  <tr><td>对训练的影响</td><td>一次训练要跑好几天，令牌过期的那一刻，<b>所有</b>创建 pod、执行命令的操作同时失败</td><td>没有这个问题</td></tr>
+  <tr><td>安全性</td><td>泄漏后影响时间有限</td><td>泄漏后一直有效，需要手动吊销（删除 Secret）</td></tr>
+</table>
+<p>因为训练进程不会自动刷新令牌，所以选长期令牌，再通过"权限只限一个命名空间"和"文件权限 600"控制风险。</p>
+
+<h4>4.5 应用</h4>
+<pre><code># 用管理员 kubeconfig 执行
+kubectl apply -f docs/learning-mimo/k8s-identity/mimo-rollout-rbac.yaml</code></pre>
+
+<h3 id="xd-5">5. 生成 kubeconfig 并验证</h3>
+<h4>5.1 生成</h4>
+<pre><code># 仍然以管理员 context 运行：脚本从当前 context 读取集群地址
+bash docs/learning-mimo/k8s-identity/make-kubeconfig.sh
+# 可以用环境变量覆盖：NS=... SA=... SECRET=... OUT=... SERVER=...</code></pre>
+<p>脚本做的事：等待 k8s 往 Secret 里填好令牌 → 取出令牌和集群 CA 证书 → 用 <code>kubectl config set-cluster / set-credentials / set-context</code> 写出一个独立的 kubeconfig（证书内嵌在文件里）→ <code>chmod 600</code>。</p>
+<div class="box warn"><b>集群地址要从 Ray 节点能访问到。</b>脚本默认取管理员 kubeconfig 里的 <code>server</code>。如果管理员是通过本机端口转发或跳板访问集群的（地址是 <code>https://127.0.0.1:xxxx</code> 之类），这个地址在 Ray 节点上无效，要用 <code>SERVER=https://&lt;API server 实际地址&gt;:6443</code> 覆盖。</div>
+
+<h4>5.2 验证权限</h4>
+<pre><code>export KC=./mimo-rollout.kubeconfig
+kubectl --kubeconfig=$KC auth can-i create pods                      # 期望 yes
+kubectl --kubeconfig=$KC auth can-i get pods                         # 期望 yes
+kubectl --kubeconfig=$KC auth can-i delete pods                      # 期望 yes
+kubectl --kubeconfig=$KC auth can-i create pods --subresource=exec   # 期望 yes
+kubectl --kubeconfig=$KC auth can-i get pods --subresource=exec      # 期望 yes
+kubectl --kubeconfig=$KC auth can-i create pods -n default           # 期望 no：权限只在 mimo-rl
+kubectl --kubeconfig=$KC auth can-i create deployments               # 期望 no</code></pre>
+
+<h4>5.3 端到端冒烟测试（模拟代码的完整流程）</h4>
+<pre><code># 镜像换成你的任务镜像（DOCKER_REGISTRY + 数据里的 docker_image），顺便验证拉镜像
+IMG=registry.example.com/ns/general-agent-env:oss
+kubectl --kubeconfig=$KC run mimo-smoke --image=$IMG --restart=Never --command -- sleep 600
+for i in $(seq 1 60); do                                          # 只用 get 轮询，和代码一样，不依赖 watch 权限
+  [ "$(kubectl --kubeconfig=$KC get pod mimo-smoke -o jsonpath='{.status.phase}')" = Running ] &amp;&amp; break
+  sleep 5
+done
+kubectl --kubeconfig=$KC exec mimo-smoke -- /bin/bash -lc 'id &amp;&amp; echo exec-ok'
+kubectl --kubeconfig=$KC delete pod mimo-smoke --grace-period=0
+kubectl --kubeconfig=$KC get pod mimo-smoke                        # 期望 NotFound</code></pre>
+<p>如果 pod 一直是 Pending，用 <code>kubectl --kubeconfig=$KC get pod mimo-smoke -o yaml</code> 看 <code>status.conditions</code> 和 <code>containerStatuses[].state.waiting.reason</code>：<code>Unschedulable</code> 通常是节点污点或资源不足，<code>ImagePullBackOff</code> 是镜像地址或拉取凭据的问题。（查看 events 需要额外的 events 读权限，Role 里没有给。）</p>
+
+<h3 id="xd-6">6. 接入训练：两条路径分别怎么配</h3>
+<p>先把 kubeconfig 放到<b>所有 Ray 节点都能读到的共享路径</b>上。env_actor 和 runner 可能被调度到任何一个节点，<code>recipes/code/cluster_precheck.py</code> 的说明里专门提到过这类问题："Shared-storage visibility is per-node"。</p>
+<h4>6.1 General</h4>
+<pre><code># scripts/general/general.env.example 对应的变量
+export KUBECONFIG=/shared/path/mimo-rollout.kubeconfig
+export K8S_NAMESPACE=mimo-rl          # run_general.sh 会把它传进 Ray</code></pre>
+<p>这条路径到这里就配好了。如果更希望写死在配置里，也可以在 <code>config/agent/general/s3k.yaml</code> 的 <code>environment:</code> 块加 <code>namespace: mimo-rl</code>，它的优先级高于环境变量。</p>
+<h4>6.2 Code</h4>
+<pre><code>export KUBECONFIG=/shared/path/mimo-rollout.kubeconfig   # run_train.sh 会传进 Ray</code></pre>
+<p>namespace 需要额外处理，因为 <code>run_train.sh</code> 不传 <code>K8S_NAMESPACE</code>。二选一：</p>
+<ul>
+  <li><b>推荐：写进 yaml。</b>启动前，在 <code>config/agent/code/</code> 下四个 <code>mini-*.yaml</code> 的 <code>environment:</code> 块里各加一行 <code>namespace: mimo-rl</code>。<code>namespace</code> 是配置类认识的字段，不会被过滤掉；<code>train.sh</code> 复制副本时也只改 <code>model_kwargs</code>，不影响这一行。</li>
+  <li><b>或者：</b>在每个 Ray 节点执行 <code>ray start</code> 之前就 <code>export K8S_NAMESPACE=mimo-rl</code>，让 Ray worker 从启动环境里继承它。这种方式依赖集群的启动方式，容易遗漏某个节点。</li>
+</ul>
+<div class="box warn"><b>如果什么都不做</b>：Code 的 pod 会尝试建在 <code>default</code> 命名空间。用本页的 kubeconfig 时，这个身份在 <code>default</code> 里没有权限，每个 session 的 pod 创建都会返回 403，表现为大量 session 失败。反过来，如果用的是集群管理员 kubeconfig，pod 会悄悄建进 <code>default</code>，不受 <code>mimo-rl</code> 的配额和安全策略约束。</div>
+<h4>6.3 私有镜像仓库</h4>
+<p>如果任务镜像在私有仓库，需要先在 <code>mimo-rl</code> 里创建拉取凭据，再在 yaml 的 <code>environment:</code> 块里引用它（<b>不要</b>依赖 <code>K8S_IMAGE_PULL_SECRET</code> 环境变量，它没有被任何代码读取，见插课 C §14.5）：</p>
+<pre><code>kubectl -n mimo-rl create secret docker-registry regcred \
+  --docker-server=registry.example.com --docker-username=... --docker-password=...</code></pre>
+<pre><code># s3k.yaml / mini-*.yaml 的 environment: 块
+environment:
+  namespace: mimo-rl
+  image_pull_secrets: [regcred]
+  # 需要调度到带污点的节点时（同样不要依赖 K8S_TOLERATION_* 环境变量）：
+  # tolerations:
+  #   - {key: dedicated, operator: Equal, value: my-pool, effect: NoSchedule}
+  # node_selector: {node-pool: my-pool}</code></pre>
+<p>这里的 regcred 是 pod 拉镜像时由 kubelet 使用的，训练进程自己不读它，所以 Role 里不需要 secrets 的读权限。</p>
+
+<h3 id="xd-7">7. 安全与容量的注意事项</h3>
+<ul>
+  <li><b>kubeconfig 等于这个身份本身。</b>它放在共享文件系统上，所有能读到这个文件的人都能在 <code>mimo-rl</code> 里创建 pod 并执行任意命令。保持 600 权限，必要时放在只有训练账户能读的目录。吊销方法：删除 <code>mimo-rollout-token</code> 这个 Secret，再重新 apply 生成新令牌。</li>
+  <li><b>exec 权限的含义。</b>pods/exec 允许在命名空间里任何 pod 中执行命令。这也是把训练 pod 放进专用命名空间的原因：不要在 <code>mimo-rl</code> 里放其他业务的 pod。</li>
+  <li><b>配额要按并发量估算。</b>General 每个 pod 请求 main 2 核 8Gi + sidecar 0.5 核 1Gi（未单独配置时的默认值）。默认配置下一个训练步有 64 个 prompt × 8 = 512 条轨迹并发，开启 <code>filter_groups</code> 时还会补充更多 prompt。如果给 <code>mimo-rl</code> 设置 ResourceQuota，额度太小的话多出来的 pod 会创建失败（返回 403 forbidden: exceeded quota），这类失败会被记成 setup 失败、奖励 -999，不容易一眼看出是配额问题。</li>
+  <li><b>网络出口。</b>General 的打分在 sidecar 里调用 LLM 评审服务（<code>GA_JUDGE_URL</code>）。如果给命名空间加了默认拒绝出站流量的 NetworkPolicy，需要放行到评审服务和镜像仓库的访问，否则打分会失败。</li>
+  <li><b>API server 压力。</b>每次工具调用都是一次 exec 请求（插课 C §12）。如果是共享集群，提前和集群管理员确认 API server 的限流设置，避免影响其他用户。</li>
+</ul>
+
+<h3 id="xd-8">8. 思考题</h3>
+<details><summary>Q1：为什么 kubeconfig 里 context 设置的 namespace 不起作用？</summary>
+<p>kubectl 会在命令没写 <code>-n</code> 时使用 context 里的 namespace，但这是 kubectl 自己的行为。mimoagent 用的是 Python 客户端，每个 API 调用都显式传入 <code>namespace=self.config.namespace</code>，而这个值来自 yaml 或 <code>K8S_NAMESPACE</code>，默认是 <code>default</code>，从不读取 kubeconfig 里的 context namespace。所以 <code>make-kubeconfig.sh</code> 虽然也写了 namespace，那只是方便你用 kubectl 手动排查，对训练没有影响。</p></details>
+<details><summary>Q2：能不能直接用集群管理员的 kubeconfig，省掉这些配置？</summary>
+<p>技术上可以，代码不区分身份。但有三个风险：一是 kubeconfig 放在共享文件系统上，等于把集群管理员权限分发到了每个 Ray 节点；二是 Code 路径漏配 namespace 时，pod 会悄悄建进 <code>default</code>，不受任何配额约束，出问题也不会报错；三是训练代码里的 bug（比如按标签批量删除时标签写错）可能误删其他业务的 pod。用专用身份，这些错误都会以"权限不足"的形式立刻暴露出来。</p></details>
+<details><summary>Q3：训练中途令牌被吊销（删除了 Secret），会发生什么？</summary>
+<p>之后所有 k8s 调用都会返回 401。正在 setup 的轨迹创建 pod 失败 → 奖励 -999；正在执行工具的轨迹，exec 通道打不开 → 先重试 3 次，然后作为传输错误终止（插课 A §8）。已经建好的 pod 也删不掉了，会一直残留到有人用新凭据清理。所以轮换令牌最好在两次训练之间进行。</p></details>
+
+<h3 id="xd-9">9. 补充答疑：问题澄清</h3>
+<div class="box ask"><b>提问</b>：你误解了我的意思，我的意思是 K8s 加载的 pod 启动的 yaml 配置是从哪里加载的，是否有约束 namespace，kube config 有什么要求，我现在有 k8s 集群，要给这个仓库的训练提前准备 kube config 身份和 namespace 规定，避免误删除生产的其他 pod。</div>
+<div class="box key"><b>结论</b>
+<ol>
+  <li><b>pod 启动配置没有 YAML 文件。</b>pod 定义由代码拼成字典：一部分写死在 <code>_build_pod_body</code> 里，另一部分来自 agent 配置 yaml 的 <code>environment:</code> 块（General 是 <code>s3k.yaml</code>，Code 是 <code>mini-*.yaml</code>），还有少数字段来自数据行（镜像、cwd）。§10</li>
+  <li><b>代码对 namespace 没有任何约束</b>：不校验、不创建，取什么值就往哪里建。唯一能真正约束它的是集群上的 RBAC。§11</li>
+  <li><b>kubeconfig 最关键的要求是：只含一个 context，指向训练专用的身份。</b>代码读 kubeconfig 时用的是文件里的 <code>current-context</code>，不能另外指定；而且在没给 kubeconfig 时，会退回到节点上的 <code>~/.kube/config</code> 或者 pod 自身的服务账号。§12</li>
+  <li><b>代码本身不会删别人的 pod</b>：训练路径只按自己生成的精确 pod 名删除（<code>mimoagent-</code> + 16 位随机十六进制），不存在按标签批量删除。真正的风险在配置和人工操作：用了生产集群的管理员 kubeconfig、pod 落进共享的 <code>default</code> 命名空间、人工清理命令写得太宽。§13</li>
+  <li><b>防护方案</b>：专用命名空间 + 只在该命名空间生效的 Role（§4 已给出，这是决定性的一层）→ 单 context 的专用 kubeconfig 并验证权限边界 → 可选的准入策略，限制这个身份只能删 <code>mimoagent-*</code> → 只在专用命名空间里、按名字前缀和存活时长清理残留 pod。§14，新增文件 <code>k8s-identity/mimo-rollout-guardrails.yaml</code>、<code>k8s-identity/cleanup-stale-pods.sh</code>。</li>
+</ol></div>
+
+<h3 id="xd-10">10. pod 启动配置从哪里来</h3>
+<p>仓库里搜不到 <code>kind: Pod</code> 的文件，也没有调用 <code>kubectl apply</code> 或客户端的 <code>create_from_yaml</code>。发给 API server 的 pod 定义，是 <code>create_namespaced_pod(body=字典)</code> 里那个字典，它由三处来源拼成：</p>
+<table>
+  <tr><th>来源</th><th>字段</th><th>能否通过配置修改</th></tr>
+  <tr><td><b>写死在代码里</b><br><code>mimoagent/environments/kubernetes.py</code> <code>_build_pod_body</code>、<code>_start_pod</code></td><td>
+    pod 名 <code>mimoagent-&lt;16位hex&gt;</code>；容器名 <code>main</code>；<code>command/args: [/bin/bash, -lc]</code>；<code>stdin: true, tty: true</code>（让容器空转不退出）；<code>imagePullPolicy: IfNotPresent</code>；<code>restartPolicy: OnFailure</code>；<code>automountServiceAccountToken: false</code>；随机 hostname；<b>没有</b> <code>serviceAccountName</code>、<code>activeDeadlineSeconds</code>、<code>ownerReferences</code></td><td>不能，只能改代码</td></tr>
+  <tr><td><b>写死在 recipes 里</b>（仅 General）<br><code>recipes/general/general_agent/k8s_sidecar.py</code></td><td>追加 sidecar 容器；共享卷类型固定为 <code>emptyDir</code>；有 sidecar 时强制 <code>hostNetwork: false</code>；sidecar 默认资源 0.5 核/1Gi 请求、2 核/4Gi 上限</td><td>sidecar 的镜像、命令、资源、挂载可以在 yaml 的 <code>sidecars:</code> 里配</td></tr>
+  <tr><td><b>agent 配置 yaml 的 <code>environment:</code> 块</b><br>General：<code>config/agent/general/s3k.yaml</code><br>Code：<code>config/agent/code/mini-*.yaml</code>（训练时读 <code>$RUN_DIR/harness.*</code> 下的副本，见 §2）</td><td><code>namespace</code>、资源请求与上限、<code>env</code>/<code>forward_env</code>、<code>labels</code>/<code>annotations</code>、<code>node_selector</code>、<code>tolerations</code>、<code>image_pull_secrets</code>、<code>host_network</code>、<code>capabilities</code>、<code>kubeconfig</code>，以及 sidecar 相关字段（字段与 pod 位置的对应见插课 C §14.3）</td><td>能，改 yaml</td></tr>
+  <tr><td><b>数据行（parquet）</b><br><code>extra_info.instance_json</code></td><td><code>docker_image</code>（加上 <code>DOCKER_REGISTRY</code> 前缀成为镜像地址）；可选的 <code>cwd</code>；可选的 <code>routing.kubeconfig</code> / <code>routing.node_selector</code>（按任务路由到不同集群或节点池）</td><td>能，改数据</td></tr>
+  <tr><td><b>运行时补充</b></td><td>General 的 env_actor 会加标签 <code>exp=$EXP_NAME</code>；从环境变量补 <code>kubeconfig</code>、<code>image_prefix</code></td><td>通过环境变量</td></tr>
+</table>
+<div class="box warn"><b>两个和"残留 pod"直接相关的事实</b>
+<ul>
+  <li><b><code>pod_timeout: "2h"</code> 是个摆设。</b><code>KubernetesEnvironmentConfig</code> 里声明了这个字段，注释说是"Max duration to keep pod running"，但整个 mimoagent 里没有任何代码使用它，pod 定义里也没有 <code>activeDeadlineSeconds</code>。所以 pod 不会自己到期结束。</li>
+  <li><b>没有 <code>ownerReferences</code>。</b>pod 不挂在任何上层对象下面，训练进程退出后 k8s 不会自动回收它们。</li>
+</ul>
+两者合起来就是：只要训练进程异常退出、来不及执行 <code>finally</code> 里的清理，pod 就会一直留在集群里，直到有人手动删除。这正是人工清理需求的来源，也是误删风险的来源（§13、§14.5）。</div>
+
+<h3 id="xd-11">11. namespace 有没有约束</h3>
+<p><b>代码层面没有任何约束。</b><code>KubernetesEnvironmentConfig.namespace</code> 就是一个字符串，代码既不检查它是否合法、是否在允许的列表里，也不会创建它。取值顺序见 §3：yaml <code>environment.namespace</code> → 环境变量 <code>K8S_NAMESPACE</code> → <code>default</code>。创建、查询、执行命令、删除，每个 API 调用都显式传入这个值。</p>
+<table>
+  <tr><th>情况</th><th>结果</th></tr>
+  <tr><td>namespace 存在，身份有权限</td><td>pod 正常建在这里</td></tr>
+  <tr><td>namespace 不存在</td><td>创建返回 404。404 不在重试列表里（只重试 406/409/429/500/503），直接失败 → setup 失败 → 奖励 -999</td></tr>
+  <tr><td>身份在这个 namespace 没有权限</td><td>创建返回 403，同样直接失败</td></tr>
+  <tr><td>namespace 有 Pod 安全准入级别（§4.1）</td><td>pod 定义不符合时创建返回 403</td></tr>
+  <tr><td>namespace 有 ResourceQuota</td><td>超出配额时创建返回 403（exceeded quota）</td></tr>
+  <tr><td><b>Code 路径什么都没配</b></td><td>runner 里拿不到 <code>K8S_NAMESPACE</code>（§6.2），落到 <code>default</code>。如果 kubeconfig 是管理员身份，pod 会悄悄建进 <code>default</code></td></tr>
+</table>
+<p>所以"namespace 规定"只能在集群一侧落实：<b>给训练身份的权限只覆盖专用命名空间</b>。这样即使配置写错了 namespace，结果也是"创建被拒绝"，而不是"建到了不该去的地方"。</p>
+
+<h3 id="xd-12">12. kubeconfig 有什么要求</h3>
+<p>代码读取 kubeconfig 的调用是（插课 C §3）：</p>
+<pre><code>config.load_kube_config(config_file=kubeconfig, client_configuration=self._kube_configuration)</code></pre>
+<p>注意它<b>没有传 <code>context=</code> 参数</b>，所以使用的是文件里的 <code>current-context</code>。由此推出以下要求：</p>
+<table>
+  <tr><th>要求</th><th>原因</th></tr>
+  <tr><td><b>只含一个 context、一个集群、一个用户</b></td><td>多 context 的文件（比如运维常用的那份，里面同时有测试和生产集群）用哪个，完全取决于 <code>current-context</code> 当时指向谁。有人用 <code>kubectl config use-context</code> 切换一下，训练就会连到另一个集群。§5 的 <code>make-kubeconfig.sh</code> 生成的就是单 context 文件</td></tr>
+  <tr><td><b>身份是训练专用的</b>，不是个人或管理员账号</td><td>权限边界只能靠这个身份的 RBAC 来保证（§11）</td></tr>
+  <tr><td><b>不要用冒号拼接多个文件</b>（<code>KUBECONFIG=a:b</code>）</td><td>客户端会合并多个文件，<code>current-context</code> 取第一个出现的值，结果不直观</td></tr>
+  <tr><td><b>所有 Ray 节点都能读到同一路径</b></td><td>env_actor / runner 可能被调度到任何节点（§6）</td></tr>
+  <tr><td><b>API server 地址从 Ray 节点可达</b></td><td>不能是 127.0.0.1 端口转发之类的地址（§5.1）</td></tr>
+  <tr><td><b>认证方式不依赖节点上的额外程序</b>，推荐静态令牌</td><td>云厂商常用的 exec 插件认证（如 <code>aws eks get-token</code>、<code>gke-gcloud-auth-plugin</code>）要求每个 Ray 节点都装有对应程序和凭据，缺一个节点就会在那台机器上失败</td></tr>
+  <tr><td><b>令牌在整个训练期间有效</b></td><td>训练进程不会刷新令牌，中途过期会让所有 k8s 调用同时失败（§4.4）</td></tr>
+  <tr><td><b>context 里的 namespace 不能代替 <code>K8S_NAMESPACE</code></b></td><td>代码从不读它（§8 Q1）</td></tr>
+</table>
+<div class="box warn"><b>最隐蔽的风险：没给 kubeconfig 时的回退行为。</b>
+<p><code>_setup_kubernetes_client</code> 在 <code>config.kubeconfig</code> 为空时：</p>
+<pre><code>default_kubeconfig = os.getenv("KUBECONFIG") or os.path.expanduser("~/.kube/config")
+if kubeconfig is None and not os.path.exists(default_kubeconfig) and os.getenv("KUBERNETES_SERVICE_HOST"):
+    config.load_incluster_config(...)        # ← 用当前进程所在 pod 的服务账号
+else:
+    config.load_kube_config(config_file=None, ...)   # ← 交给客户端库按默认位置查找</code></pre>
+<ul>
+  <li>General 的 <code>run_general.sh</code> 强制要求设置 <code>KUBECONFIG</code>，env_actor 还会显式填进去，这条路径比较安全。</li>
+  <li><b>Code 的 <code>run_train.sh</code> 允许 <code>KUBECONFIG</code> 为空</b>（<code>KUBECONFIG="${KUBECONFIG:-}"</code>），yaml 里也没有 <code>kubeconfig</code> 字段。这时用哪个身份，取决于 runner 落在的那台节点上的状态：如果节点上恰好有某个运维留下的 <code>~/.kube/config</code>，就会用它——那可能是生产集群的管理员凭据；如果 Ray 本身跑在 k8s 里（比如用 KubeRay 部署在生产集群上），就会用 Ray pod 的服务账号，连到 Ray 所在的那个集群。</li>
+</ul>
+<p>所以对 Code 路径：<b>始终显式设置 <code>KUBECONFIG</code></b>，或者在四个 <code>mini-*.yaml</code> 的 <code>environment:</code> 块里写上 <code>kubeconfig: /共享路径/mimo-rollout.kubeconfig</code>。（<code>KUBECONFIG</code> 为空字符串时客户端库的具体行为，本机未安装该库，没有核实。）</p></div>
+
+<h3 id="xd-13">13. 会不会误删生产 pod：全部删除路径</h3>
+<p>在整个仓库（含两个子模块，不含测试）里搜索所有删除 pod 的调用，只有两处：</p>
+<table>
+  <tr><th>删除路径</th><th>删什么</th><th>什么时候触发</th><th>能否删到别人的 pod</th></tr>
+  <tr><td><code>KubernetesEnvironment.cleanup()</code><br><code>delete_namespaced_pod(name=self.pod_name, namespace=self.config.namespace)</code></td><td><b>只按精确的 pod 名</b>删除，名字是本对象自己生成的 <code>mimoagent-</code> + 16 位随机十六进制</td><td>General：<code>GeneralAgentLoop.run()</code> 的 <code>finally</code>；<code>DatasetEnvActor.setup()</code> 每次重试前和最终失败后<br>Code：<code>mimoagent_runner._run_sync</code> 的 <code>finally</code></td><td>正常情况下不能（见下方"理论上的唯一例外"）</td></tr>
+  <tr><td><code>ray_batch._sweep_namespace</code><br><code>delete_collection_namespaced_pod(label_selector=...)</code></td><td>按标签批量删除，标签是 <code>mimoagent-run=rb-&lt;12位随机hex&gt;</code>，每次运行唯一</td><td>只在 mimoagent 自己的分布式评测工具结束或被中断时。<b>不在 verl 训练路径上</b></td><td>不能：标签每次运行随机生成，生产 pod 不可能带这个标签</td></tr>
+</table>
+<p>训练路径里<b>没有</b> list 调用，<b>没有</b>按标签删除，<b>没有</b>按名字前缀删除。</p>
+<div class="box note"><b>理论上的唯一例外：名字冲突</b>
+<p><code>_start_pod</code> 是先生成 <code>self.pod_name</code>、再发创建请求的。如果命名空间里已经有一个同名的 pod，创建会返回 409，重试 10 次后抛出异常；setup 失败后会调用 <code>cleanup()</code>，而这时 <code>self.pod_name</code> 已经设置好了，于是会去删除那个<b>早已存在的同名 pod</b>。</p>
+<p>16 位十六进制是 64 位随机数，和一个碰巧叫 <code>mimoagent-xxxxxxxxxxxxxxxx</code> 的生产 pod 撞名的概率可以忽略。这里列出来，是为了说明"代码只删自己的 pod"这个结论成立的前提：<b>没有别的东西用 <code>mimoagent-</code> 前缀命名 pod</b>。专用命名空间可以让这个前提自动成立。</p></div>
+<p>既然代码本身是安全的，误删生产 pod 的风险就来自<b>配置和人工操作</b>：</p>
+<table>
+  <tr><th>风险</th><th>怎么发生</th><th>后果</th></tr>
+  <tr><td>kubeconfig 指向生产集群、带管理员权限</td><td>多 context 文件被切换；Code 路径 <code>KUBECONFIG</code> 为空、落到节点上的 <code>~/.kube/config</code>（§12）</td><td>pod 建进生产集群；权限边界完全不存在</td></tr>
+  <tr><td>pod 落进共享命名空间</td><td>Code 路径没配 namespace，落到 <code>default</code>（§11）</td><td>训练 pod 和生产 pod 混在一起，后续人工清理容易误伤</td></tr>
+  <tr><td><b>人工清理命令写得太宽</b></td><td>训练崩溃后 pod 残留（§10 两个事实），有人在共享命名空间执行 <code>kubectl delete pods --all</code>，或者用 <code>-l app=...</code> 这种通用标签</td><td><b>这是最现实的误删场景</b></td></tr>
+  <tr><td>按标签清理时标签不可靠</td><td>Code 的四个 <code>mini-*.yaml</code> 写着 <code>labels: {}</code>，显式传入空字典会覆盖默认的 <code>app: mimoagent</code>，所以 Code 的 pod <b>没有任何标签</b>；General 的 pod 只有 <code>exp=$EXP_NAME</code>，默认值是很通用的 <code>ga_train</code></td><td>想按标签清理时，要么找不到，要么标签太通用可能匹配到别的东西</td></tr>
+</table>
+
+<h3 id="xd-14">14. 防误删的分层方案</h3>
+<p>按"哪一层出错也不会删到生产 pod"来设计，越靠前的层越关键：</p>
+<pre><code>第 1 层  专用命名空间 + 命名空间级 Role         ← 决定性的一层：API 层面保证碰不到别的命名空间
+第 2 层  单 context 的专用 kubeconfig，验证边界   ← 保证训练确实用的是第 1 层的身份
+第 3 层  准入策略：只能创建/删除 mimoagent-*     ← 可选；必须和其他业务共用命名空间时的补救
+第 4 层  给训练 pod 打上专属标签                 ← 让人工排查和清理有可靠的依据
+第 5 层  只在专用命名空间里、按前缀和时长清理    ← 把人工操作的范围也限定住</code></pre>
+
+<h4>14.1 第 1 层：专用命名空间 + Role</h4>
+<p>直接使用 §4 的 <code>mimo-rollout-rbac.yaml</code>。它为什么能防误删：</p>
+<ul>
+  <li>Role 是<b>命名空间级</b>的，RoleBinding 只在 <code>mimo-rl</code> 里。这个身份对其他任何命名空间都没有任何权限，删除生产命名空间里的 pod 会被 API server 直接拒绝（403），与代码怎么写无关。</li>
+  <li>令牌只对这一个集群有效，kubeconfig 里也只有这一个集群，不存在"连错集群"。</li>
+  <li><code>mimo-rl</code> 里约定<b>不放任何其他业务</b>，这样 Role 里的 <code>list</code>/<code>deletecollection</code>（用于批量清理）也就不会伤到别人。</li>
+</ul>
+
+<h4>14.2 第 2 层：验证权限边界</h4>
+<p>在 §5.2 的基础上，重点验证"<b>不能做</b>的事"。把 <code>&lt;prod-ns&gt;</code> 换成你生产业务实际所在的命名空间：</p>
+<pre><code>export KC=/shared/path/mimo-rollout.kubeconfig
+kubectl --kubeconfig=$KC config get-contexts                        # 期望只有一行
+kubectl --kubeconfig=$KC auth can-i delete pods -n &lt;prod-ns&gt;          # 期望 no
+kubectl --kubeconfig=$KC auth can-i delete pods -n default           # 期望 no
+kubectl --kubeconfig=$KC auth can-i create pods --subresource=exec -n &lt;prod-ns&gt;   # 期望 no
+kubectl --kubeconfig=$KC auth can-i delete pods --all-namespaces     # 期望 no
+kubectl --kubeconfig=$KC auth can-i --list -n mimo-rl                # 核对只有预期的几条权限</code></pre>
+<p>任何一条"期望 no"返回了 yes，说明这个身份还被别的 RoleBinding / ClusterRoleBinding 授予了权限（比如集群里有给所有服务账号授权的宽泛绑定），需要先查清楚再开训练。</p>
+
+<h4>14.3 第 3 层（可选）：准入策略限制 pod 名前缀</h4>
+<p>如果拿不到专用命名空间、只能和其他业务共用，RBAC 就无能为力了：RBAC 不能按标签或名字前缀授权（<code>resourceNames</code> 只能写精确名字，而 pod 名是随机生成的，而且它对 create 不生效）。这时可以用 k8s 1.30 起正式可用的 ValidatingAdmissionPolicy，文件是 <code>k8s-identity/mimo-rollout-guardrails.yaml</code>：</p>
+<pre><code>matchConstraints:   pods 的 CREATE / DELETE
+matchConditions:    请求者 == system:serviceaccount:mimo-rl:mimo-rollout     ← 只约束训练身份
+validations:
+  (CREATE 且 object.metadata.name 以 mimoagent- 开头) 或
+  (DELETE 且 oldObject.metadata.name 以 mimoagent- 开头)
+validationActions: [Deny]</code></pre>
+<p>效果：即使这个身份在共享命名空间里有删除权限，也只能删名字以 <code>mimoagent-</code> 开头的 pod；删别的 pod 会被拒绝。管理员和其他业务不受影响。在共享命名空间里使用时，还应该<b>从 Role 中去掉 <code>list</code> 和 <code>deletecollection</code></b>，不依赖准入策略对批量删除逐项生效。</p>
+<p>验证方法（用管理员身份先建一个名字不带前缀的测试 pod）：</p>
+<pre><code>kubectl -n mimo-rl run guard-test --image=$IMG --restart=Never --command -- sleep 600   # 管理员身份
+kubectl --kubeconfig=$KC -n mimo-rl delete pod guard-test     # 期望被拒绝，提示 mimoagent-*
+kubectl -n mimo-rl delete pod guard-test                       # 管理员身份清理</code></pre>
+<p>这个策略<b>不覆盖 exec</b>（exec 在 k8s 里是 CONNECT 请求），exec 的范围仍然靠命名空间来限定。文件已通过 YAML 解析检查，<b>还没有在真实集群上 apply 过</b>；需要集群版本 ≥ 1.30。</p>
+
+<h4>14.4 第 4 层：给训练 pod 打上专属标签</h4>
+<p>标签不能防止删除，但能让人工排查和清理有可靠的依据。建议在 yaml 里显式写一个专属标签（下面只是建议，仓库里的文件我没有改）：</p>
+<pre><code># config/agent/general/s3k.yaml 的 environment: 块
+labels: {app: mimo-rollout}
+#   General 的 env_actor 会合并成 {exp: $EXP_NAME, app: mimo-rollout}
+
+# config/agent/code/mini-*.yaml 的 environment: 块（替换现在的 labels: {}）
+labels: {app: mimo-rollout}</code></pre>
+<p>yaml 是直接读取的，不展开环境变量，所以这里只能写固定值；按单次运行区分 pod，General 可以依靠自动添加的 <code>exp=$EXP_NAME</code>，并给每次运行起一个不同的 <code>EXP_NAME</code>。</p>
+
+<h4>14.5 第 5 层：只在专用命名空间里、按前缀和时长清理</h4>
+<p>因为 pod 不会自动过期（§10），训练崩溃后需要清理。<code>k8s-identity/cleanup-stale-pods.sh</code> 把清理范围限定成三个条件同时满足：</p>
+<ul>
+  <li>只看一个命名空间（<code>NS</code>，默认 <code>mimo-rl</code>），并且<b>拒绝在 <code>default</code> 和 <code>kube-system</code> 上运行</b>；</li>
+  <li>名字以 <code>mimoagent-</code> 开头，且没有处于正在删除的状态；</li>
+  <li>存活时间超过 <code>MAX_AGE_HOURS</code>（默认 12 小时，远大于单条轨迹的最长合法寿命）。</li>
+</ul>
+<pre><code># 默认只列出，不删除
+KC=/shared/path/mimo-rollout.kubeconfig NS=mimo-rl bash docs/learning-mimo/k8s-identity/cleanup-stale-pods.sh
+# 确认列表无误后再真正删除
+KC=... NS=mimo-rl APPLY=1 bash docs/learning-mimo/k8s-identity/cleanup-stale-pods.sh</code></pre>
+<p>我用一个假的 <code>kubectl</code> 在本地测过筛选逻辑：给出"20 小时前的 <code>mimoagent-old</code>、1 小时前的 <code>mimoagent-new</code>、100 小时前的 <code>prod-api-7d9</code>、正在删除的 <code>mimoagent-terminating</code>"四个 pod，脚本只选中了 <code>mimoagent-old</code>；<code>NS=default</code> 时直接拒绝并退出。<b>还没有连真实集群运行过。</b></p>
+<p>手动清理时也遵循同样的原则：<b>永远带 <code>-n mimo-rl</code></b>，永远不要在共享命名空间里用 <code>--all</code>，按名字前缀或专属标签筛选，先 <code>get</code> 列出确认，再 <code>delete</code>。</p>
+
+<h3 id="xd-15">15. 上线前检查清单</h3>
+<table>
+  <tr><th>#</th><th>检查项</th><th>怎么确认</th></tr>
+  <tr><td>1</td><td>专用命名空间已创建，里面没有其他业务</td><td><code>kubectl get all -n mimo-rl</code></td></tr>
+  <tr><td>2</td><td>训练身份只在专用命名空间有权限</td><td>§14.2 的所有"期望 no"都是 no</td></tr>
+  <tr><td>3</td><td>kubeconfig 只有一个 context，权限 600，所有 Ray 节点可读</td><td><code>kubectl --kubeconfig=$KC config get-contexts</code>；在每个节点 <code>test -r</code></td></tr>
+  <tr><td>4</td><td>API server 地址从 Ray 节点可达</td><td>在任一 Ray 节点执行 §5.2 的 <code>auth can-i</code></td></tr>
+  <tr><td>5</td><td>General：<code>KUBECONFIG</code> 和 <code>K8S_NAMESPACE=mimo-rl</code> 已导出</td><td>启动日志；或在 <code>s3k.yaml</code> 写 <code>namespace</code></td></tr>
+  <tr><td>6</td><td>Code：<code>KUBECONFIG</code> 已导出且非空；四个 <code>mini-*.yaml</code> 写了 <code>namespace: mimo-rl</code>（必要时也写 <code>kubeconfig</code>）</td><td>启动前检查 <code>config/agent/code/</code> 原文件</td></tr>
+  <tr><td>7</td><td>Ray 节点上没有会被误用的 <code>~/.kube/config</code>（尤其是 Code 路径）</td><td>逐节点检查，或确认第 6 条已显式指定</td></tr>
+  <tr><td>8</td><td>私有镜像、节点污点写在 yaml 里，而不是 <code>K8S_*</code> 环境变量</td><td>插课 C §14.5、本页 §6.3</td></tr>
+  <tr><td>9</td><td>（共享命名空间时）准入策略已生效，Role 已去掉 list/deletecollection</td><td>§14.3 的验证</td></tr>
+  <tr><td>10</td><td>冒烟测试通过：建 pod、exec、删除</td><td>§5.3</td></tr>
+  <tr><td>11</td><td>约定好崩溃后的清理流程</td><td>§14.5，先列出再删除</td></tr>
+</table>
+
+<h3 id="xd-16">16. 补充思考题</h3>
+<details><summary>Q1：既然代码只按精确名字删除，为什么还说专用命名空间是"决定性的一层"？</summary>
+<p>"代码只删自己的 pod"是对当前代码的分析结论，它依赖代码不变、配置正确、没有人工操作。专用命名空间 + 命名空间级 Role 是 API server 强制执行的规则：不管代码以后怎么改、配置怎么写错、有人用这个 kubeconfig 手动敲了什么命令，删除其他命名空间的 pod 都会被拒绝。前者是"相信它不会做"，后者是"它做不到"。防误删要依赖后者。</p></details>
+<details><summary>Q2：为什么不在 pod 上加 <code>activeDeadlineSeconds</code> 让它自动过期，而要写清理脚本？</summary>
+<p>那需要改 mimoagent 的 <code>_build_pod_body</code>（或者真正把 <code>pod_timeout</code> 接上），属于改代码；而且到期后 pod 只是变成 Failed 状态，对象本身仍然留在 API server 里，还是需要删除。清理脚本不改代码、可以先预览，并且能把范围严格限定在专用命名空间和 <code>mimoagent-</code> 前缀上。如果之后决定改代码，两者可以并存：deadline 负责停掉进程、释放节点资源，脚本负责删除对象。</p></details>
+
+<h3 id="xd-17">17. 答疑：RBAC 是什么；只建一个低权限用户够不够</h3>
+<div class="box ask"><b>提问</b>：第一个问题是：集群的 RBAC 是什么？第二个问题是，我是不是给训练新建一个权限小的用户就可以了？</div>
+<div class="box key"><b>结论</b>
+<ol>
+  <li><b>RBAC 是 k8s 决定"某个身份能不能做某件事"的规则系统</b>，全称 Role-Based Access Control（基于角色的访问控制）。做法是：先定义一个"角色"，写清楚它能对哪些资源做哪些操作；再把这个角色"绑定"给某个身份，并且指定生效范围。</li>
+  <li><b>新建一个低权限身份是对的，而且是最核心的一步，但单靠它不够。</b>还要满足三个条件：权限只在<b>专用命名空间</b>里生效；这个身份<b>没有从别处继承</b>额外权限；训练（以及事后人工清理）<b>确实用的是</b>这个身份。缺任何一条，"权限小"都可能形同虚设。</li>
+</ol></div>
+
+<h4>17.1 RBAC 是什么</h4>
+<p>先看 k8s 处理一个 API 请求的顺序，RBAC 处在中间一步：</p>
+<pre><code>请求（比如"删除 mimo-rl 命名空间里的 pod mimoagent-3f9a"）
+  ① 认证：你是谁？        看请求带的令牌或证书 → 得出身份，如 system:serviceaccount:mimo-rl:mimo-rollout
+  ② 授权：你能做这件事吗？ ← RBAC 在这里检查
+  ③ 准入：这件事合规吗？  Pod 安全级别、ResourceQuota、§14.3 的准入策略在这里检查
+  ④ 执行</code></pre>
+<p>RBAC 回答的问题可以写成一句话：<b>"某个身份，能不能对某个命名空间里的某种资源，执行某个操作"</b>。它由四种对象表达，分成"定义权限"和"授予权限"两类：</p>
+<table>
+  <tr><th></th><th>只在一个命名空间内</th><th>整个集群</th></tr>
+  <tr><td><b>定义权限</b>（能做什么）</td><td><code>Role</code></td><td><code>ClusterRole</code></td></tr>
+  <tr><td><b>授予权限</b>（给谁）</td><td><code>RoleBinding</code></td><td><code>ClusterRoleBinding</code></td></tr>
+</table>
+<p>以 <code>mimo-rollout-rbac.yaml</code> 为例，逐个对应：</p>
+<pre><code>Role  mimo-rollout（在 mimo-rl 命名空间里）          ← "能做什么"
+  rules:
+  - resources: [pods]       verbs: [create, get, delete]   对 pod：创建、查看、删除
+  - resources: [pods/exec]  verbs: [create, get]           对 pod：执行命令
+
+RoleBinding  mimo-rollout（在 mimo-rl 命名空间里）    ← "给谁、在哪生效"
+  subjects: [ServiceAccount mimo-rl/mimo-rollout]          给这个账号
+  roleRef:  Role mimo-rollout                               授予上面那组权限
+  生效范围 = RoleBinding 所在的命名空间 = mimo-rl</code></pre>
+<p>理解 RBAC 有三个要点：</p>
+<ul>
+  <li><b>只有"允许"，没有"禁止"。</b>RBAC 的规则全部是允许规则，没写的就是不允许。所以不能写一条"禁止删除生产 pod"的规则；能做的只是"不授予"。一个身份的最终权限，是所有绑定到它的规则<b>加在一起</b>的结果。这也是 17.2 第二个条件的由来。</li>
+  <li><b>生效范围由"绑定"决定，不由"角色"决定。</b>同一个 ClusterRole，用 RoleBinding 绑定就只在那一个命名空间生效，用 ClusterRoleBinding 绑定就在全集群生效。防误删的关键就在于用 RoleBinding。</li>
+  <li><b>只能按资源类型授权，不能按标签或名字前缀授权。</b>可以授权"删除 pod"，但不能授权"只删除带某个标签的 pod"或"只删除以 mimoagent- 开头的 pod"。（<code>resourceNames</code> 只能写完整的名字，而训练的 pod 名是随机生成的。）这就是为什么必须靠命名空间来隔离，或者用 §14.3 的准入策略补充。</li>
+</ul>
+<h4>"用户"在 k8s 里是什么</h4>
+<p>k8s 里<b>没有"用户"这种可以创建的对象</b>。RBAC 里能绑定的身份有三种：</p>
+<table>
+  <tr><th>身份</th><th>是什么</th><th>怎么创建</th><th>适合谁</th></tr>
+  <tr><td><code>User</code></td><td>只是一个名字，来自认证结果（证书里的名字、OIDC 登录的用户名等）</td><td>不能用 kubectl 创建；要靠签发证书或接入公司的登录系统</td><td>人</td></tr>
+  <tr><td><code>Group</code></td><td>同样来自认证结果，比如证书里的组织字段</td><td>同上</td><td>一类人</td></tr>
+  <tr><td><code>ServiceAccount</code></td><td>k8s 里真实存在的对象，属于某个命名空间</td><td><code>kubectl create serviceaccount</code>；令牌由 k8s 签发</td><td><b>程序</b></td></tr>
+</table>
+<p>训练是程序在调用 API，所以"给训练新建一个用户"在 k8s 里的标准做法就是建一个 ServiceAccount，再给它签发令牌、做成 kubeconfig——也就是 §4、§5 已经做的事。</p>
+
+<h4>17.2 只建一个低权限用户够不够</h4>
+<p>方向完全正确，这是整个防误删方案的核心（§14 第 1 层）。但"权限小"要真正起作用，必须同时满足下面三个条件：</p>
+
+<h4>条件一：权限只在专用命名空间里，而且那里没有别的业务</h4>
+<p>"权限小"有两个维度：能做的<b>操作</b>少，和生效的<b>范围</b>小。训练必须有"删除 pod"和"在 pod 里执行命令"这两个权限，这两个操作本身无法再缩小。所以只能靠缩小范围：</p>
+<table>
+  <tr><th>做法</th><th>能不能删到生产 pod</th></tr>
+  <tr><td>低权限账号 + <b>ClusterRoleBinding</b>（全集群生效）</td><td>能。它可以删除任何命名空间里的任何 pod</td></tr>
+  <tr><td>低权限账号 + RoleBinding，但放在<b>和生产共用</b>的命名空间</td><td><b>能</b>。RBAC 不能按名字或标签区分，这个命名空间里的生产 pod 一样可以删，也一样可以进去执行命令</td></tr>
+  <tr><td>低权限账号 + RoleBinding + <b>专用命名空间</b></td><td>不能。其他命名空间的请求在第 ② 步就被拒绝</td></tr>
+</table>
+<p>所以准确的说法是：<b>低权限账号 + 专用命名空间</b>，两者缺一不可。如果实在拿不到专用命名空间，就需要 §14.3 的准入策略来补上"只能删 mimoagent-* "这条 RBAC 表达不了的规则。</p>
+
+<h4>条件二：这个账号没有从别处继承额外权限</h4>
+<p>因为 RBAC 的权限是叠加的，集群里如果已经有宽泛的绑定，新账号会自动获得那些权限。常见的情况是：</p>
+<ul>
+  <li>某个 ClusterRoleBinding 绑定的对象是组 <code>system:serviceaccounts</code>（所有服务账号）或者 <code>system:serviceaccounts:mimo-rl</code>（这个命名空间里的所有服务账号）；</li>
+  <li>某个绑定给了 <code>system:authenticated</code>（所有通过认证的身份）。</li>
+</ul>
+<p>只要存在这样的绑定，你新建的账号就天然带上了那些权限，自己写的 Role 再小也没用。检查方法：</p>
+<pre><code># 看这个账号最终的有效权限（这是所有绑定叠加后的结果）
+kubectl --kubeconfig=$KC auth can-i --list -n mimo-rl
+kubectl --kubeconfig=$KC auth can-i --list -n &lt;prod-ns&gt;          # 期望只有很少几条通用的只读权限
+
+# 用管理员身份找出绑定给"所有服务账号"或"所有已认证身份"的规则
+kubectl get clusterrolebindings,rolebindings -A -o wide | grep -E 'system:(serviceaccounts|authenticated)'</code></pre>
+<p>§14.2 列出的那组"期望 no"的检查，就是在验证这一条。</p>
+
+<h4>条件三：训练和人工清理确实用的是这个身份</h4>
+<p>建好了低权限账号，但程序实际用的是别的凭据，等于没建。这个仓库里有几处很容易"悄悄用错身份"：</p>
+<ul>
+  <li><b>Code 路径允许 <code>KUBECONFIG</code> 为空</b>，这时会回退到 Ray 节点上的 <code>~/.kube/config</code>，或者 Ray 所在 pod 的服务账号（§12）。必须显式设置。</li>
+  <li><b>kubeconfig 里有多个 context</b>，用哪个取决于 <code>current-context</code>（§12）。必须是单 context 文件。</li>
+  <li><b>Code 路径的 namespace 默认是 <code>default</code></b>（§6.2、§11）。配对了身份但没配 namespace，结果是全部创建失败（这是好的失败方式，至少不会建错地方）。</li>
+  <li><b>人工清理时用了管理员 kubeconfig。</b>训练崩溃后，运维习惯性地用自己的管理员凭据去删残留 pod，这时 RBAC 的保护对他不起作用。建议清理也用这份训练 kubeconfig（§14.5 的脚本支持 <code>KC=</code> 参数），这样即使命令写错，也只会影响 <code>mimo-rl</code>。</li>
+</ul>
+
+<h4>小结</h4>
+<pre><code>"给训练新建一个权限小的用户"
+  = 建一个 ServiceAccount                               ← §4.2
+  + 只用 RoleBinding 授予 pod 的增删查和 exec 权限          ← §4.3（条件一：范围）
+  + 放在一个专用、没有其他业务的命名空间                     ← §4.1（条件一：范围）
+  + 确认没有宽泛的绑定让它继承额外权限                       ← §14.2、本节（条件二）
+  + 训练和人工清理都只用这一份单 context 的 kubeconfig        ← §5、§6、§12（条件三）</code></pre>
+<p>前三项写在 <code>mimo-rollout-rbac.yaml</code> 里，apply 一次就完成；后两项需要在你的集群和 Ray 节点上逐项确认。</p>
+
+<div class="topbar" style="border-top:1px solid var(--line);border-bottom:none;margin-top:40px"><a href="index.html">总览</a><span class="sp"></span><a href="xc-k8s-api.html">相关：插课 C（仓库如何调用 k8s API）</a></div>
+</main>
+</body>
+</html>
