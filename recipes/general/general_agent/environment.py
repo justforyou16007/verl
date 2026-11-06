@@ -112,6 +112,7 @@ class GeneralAgentEnvironment(DatasetEnvironment):
     BRIDGE_LAUNCHER = "/work/_setup/mcp-bridge-launch"
     MCP_BRIDGE_SCRIPT = "/work/_setup/mcp_bridge.py"
     VENV_PYTHON = "/opt/openai-agents-venv/bin/python"
+    FALLBACK_PYTHON = "/usr/local/bin/python3"
 
     AGENT_SESSIONS_POD_DIR = "/tmp/mimo-claude-logs/sessions"
 
@@ -123,6 +124,10 @@ class GeneralAgentEnvironment(DatasetEnvironment):
         "GA_JUDGE_URL",
         "GA_JUDGE_MODEL",
         "GA_JUDGE_EFFORT",
+        # Selects the judge's wire protocol ("chat" vs "responses"). Without it the in-pod
+        # verifier falls back to "responses", which the judge stub does not serve: every
+        # grade comes back as judge_crashed and the whole batch is rewarded -999.
+        "GA_JUDGE_API",
         "GRADE_VOTES",
         "JUDGE_API_KEY",
         "JUDGE_BASE_URL",
@@ -166,7 +171,6 @@ class GeneralAgentEnvironment(DatasetEnvironment):
             for p in Path(tools_dir).iterdir()
             if p.is_file() and p.suffix == ".py" and not p.name.startswith("_") and p.name != "tools_test.py"
         )
-
 
     MANIFEST_FILE = "manifest.json"
 
@@ -336,6 +340,25 @@ class GeneralAgentEnvironment(DatasetEnvironment):
             timeout=30,
         )
 
+    def _resolve_bridge_python(self) -> str:
+        """Interpreter that runs ``mcp_bridge.py`` inside the pod's ``main`` container.
+
+        Some env images bake in the agents venv and some do not (the current
+        ``general-agent-env-0:oss`` has no ``/opt/openai-agents-venv``). This code runs on the
+        trainer side, where that path belongs to the pod and cannot be stat'ed locally, so the
+        probe has to happen in the container. Falling back to the container's system
+        interpreter keeps MCP tool discovery working instead of failing every bridge launch.
+        """
+        probe = self.env.execute(f"test -x {shlex.quote(self.VENV_PYTHON)}")
+        if probe.get("returncode") == 0:
+            return self.VENV_PYTHON
+        self.logger.info(
+            "%s: %s absent in pod; MCP bridge falls back to %s",
+            self.instance_id,
+            self.VENV_PYTHON,
+            self.FALLBACK_PYTHON,
+        )
+        return self.FALLBACK_PYTHON
 
     def _setup_dataset_specific(self) -> None:
         env = self.env
@@ -352,7 +375,7 @@ class GeneralAgentEnvironment(DatasetEnvironment):
 
         env.mcp_servers = self.mcp_servers
         if self.mcp_servers:
-            env.mcp_bridge_python = self.VENV_PYTHON
+            env.mcp_bridge_python = self._resolve_bridge_python()
             env.mcp_bridge_script = self.MCP_BRIDGE_SCRIPT
             self._setup_privilege_isolation()
 
@@ -443,7 +466,6 @@ chown -R {agent_uid}:{agent_uid} {self.WORK_DIR}/workspace 2>/dev/null || true
             f"{self.instance_id}: privilege isolation ready "
             f"(agent uid={agent_uid}, bridge user={bridge_user}, url hidden from agent)"
         )
-
 
     def _capture_model_diff(self) -> tuple[str, str]:
         return "", ""
@@ -664,7 +686,6 @@ chown -R {agent_uid}:{agent_uid} {self.WORK_DIR}/workspace 2>/dev/null || true
                     os.replace(extracted, target)
             except Exception as e:
                 self.logger.warning(f"{self.instance_id}: post-state pull of {name} failed ({e!r})")
-
 
     def _verify_env_prefix(
         self,
