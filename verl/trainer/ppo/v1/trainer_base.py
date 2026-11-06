@@ -782,14 +782,13 @@ class PPOTrainer(ABC):
             SkipManager.set_step(self.global_steps)
             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
             if is_last_step:
-                self._shutdown_dump_executor()
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
-                return
+                break
 
         self.on_train_end()
-        # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
+        self._shutdown_train_dataloader()
 
     def step(self, metrics: dict, timing_raw: dict, *, prefetch_next_batch: bool = True) -> KVBatchMeta:
         train_batch_size = self.config.data.train_batch_size
@@ -1558,6 +1557,17 @@ class PPOTrainer(ABC):
         self._dump_futures.clear()
         self._dump_executor.shutdown(wait=True)
 
+    def _shutdown_train_dataloader(self):
+        """Stop the train dataloader's worker processes.
+
+        StatefulDataLoader keeps its last iterator, so the workers would outlive fit(). At process exit Ray kills them
+        with the actor, and the trainer then reports "DataLoader worker (pid ...) is killed by signal: Killed".
+        """
+        iterator, self.train_dataloader_it = self.train_dataloader_it, None
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+        if shutdown_workers is not None:
+            shutdown_workers()
+
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
@@ -2080,7 +2090,9 @@ class PPOTrainer(ABC):
         repetition_enabled = bool(repetition_config.get("enable", False))
         repetition_strategy = str(repetition_config.get("strategy", "monitor"))
         repetition_value = float(repetition_config.get("penalty_value", 0.0) or 0.0)
-        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob"]
+        if self.use_critic:
+            fields.append("values")
         if tool_penalty_enabled:
             fields.append("tool_call_error_mask")
         if repetition_enabled:
@@ -2463,7 +2475,6 @@ class PPOTrainer(ABC):
             "prompts",
             "responses",
             "response_mask",
-            "values",
             "advantages",
             "returns",
             "rm_scores",
@@ -2477,6 +2488,8 @@ class PPOTrainer(ABC):
             or self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         ):
             fields.append("entropy")
+        if self.use_critic:
+            fields.append("values")
         moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
         data = get_metric_data_with_optional_routed_experts(
             keys=batch.keys,
