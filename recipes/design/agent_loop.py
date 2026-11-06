@@ -63,6 +63,7 @@ from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.tokenizer.chat_template import initialize_turn_separator
 from verl.workers.rollout.replica import TokenOutput
 
 from .chat_delta import anchor_ids, render_ids, render_injected_turn, render_injected_turn_mm
@@ -237,7 +238,6 @@ class _VerlRolloutModel:
         self.n_prompt_tokens = 0
         self.n_generated_tokens = 0
 
-
     def query(self, messages: list[dict[str, Any]], **kwargs) -> dict[str, Any]:
         """Blocking call from the agent thread; ``kwargs`` (tools/tool_choice) is ignored.
 
@@ -313,7 +313,6 @@ class _VerlRolloutModel:
                 except OSError:
                     pass  # dump filesystem hiccups must never fail the rollout
         return markers
-
 
     async def _agenerate(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         if self.stopped:
@@ -659,6 +658,7 @@ class WebdevAgentLoop(AgentLoopBase):
 
         self._processing_class = self.tokenizer
         self._anchor_ids = anchor_ids(self._processing_class, **self.apply_chat_template_kwargs)
+        self.turn_separator = initialize_turn_separator(self._processing_class, **self.apply_chat_template_kwargs)
 
         self.dump_root = os.environ.get("WEBDEV_DEBUG_DIR")
 
@@ -794,7 +794,6 @@ class WebdevAgentLoop(AgentLoopBase):
         from verl.experimental.agent_loop.utils import resolve_config_path
 
         return resolve_config_path(path)
-
 
     @staticmethod
     def _reward_extra_info(
@@ -953,7 +952,6 @@ class WebdevAgentLoop(AgentLoopBase):
             "on every dataset row, carrying at least instance_id, problem_statement, cwd and "
             "docker_image"
         )
-
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:

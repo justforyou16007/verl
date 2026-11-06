@@ -56,6 +56,7 @@ from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.tokenizer.chat_template import initialize_turn_separator
 from verl.workers.rollout.replica import TokenOutput
 
 from .chat_delta import anchor_ids, render_ids, render_injected_turn
@@ -480,6 +481,7 @@ class ArvoAgentLoop(AgentLoopBase):
 
         self._processing_class = self.tokenizer
         self._anchor_ids = anchor_ids(self._processing_class, **self.apply_chat_template_kwargs)
+        self.turn_separator = initialize_turn_separator(self._processing_class, **self.apply_chat_template_kwargs)
 
         self.dump_root = os.environ.get("AGENT_DEBUG_DIR")
 
