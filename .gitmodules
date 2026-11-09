@@ -7,33 +7,3 @@
 [submodule "third_party/mimoagent-osr"]
 	path = third_party/mimoagent-osr
 	url = https://github.com/justforyou16007/mimoagent.git
-[submodule "third_party/vllm"]
-	path = third_party/vllm
-	url = https://github.com/vllm-project/vllm.git
-[submodule "third_party/sglang"]
-	path = third_party/sglang
-	url = https://github.com/sgl-project/sglang.git
-[submodule "third_party/Megatron-LM"]
-	path = third_party/Megatron-LM
-	url = https://github.com/NVIDIA/Megatron-LM.git
-[submodule "third_party/vllm-ascend"]
-	path = third_party/vllm-ascend
-	url = https://github.com/vllm-project/vllm-ascend.git
-[submodule "third_party/MindSpeed"]
-	path = third_party/MindSpeed
-	url = https://gitcode.com/Ascend/MindSpeed.git
-[submodule "third_party/MegatronAdaptor"]
-	path = third_party/MegatronAdaptor
-	url = https://gitcode.com/ascend/MegatronAdaptor.git
-[submodule "third_party/MindSpeed-Bridge"]
-	path = third_party/MindSpeed-Bridge
-	url = https://gitcode.com/ascend/MindSpeed-Bridge.git
-[submodule "third_party/MindSpeed-Ops"]
-	path = third_party/MindSpeed-Ops
-	url = https://gitcode.com/ascend/MindSpeed-Ops.git
-[submodule "third_party/TransformerEngineNPU"]
-	path = third_party/TransformerEngineNPU
-	url = https://gitcode.com/ascend/TransformerEngineNPU.git
-[submodule "third_party/Megatron-Bridge"]
-	path = third_party/Megatron-Bridge
-	url = https://github.com/NVIDIA-NeMo/Megatron-Bridge.git

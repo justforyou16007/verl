@@ -134,3 +134,18 @@ outputs
 # trainer.logger=[...,"tensorboard"] grows this at the repo root.
 tensorboard_log
 .history
+
+# NPU build dependencies: standalone clones of vllm / sglang / Megatron / Ascend
+# repos, pinned by the launch scripts rather than by this repo. They are not
+# submodules -- tracking them here put a gitlink to another project's commit in
+# every clone, and nothing in verl reads them through git.
+third_party/vllm
+third_party/sglang
+third_party/Megatron-LM
+third_party/Megatron-Bridge
+third_party/vllm-ascend
+third_party/MindSpeed
+third_party/MindSpeed-Bridge
+third_party/MindSpeed-Ops
+third_party/MegatronAdaptor
+third_party/TransformerEngineNPU
