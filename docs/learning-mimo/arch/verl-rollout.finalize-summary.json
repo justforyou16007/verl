@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rollout.candidate.json",
+    "sha256": "8e3a16d1a99d605a659e573cb715f7cf1d89fd61f32272b4ffb1097e00bee361",
+    "bytes": 8827
+  },
+  "artifact": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-rollout.html",
+    "sha256": "9c6088eb8046b839daba97ee49171aeb07d20597f834db65afbda8a89af388c2",
+    "bytes": 857607
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-rollout.finalize.json",
+    "summaryReceipt": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-rollout.finalize-summary.json",
+    "browserCheckReceipt": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-rollout.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-30T16:19:25.419Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 2024,
+  "browserCheck": {
+    "requested": true,
+    "ran": true
+  },
+  "visualReviewRecommendation": {
+    "action": "inspect-route-readability",
+    "signals": {
+      "routesOverSuggestedBends": 2
+    },
+    "reason": "Automated gates passed, but crossings or detours still need perceptual review before claiming visual quality.",
+    "affectedRoutes": {
+      "crossings": [],
+      "detours": [
+        {
+          "relationship": {
+            "id": "c2",
+            "from": "client",
+            "to": "balancer",
+            "label": "acquire_server",
+            "collectionIndex": 1,
+            "artifactIndex": 2
+          },
+          "bends": 3,
+          "stretch": 1.294
+        },
+        {
+          "relationship": {
+            "id": "c5",
+            "from": "vsrv",
+            "to": "vexec",
+            "label": "fork TP 进程",
+            "collectionIndex": 4,
+            "artifactIndex": 5
+          },
+          "bends": 3,
+          "stretch": 1.26
+        }
+      ],
+      "truncated": false
+    },
+    "hints": [
+      "client → balancer needs 3 bends: move node client or balancer so they share a row or column with matching centers, or sit diagonally with a clear corner.",
+      "vsrv → vexec needs 3 bends: move node vsrv or vexec so they share a row or column with matching centers, or sit diagonally with a clear corner."
+    ],
+    "repair": "Trace these relationships at the desktop viewport. For Architecture, use references/architecture-layout-repair.md: reflow a blocked main path or tangled connected scene, and repair an isolated defect locally only when the surrounding composition is accepted. Preserve all semantic content and user-fixed geometry. Rerun finalize once after the edit."
+  }
+}

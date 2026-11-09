@@ -1,0 +1,690 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "模型初始化与设备放置：Megatron 侧与推理引擎侧",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-model-init.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "lanes": [
+    {
+      "id": "spine",
+      "label": "主干：六个阶段"
+    },
+    {
+      "id": "mega",
+      "label": "Megatron 训练侧"
+    },
+    {
+      "id": "infer",
+      "label": "vLLM / SGLang 推理侧"
+    },
+    {
+      "id": "qwen",
+      "label": "实例：Qwen3.8-27B"
+    }
+  ],
+  "phases": [
+    {
+      "id": "topo",
+      "label": "定拓扑",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "build",
+      "label": "建层与读权重",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "ready",
+      "label": "包装与定量",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "s0",
+    "s1",
+    "s2",
+    "s3",
+    "s4",
+    "s5"
+  ],
+  "nodes": [
+    {
+      "id": "s0",
+      "lane": "spine",
+      "col": 0,
+      "type": "cloud",
+      "icon": "start",
+      "label": "① 定并行组",
+      "sublabel": "先建通信组",
+      "sources": [
+        {
+          "path": "verl/workers/engine/megatron/transformer_impl.py",
+          "line": 235,
+          "end_line": 277,
+          "label": "_init_device_mesh"
+        }
+      ]
+    },
+    {
+      "id": "s1",
+      "lane": "spine",
+      "col": 1,
+      "type": "backend",
+      "label": "② 分层",
+      "sublabel": "本 rank 的层区间"
+    },
+    {
+      "id": "s2",
+      "lane": "spine",
+      "col": 2,
+      "type": "backend",
+      "label": "③ 建空层",
+      "sublabel": "先不填权重",
+      "sources": [
+        {
+          "path": "verl/workers/engine/megatron/transformer_impl.py",
+          "line": 530,
+          "end_line": 611,
+          "label": "initialize()"
+        }
+      ]
+    },
+    {
+      "id": "s3",
+      "lane": "spine",
+      "col": 3,
+      "type": "database",
+      "label": "④ 读权重",
+      "sublabel": "切出本 rank 的片",
+      "sources": [
+        {
+          "path": "verl/workers/engine/megatron/transformer_impl.py",
+          "line": 458,
+          "end_line": 462,
+          "label": "load_hf_weights"
+        }
+      ]
+    },
+    {
+      "id": "s4",
+      "lane": "spine",
+      "col": 4,
+      "type": "security",
+      "label": "⑤ 包装定量",
+      "sublabel": "优化器 / KV 容量",
+      "sources": [
+        {
+          "path": "verl/workers/engine/megatron/transformer_impl.py",
+          "line": 563,
+          "end_line": 564,
+          "label": "_build_optimizer"
+        }
+      ]
+    },
+    {
+      "id": "s5",
+      "lane": "spine",
+      "col": 5,
+      "type": "backend",
+      "icon": "success",
+      "label": "⑥ 就位",
+      "sublabel": "可训练 / 可服务",
+      "sources": [
+        {
+          "path": "verl/workers/engine/megatron/transformer_impl.py",
+          "line": 604,
+          "end_line": 609,
+          "label": "按配置卸载"
+        }
+      ]
+    },
+    {
+      "id": "m0",
+      "lane": "mega",
+      "col": 0,
+      "type": "cloud",
+      "label": "① 建 mcore 并行组",
+      "sublabel": "六个并行度一次传",
+      "tag": "order 默认",
+      "sources": [
+        {
+          "path": "verl/workers/engine/megatron/transformer_impl.py",
+          "line": 267,
+          "end_line": 277,
+          "label": "唯一一次调用"
+        }
+      ]
+    },
+    {
+      "id": "m1",
+      "lane": "mega",
+      "col": 1,
+      "type": "backend",
+      "label": "② 本 PP rank 的层段",
+      "sublabel": "层数 + 层号偏移"
+    },
+    {
+      "id": "m2",
+      "lane": "mega",
+      "col": 2,
+      "type": "backend",
+      "label": "③ AutoBridge → provider",
+      "sublabel": "读 config.json 建层"
+    },
+    {
+      "id": "m3",
+      "lane": "mega",
+      "col": 3,
+      "type": "database",
+      "label": "④ 每 rank 读再 scatter",
+      "sublabel": "非 0 号 rank 白读"
+    },
+    {
+      "id": "m4",
+      "lane": "mega",
+      "col": 4,
+      "type": "security",
+      "label": "⑤ DDP + 分布式优化器",
+      "sublabel": "倒序分桶、FP32 主片"
+    },
+    {
+      "id": "i0",
+      "lane": "infer",
+      "col": 0,
+      "type": "cloud",
+      "label": "① set_device → TP 组",
+      "sublabel": "先 NCCL 后基线",
+      "tag": "顺序刻意"
+    },
+    {
+      "id": "i1",
+      "lane": "infer",
+      "col": 1,
+      "type": "backend",
+      "label": "② 按 layer_types 分组",
+      "sublabel": "不同 KV 规格"
+    },
+    {
+      "id": "i2",
+      "lane": "infer",
+      "col": 2,
+      "type": "backend",
+      "label": "③ load_model",
+      "sublabel": "落在 weights 标签"
+    },
+    {
+      "id": "i3",
+      "lane": "infer",
+      "col": 3,
+      "type": "database",
+      "label": "④ weight_loader 本地切",
+      "sublabel": "没有 scatter"
+    },
+    {
+      "id": "i4",
+      "lane": "infer",
+      "col": 4,
+      "type": "security",
+      "label": "⑤ profile_run 定块数",
+      "sublabel": "跑空 batch 量峰值"
+    },
+    {
+      "id": "i5",
+      "lane": "infer",
+      "col": 5,
+      "type": "cloud",
+      "label": "⑥ 分配 KV cache",
+      "sublabel": "一块扁平缓冲"
+    },
+    {
+      "id": "q0",
+      "lane": "qwen",
+      "col": 0,
+      "type": "external",
+      "label": "① TP 取 24 的因子",
+      "sublabel": "4 个 KV 头另有约束"
+    },
+    {
+      "id": "q1",
+      "lane": "qwen",
+      "col": 2,
+      "type": "external",
+      "label": "③ 64 层两种类型",
+      "sublabel": "16 full + 48 linear",
+      "tag": "另加 1 层 MTP"
+    },
+    {
+      "id": "q2",
+      "lane": "qwen",
+      "col": 3,
+      "type": "external",
+      "label": "④ 融合 qkv 的形状",
+      "sublabel": "TP=8 每 rank 取 1/8"
+    },
+    {
+      "id": "q3",
+      "lane": "qwen",
+      "col": 4,
+      "type": "external",
+      "label": "⑤ 两种 KV 规格",
+      "sublabel": "块取 LCM，哈希取 GCD"
+    },
+    {
+      "id": "q4",
+      "lane": "qwen",
+      "col": 5,
+      "type": "external",
+      "label": "⑥ MTP 归 drafter",
+      "sublabel": "主模型按层号丢掉",
+      "tag": "会吃 KV 块"
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-s0s1",
+      "from": "s0",
+      "to": "s1",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-s1s2",
+      "from": "s1",
+      "to": "s2",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-s2s3",
+      "from": "s2",
+      "to": "s3",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-s3s4",
+      "from": "s3",
+      "to": "s4",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-s4s5",
+      "from": "s4",
+      "to": "s5",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-s0m0",
+      "from": "s0",
+      "to": "m0",
+      "label": "训练侧",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e-m0m1",
+      "from": "m0",
+      "to": "m1"
+    },
+    {
+      "id": "e-m1m2",
+      "from": "m1",
+      "to": "m2"
+    },
+    {
+      "id": "e-m2m3",
+      "from": "m2",
+      "to": "m3"
+    },
+    {
+      "id": "e-m3m4",
+      "from": "m3",
+      "to": "m4"
+    },
+    {
+      "id": "e-m4s5",
+      "from": "m4",
+      "to": "s5",
+      "label": "可训练",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "e-m0i0",
+      "from": "m0",
+      "to": "i0",
+      "label": "推理侧对照",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-i0i1",
+      "from": "i0",
+      "to": "i1"
+    },
+    {
+      "id": "e-i1i2",
+      "from": "i1",
+      "to": "i2"
+    },
+    {
+      "id": "e-i2i3",
+      "from": "i2",
+      "to": "i3"
+    },
+    {
+      "id": "e-i3i4",
+      "from": "i3",
+      "to": "i4"
+    },
+    {
+      "id": "e-i4i5",
+      "from": "i4",
+      "to": "i5"
+    },
+    {
+      "id": "e-i0q0",
+      "from": "i0",
+      "to": "q0",
+      "label": "代入实例",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-q0q1",
+      "from": "q0",
+      "to": "q1"
+    },
+    {
+      "id": "e-q1q2",
+      "from": "q1",
+      "to": "q2"
+    },
+    {
+      "id": "e-q2q3",
+      "from": "q2",
+      "to": "q3"
+    },
+    {
+      "id": "e-q3q4",
+      "from": "q3",
+      "to": "q4"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "slate",
+      "title": "实例的配置来源（用户提供的 config.json）",
+      "items": [
+        "architectures = [\"Qwen3_5ForConditionalGeneration\"]、model_type = \"qwen3_5\"——<b>发布名叫 Qwen3.8-27B，HF 架构标识却是 qwen3_5</b>。",
+        "text_config：hidden_size 5120、intermediate_size 17408、num_hidden_layers 64、num_attention_heads 24、num_key_value_heads 4、head_dim 256、vocab_size 248320。",
+        "没有 num_experts / moe_* 字段，<b>这是个 dense 模型</b>，不走专家并行。",
+        "layer_types 是 64 项的列表，[linear, linear, linear, full] 重复 16 次，full_attention_interval = 4。",
+        "另有 mtp_num_hidden_layers = 1、attn_output_gate = true、tie_word_embeddings = false，以及一个 depth 27 的视觉塔（out_hidden_size 5120）。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "一个会把算术带偏的细节",
+      "items": [
+        "head_dim 是<b>显式给出的 256</b>，不是 hidden / heads。",
+        "24 × 256 = 6144 ≠ hidden 5120，所以 q 投影不是方阵。",
+        "o_proj 的形状是 [5120, 6144]：从 6144 维投回 5120。",
+        "partial_rotary_factor = 0.25，只有 1/4 的头维度参与旋转位置编码。",
+        "mcore 侧这个值进的字段叫 kv_channels，而不是 head_dim。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "① 为什么两边都先建通信组",
+      "items": [
+        "通信库初始化本身要吃显存（NCCL / HCCL 的缓冲）。",
+        "vLLM 的注释写得最直白：先 init 分布式环境，<b>这样测可用显存时 NCCL 缓冲已经在里面了</b>。",
+        "顺序：set_device → init_distributed_environment → ensure_model_parallel_initialized → 拍 MemorySnapshot → 之后才 load_model。",
+        "基线是在「有 NCCL、没权重」这个时刻拍的，后面所有减法都基于它。",
+        "源码：gpu_worker.py:501-535，理由注释在 :505-508"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "① Megatron 侧这一步传了什么",
+      "items": [
+        "verl 只调一次 mpu.initialize_model_parallel，六个并行度一次传入：TP / PP / VPP / CP / EP / ETP。",
+        "除了硬编码的 use_sharp=False 和 nccl_communicator_config_path=None，其余全来自 McoreEngineConfig。",
+        "<b>没传的用 mcore 默认</b>：order=\"tp-cp-ep-dp-pp\"、超时 30 分钟、建 gloo 组、优化器实例数 1。",
+        "expert_tensor_parallel_size 默认 None，由 mcore 解析成等于 TP。",
+        "已初始化就直接早退（mpu.is_initialized），所以 actor 和 ref 共卡时只建一次。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "① 两侧的组布局顺序不一样",
+      "items": [
+        "Megatron：order 字符串 \"tp-cp-ep-dp-pp\"，<b>最前面的维 stride 为 1、变化最快</b>。",
+        "vLLM：布局是 ExternalDP × DP × PP × PCP × TP，用 arange(world_size).view(-1, tp).unbind(0) 切出 TP 组。",
+        "所以 vLLM 里 <b>TP 在最内层</b>，连续 rank 构成一个 TP 组。",
+        "vLLM 源码里专门点名了 verl：ExternalDP 是「不属于模型的那层数据并行，每个 dp rank 可独立生成」。",
+        "源码：parallel_state.py:2126-2158（vLLM）、:547-568（mcore 默认）"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② 本 PP rank 建哪些层",
+      "items": [
+        "两个 mcore 函数定这件事：get_num_layers_to_build（建几层）和 get_transformer_layer_offset（全局层号从哪开始）。",
+        "两者签名都是 (config, vp_stage=None, pp_rank=None)，pp_rank 默认取当前 rank。",
+        "VPP 开启时一个 rank 持有多个「模型块」，每块各有自己的偏移。",
+        "所以一个 rank 知道自己拥有的是全局层号 [a, b) 这一段，而不是从 0 开始重编号。",
+        "源码：transformer_block.py:69-190、transformer_layer.py:46-200"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② 代入实例：64 层怎么分",
+      "items": [
+        "PP=4 → 每 rank 16 层。因为 layer_types 的周期正好是 4，<b>每个 PP rank 恰好拿到 4 个 full + 12 个 linear</b>。",
+        "PP=8 → 每 rank 8 层 = 2 full + 6 linear，仍然均衡。",
+        "但 PP=5 这类不整除 64 的配置会打破这个平衡，某些 rank 的 full 层数会不同。",
+        "full 层贵在 KV cache，linear 层贵在常驻的循环状态——层类型不均衡会直接变成显存不均衡。",
+        "这是 hybrid 模型选 PP 度数时比 dense 模型多出来的一条约束。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② 推理侧没有 PP 切层这一步",
+      "items": [
+        "verl 的推理副本几何是 tp × dp × pp，但实践中 pp 多为 1。",
+        "推理侧这一阶段做的是另一件事：<b>按 layer_types 把层分成不同的 KV 规格组</b>。",
+        "full_attention 层得到 FullAttentionSpec（按 token 增长的分页 KV）。",
+        "linear_attention 层走 Mamba 一类的规格（常驻状态，不随 token 数增长）。",
+        "分组结果决定后面用 Unitary 还是 Hybrid 的 KV 协调器。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "③ Megatron 建层：config.json 怎么变成 TransformerConfig",
+      "items": [
+        "AutoBridge.from_hf_pretrained <b>只读 config.json</b>，不碰权重；返回的是通用 AutoBridge 而不是模型专属类。",
+        "字段映射表（CONFIG_MAPPING）：num_hidden_layers→num_layers、intermediate_size→ffn_hidden_size、<b>num_key_value_heads→num_query_groups</b>、<b>head_dim→kv_channels</b>、tie_word_embeddings→share_embeddings_and_output_weights。",
+        "to_megatron_provider(load_weights=False) 会<b>跳过</b>预挂权重加载钩子——这才让 verl 能在 .cuda() 之后再读权重。",
+        "provider 实例化后，verl 强制覆写若干项：variable_seq_lengths=True、attention_backend=flash、moe_token_dispatcher_type=\"alltoall\"、batch_p2p_comm=False。",
+        "用户的 override_transformer_config <b>最后</b>应用，所以它赢过上面所有强制项。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "③ 一个容易踩的坑：bridge 看不到内存里的改动",
+      "items": [
+        "bridge 是从 local_path <b>重新读</b> config.json 的，不会看到 verl 在内存里对 hf_config 的修改。",
+        "verl 自己的注释点明了这件事，并用强制 override_transformer_config[\"mtp_num_layers\"] = None 来补偿。",
+        "也就是说：config.json 里写着 mtp_num_hidden_layers = 1，但训练侧默认不建那一层。",
+        "MTP 的启用走的是另一条路：initialize() 里的 patch_engine_mtp。",
+        "源码：verl/utils/megatron_utils.py:1186-1189；MTP 补丁 transformer_impl.py:544-553"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "③ verl/models/mcore/bridge.py 其实没做事",
+      "items": [
+        "109 行的兼容垫片，把 AutoBridge 从 megatron.bridge 再导出一遍。",
+        "它试图从 megatron.bridge.training.utils.train_utils 导入三个符号；v0.5.0 下<b>导入成功</b>。",
+        "所以文件里那一大段 except ImportError 的回退实现是<b>死代码</b>。",
+        "它注册的 LinearForLastLayer→\"replicated\" 也是空操作：上游已经硬编码在 replicated 集合里了。",
+        "存在的理由纯粹是兼容更老的 Megatron-Bridge 版本。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "④ 两侧读权重的方式根本不同",
+      "items": [
+        "<b>Megatron（verl 这条路）</b>：每个 TP rank 都把<b>整张</b> HF 张量读进 CPU 内存，但只有 tp_rank 0 用得上。",
+        "切片由 tp0 做好，再用 torch.distributed.scatter 发给各 rank；非 0 号 rank 的那次读是<b>白读</b>。",
+        "<b>vLLM / SGLang</b>：每个 rank 自己读、自己按 weight_loader 切，<b>没有 scatter</b>。",
+        "所以同样的 TP 度数下，训练侧的加载 I/O 大致是推理侧的 TP 倍。",
+        "源码：scatter 在 param_mapping.py:573-611；vLLM 的切分在 linear.py:1198-1304"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "④ Megatron 侧的读是随机访问的流式读",
+      "items": [
+        "全程<b>没有</b> state_dict() 调用。hf_state_dict 是个懒加载的 StateDict，背后是 safetensors 源。",
+        "每个转换任务只取 1 个（或 QKV / 门控那种 2–3 个）张量，按 index.json 找到所在分片后 safe_open + get_tensor。",
+        "所以它不是顺序扫分片，而是<b>按需随机读</b>；文件句柄不缓存，靠 OS 页缓存兜。",
+        "PP 过滤发生在<b>读之前</b>：本 rank 不拥有的层，其 megatron_module 是 None，直接 continue，磁盘都不碰。",
+        "但那些占位任务仍然保留在列表里，为的是让各 rank 的集合通信顺序完全一致（注释说改了会挂）。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "④ 代入实例：TP=8 时每个 rank 拿到什么",
+      "items": [
+        "融合 qkv 的完整形状 <b>[14336, 5120]</b>：48×256 的 q 段（24 头 ×2，因为 attn_output_gate 把 q 份额翻倍）+ 4×256 的 k + 4×256 的 v。",
+        "TP=8 每 rank：q 段 2×3×256=1536、k 256、v 256 → 本地 <b>[2048, 5120]</b>。",
+        "o_proj 切的是<b>输入维</b>：完整 [5120, 6144] → 本地 [5120, 768]。",
+        "MLP：gate_up 融合完整 [34816, 5120] → 本地 [4352, 5120]；down 完整 [5120, 17408] → 本地 [5120, 2176]。",
+        "词表并行：embedding 与 lm_head 各 [248320, 5120] → 本地 [31040, 5120]（tie_word_embeddings=false，两者是独立权重）。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "④ 4 个 KV 头遇上 TP=8：两边的解法不一样",
+      "items": [
+        "num_key_value_heads = 4 < TP = 8，这是 GQA 的典型麻醉点。",
+        "<b>vLLM 的解法是复制</b>：num_kv_heads = max(1, 4//8) = 1，num_kv_head_replicas = 8/4 = 2，相邻两个 rank 持有<b>同一份</b> K/V 头。",
+        "它甚至在 spec 里专门留了 max_tp_shards 字段，注明「超出这个数的 TP rank 持有的是副本」。",
+        "<b>Megatron 的解法是多做一次 all-gather</b>：QKV 交错布局下一个 group 被劈到多个 rank，于是注意力里额外 all_gather 再切出自己那份。",
+        "num_query_groups >= tp_size 时这次额外通信<b>不会</b>发生——所以 TP=4 比 TP=8 在这一点上更省。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑤ Megatron 侧：优化器缓冲怎么摆",
+      "items": [
+        "参数布局<b>倒序</b>遍历，所以 bucket 0 装的是模型最后面的参数——反向最先产生的那批梯度。",
+        "每个参数起始位置对齐到 64；bucket 结尾 pad 到 lcm(dp_world_size, 128)，<b>尾部 padding 才是 DP 可整除的保证</b>。",
+        "分片规则只有一条：按连续元素区间切，<b>完全无视参数边界</b>，一个参数可能横跨两个 rank。",
+        "FP32 主分片是 shard_model_param.clone().float()；内层 Adam 只见分片张量，所以 exp_avg / exp_avg_sq 天然是分片尺寸、只存在于拥有者 rank 上。",
+        "源码：distrib_optimizer.py:483-565、:323-480；padding 规则 param_layout.py:24-42"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑤ 推理侧：KV 块数是跑出来的，不是算出来的",
+      "items": [
+        "requested_memory = ceil(显卡<b>总</b>显存 × gpu_memory_utilization)——注意是总显存的比例，不是空闲显存。",
+        "profile_run 用 max_num_batched_tokens 跑一遍假 batch，量出 non_kv_cache_memory = 总消耗 + 瞬时峰值余量。",
+        "总消耗用 mem_get_info 量而不是 memory_reserved，<b>正因为 cumem 分配器绕过了 PyTorch 的记账</b>——这条直接关系到 verl 的 sleep 模式。",
+        "num_gpu_blocks = (requested_memory − non_kv_cache_memory − cudagraph 估值) // 每块字节数。",
+        "每块字节数 = 各层 page_size_bytes 之和，再按 lcm(对齐) 向上取整；page_size_bytes 里的 num_kv_heads <b>已经是每 rank 的数</b>。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑤ 代入实例：每 token 每 rank 的 KV 账",
+      "items": [
+        "full 层每 token 每 rank：num_kv_heads_per_rank × (head_size + head_size_v) × dtype_bytes = 1 × (256+256) × 2 = <b>1024 B</b>。",
+        "16 个 full 层 → 每 token 每 rank <b>16 KiB</b>。",
+        "TP=4 和 TP=8 的这个数<b>一样</b>（都是每 rank 1 个 KV 头），但 TP=8 时全集群存了两份——复制的代价。",
+        "48 个 linear 层不按 token 增长，它们持有<b>常驻的循环状态</b>（conv 状态 + SSM 状态，mamba_ssm_dtype=float32）。",
+        "这部分每层的确切字节数由 MambaSpec 算，我没有逐行核对那个公式，不在这里给数。"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑥ 两种 KV 规格并存会发生什么",
+      "items": [
+        "full 层和 linear 层的 page_size_bytes 不同，于是出现<b>多个 KV cache 组</b>。",
+        "这时有三种 token 粒度：每组自己的 block_size、调度器用的 scheduler_block_size（各组的 <b>LCM</b>）、前缀哈希用的 hash_block_size（各组的 <b>GCD</b>）。",
+        "协调器也随之换成 Hybrid 版，命中查找要在各组之间做迭代定点，而不是单组那样一趟走完。",
+        "前缀缓存的命中判据变严：get_cached_block 对<b>任一组</b> miss 就算整体 miss，各组必须同步命中。",
+        "源码：resolve_kv_cache_block_sizes kv_cache_utils.py:804-886；Hybrid 协调器 kv_cache_coordinator.py:609"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑥ MTP 那一层去哪了",
+      "items": [
+        "约定：MTP 层的层号排在 num_hidden_layers 之后，即本例的第 64 层（主干 0–63）。",
+        "<b>主模型按层号把它丢掉</b>：vLLM 在 load_weights 里判断 spec_layer 非 None 就 continue。",
+        "<b>草稿模型只收它</b>：drafter 在 GPUModelRunner.load_model 内部加载，是独立的模型类。",
+        "后果一：drafter 在 profile_run <b>之前</b>就加载完了，它的注意力层进入静态前向上下文，<b>会吃掉 KV 块</b>。",
+        "后果二：vLLM 有个 MTP 完整性检查（量化检查点常漏 MTP 层），但在 RL 式权重传输时<b>被刻意关掉</b>——这正是 verl 的场景。"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "VL 部分：视觉塔怎么接上去",
+      "items": [
+        "vision_config：depth 27、hidden_size 1152、num_heads 16、intermediate_size 4304、patch_size 16、spatial_merge_size 2、temporal_patch_size 2。",
+        "<b>out_hidden_size = 5120</b>，正好等于文本侧的 hidden_size——视觉塔的输出直接投进文本隐藏维。",
+        "deepstack_visual_indexes 是空列表，所以没有启用多层视觉特征注入。",
+        "位置编码是 mrope（多模态 rope），mrope_section = [11, 11, 10]、mrope_interleaved = true。",
+        "训练侧的 VL 路径走 MindSpeed-Bridge 的 qwen_vl recipe：qwen38_vl_27b_sft_config，hf_path=\"Qwen/Qwen3.8-27B\"，默认 tp=1、pp=1、mtp_num_layers=1。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "两处命名已经过时，别照旧文档找",
+      "items": [
+        "vLLM 这一版<b>没有</b> fused_moe/layer.py 里的 FusedMoE.weight_loader，现在叫 RoutedExperts.weight_loader（fused_moe/routed_experts.py:682）。",
+        "SGLang 这一版<b>没有</b> ModelRunner.profile_max_num_token、没有 init_memory_pool、也没有 TpModelWorkerClient。",
+        "现在的名字是 KVCacheConfigurator.configure（kv_cache_configurator.py:311）和 ModelRunner.alloc_memory_pool（model_runner.py:892）。",
+        "verl/models/mcore/readme.md 里写的 megatron.vanilla_mbridge 选项<b>整棵树里已经不存在</b>。",
+        "mcore 这一版也<b>没有</b> zero-bubble / DualPipe 调度；DualPipe 是 MindSpeed 用补丁加上去的，属于昇腾层。"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "引擎侧与 Megatron 侧的源码位置（相对各自 checkout）",
+      "items": [
+        "Megatron-LM core_v0.18.0：transformer_block.py:69-190（建几层）· transformer_layer.py:46-200（层号偏移）· distrib_optimizer.py:483-565（参数布局）· param_layout.py:24-42（padding）· parallel_state.py:547-568（未传参数的默认值）",
+        "Megatron-Bridge v0.5.0：conversion/model_bridge.py:411-453（CONFIG_MAPPING）· :965-1118（权重导入主体）· conversion/param_mapping.py:573-611（scatter_to_tp_ranks）· models/conversion/auto_bridge.py:346-418（只读 config）",
+        "vLLM v0.32.0：gpu_worker.py:436-545（init_device）· :587-595（load_model）· :634-744（量显存）· worker/utils.py:564-627（分配 KV）· linear.py:1198-1304（QKV 切分）",
+        "vLLM 续：kv_cache_interface.py:510-560（AttentionSpec）· kv_cache_utils.py:804-886（三种 token 粒度）· kv_cache_coordinator.py:609（Hybrid 协调器）· qwen3_next.py:295-330（本例的投影布局）",
+        "SGLang v0.5.20：scheduler.py:1098-1110（init_model_worker）· model_runner.py:892（alloc_memory_pool）· kv_cache_configurator.py:311（configure）· linear.py:1322-1397（QKV 切分）"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "读图提示与证据边界",
+      "items": [
+        "主干一行是两侧共有的六个阶段；下面两条泳道是同一阶段在训练侧 / 推理侧的不同做法，第四条是代入实例后的具体数字。",
+        "泳道内横向箭头只表示「属于同一阶段序列」，不表示跨泳道的数据流。",
+        "所有维度数字来自你给的 config.json；所有机制来自固定提交的源码。",
+        "我<b>没有</b>核对 MambaSpec 的状态字节公式，也没核对 SGLang 的非默认 pool configurator，相关处已注明。",
+        "行号：verl 侧对应 revision f4becf6e；引擎侧相对各自 checkout（vLLM v0.32.0、SGLang v0.5.20、Megatron-LM core_v0.18.0、Megatron-Bridge v0.5.0）。"
+      ]
+    }
+  ]
+}

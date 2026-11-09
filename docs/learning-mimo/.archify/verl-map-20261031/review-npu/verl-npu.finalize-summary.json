@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "architecture",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/npu.candidate.json",
+    "sha256": "c2a24053d40229d19edc9e4204c379bc45cbc6cde4d469df3ac894a5984fdf1c",
+    "bytes": 27296
+  },
+  "artifact": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-npu.html",
+    "sha256": "5d3b192ba4cafd3997fb58472bda612703fbb65d871146b941fbcfb939611b9f",
+    "bytes": 870871
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/review-npu/verl-npu.finalize.json",
+    "summaryReceipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/review-npu/verl-npu.finalize-summary.json",
+    "browserCheckReceipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/review-npu/verl-npu.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-30T16:19:25.419Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 2327,
+  "browserCheck": {
+    "requested": true,
+    "ran": true
+  }
+}

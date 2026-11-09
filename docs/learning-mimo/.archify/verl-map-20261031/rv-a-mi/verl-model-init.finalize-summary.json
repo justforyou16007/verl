@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "finalize",
+  "status": "pass",
+  "type": "workflow",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/model-init.candidate.json",
+    "sha256": "4e4edb71b32c899bc8d88c3eeb4bdd81e9457f0c2b38fe0ed25d46baf710495e",
+    "bytes": 27146
+  },
+  "artifact": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-model-init.html",
+    "sha256": "d8ba36c279555e092be0e2a14a34bb16d20b4ab44518d20a8b566903b611aca6",
+    "bytes": 887436
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "pass"
+  },
+  "diagnostics": [],
+  "diagnosticSummary": {
+    "total": 0,
+    "shown": 0,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rv-a-mi/verl-model-init.finalize.json",
+    "summaryReceipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rv-a-mi/verl-model-init.finalize-summary.json",
+    "browserCheckReceipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rv-a-mi/verl-model-init.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-30T16:19:25.419Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 6557,
+  "browserCheck": {
+    "requested": true,
+    "ran": true
+  }
+}

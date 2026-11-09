@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "40f0a609-1b51-44f3-a34e-eccb9b1251c1",
+  "status": "current",
+  "command": "deliver",
+  "type": "workflow",
+  "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/single-controller.candidate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-single-controller.html",
+  "specification": {
+    "sha256": "4c0aa7c1b5e960cfdbbbbc922c29ec711045a7630d0ffa3bd33f744da73d97ba",
+    "bytes": 24965
+  },
+  "artifact": {
+    "sha256": "6c902ce709b9f2a1eb5cc78d1e8f5f64c4cf7e37c209ca26308eaa4d26405738",
+    "bytes": 873582
+  }
+}

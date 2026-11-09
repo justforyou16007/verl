@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verl 并行与分片动画</title>
+<style>
+:root{
+  --bg:#0e1116; --panel:#161b22; --line:#2a313c; --fg:#e6edf3; --dim:#8b949e;
+  --cyan:#39c5cf; --violet:#a371f7; --amber:#d29922; --emerald:#3fb950; --rose:#f85149;
+  --cell:#1f2630;
+}
+:root[data-theme="light"]{
+  --bg:#ffffff; --panel:#f6f8fa; --line:#d0d7de; --fg:#1f2328; --dim:#636c76;
+  --cell:#eaeef2;
+}
+@media (prefers-color-scheme: light){
+  :root:not([data-theme="dark"]){
+    --bg:#ffffff; --panel:#f6f8fa; --line:#d0d7de; --fg:#1f2328; --dim:#636c76; --cell:#eaeef2;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans CJK SC","PingFang SC",sans-serif;
+  padding:24px 16px 64px}
+.wrap{max-width:1180px;margin:0 auto}
+h1{font-size:22px;margin:0 0 4px}
+.sub{color:var(--dim);margin:0 0 20px;font-size:13px}
+.tabs{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
+.tab{background:var(--panel);border:1px solid var(--line);color:var(--fg);
+  padding:7px 14px;border-radius:999px;cursor:pointer;font-size:13px}
+.tab[aria-selected="true"]{border-color:var(--cyan);color:var(--cyan)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+.panel h2{font-size:16px;margin:0 0 6px}
+.panel p.lead{color:var(--dim);margin:0 0 14px;font-size:13px}
+.controls{display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-bottom:16px;font-size:12px;color:var(--dim)}
+.controls label{display:flex;align-items:center;gap:6px}
+select,button{background:var(--bg);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:5px 9px;font-size:12px;cursor:pointer}
+.grid{display:grid;gap:6px;margin-bottom:14px}
+.rank{background:var(--cell);border:1px solid var(--line);border-radius:7px;
+  padding:8px 4px;text-align:center;font-size:11px;transition:all .35s ease;position:relative;min-height:54px}
+.rank b{display:block;font-size:12px;font-weight:600}
+.rank span{display:block;color:var(--dim);font-size:10px;margin-top:2px}
+.rank.hot{border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan) inset}
+.rank.g0{background:color-mix(in srgb,var(--cyan) 22%,var(--cell))}
+.rank.g1{background:color-mix(in srgb,var(--violet) 22%,var(--cell))}
+.rank.g2{background:color-mix(in srgb,var(--amber) 22%,var(--cell))}
+.rank.g3{background:color-mix(in srgb,var(--emerald) 22%,var(--cell))}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--dim);margin-top:10px}
+.sw{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.note{font-size:12px;color:var(--dim);border-left:2px solid var(--line);padding-left:10px;margin-top:12px}
+.note code{color:var(--fg)}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;
+  background:color-mix(in srgb,var(--fg) 8%,transparent);padding:1px 4px;border-radius:4px}
+/* 3D */
+.stage{height:340px;display:flex;align-items:center;justify-content:center;perspective:1100px;margin-bottom:8px}
+.cube{transform-style:preserve-3d;position:relative;width:0;height:0;transition:transform .6s ease}
+.node{position:absolute;width:46px;height:46px;margin:-23px 0 0 -23px;
+  border:1px solid var(--line);border-radius:8px;background:var(--cell);
+  display:flex;align-items:center;justify-content:center;font-size:11px;
+  transform-style:preserve-3d;transition:background .4s ease,border-color .4s ease,opacity .4s ease}
+.node.on{border-color:var(--cyan);background:color-mix(in srgb,var(--cyan) 30%,var(--cell))}
+.node.off{opacity:.22}
+.axis{position:absolute;color:var(--dim);font-size:11px;white-space:nowrap}
+table{border-collapse:collapse;width:100%;font-size:12px;margin-top:10px}
+th,td{border:1px solid var(--line);padding:6px 9px;text-align:left}
+th{background:color-mix(in srgb,var(--fg) 6%,transparent);font-weight:600}
+.hidden{display:none}
+.bar{height:22px;border-radius:5px;background:var(--cell);border:1px solid var(--line);
+  position:relative;overflow:hidden;margin:6px 0}
+.bar i{position:absolute;inset:0 100% 0 0;background:color-mix(in srgb,var(--cyan) 45%,transparent);transition:right .3s linear}
+.bar em{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-style:normal;font-size:11px;color:var(--fg)}
+.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px}
+.step{border:1px solid var(--line);border-radius:8px;padding:10px;font-size:11px;background:var(--cell);transition:border-color .3s}
+.step.active{border-color:var(--cyan)}
+.step b{display:block;font-size:12px;margin-bottom:3px}
+.step span{color:var(--dim)}
+@media (max-width:720px){ .flow{grid-template-columns:1fr 1fr} .stage{height:280px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>verl 并行与分片动画</h1>
+<p class="sub">配合「verl 流程总分图」。所有维度名与形状取自仓库 <code>f4becf6e</code> 的 <code>init_device_mesh</code> 调用，不是示意命名。</p>
+
+<div class="tabs" role="tablist">
+  <button class="tab" role="tab" aria-selected="true" data-scene="fsdp">① FSDP 参数分片</button>
+  <button class="tab" role="tab" aria-selected="false" data-scene="ulysses">② Ulysses 数据与序列</button>
+  <button class="tab" role="tab" aria-selected="false" data-scene="rollout">③ 推理 3D mesh</button>
+  <button class="tab" role="tab" aria-selected="false" data-scene="resync">④ 权重回收与下发</button>
+</div>
+
+<!-- ① FSDP -->
+<section class="panel" data-scene="fsdp">
+  <h2>① FSDP 参数分片：<code>("fsdp",)</code> 或 <code>("ddp","fsdp")</code></h2>
+  <p class="lead">来自 <code>verl/workers/engine/fsdp/utils.py:35-53</code>。只有两种形状：fsdp_size 未设或 ≥ world_size 时是一维全分片，否则是二维 HSDP。</p>
+  <div class="controls">
+    <label>world_size
+      <select id="f-ws"><option>8</option><option selected>16</option><option>32</option></select>
+    </label>
+    <label>fsdp_size
+      <select id="f-size">
+        <option value="-1">-1（全分片）</option>
+        <option value="4">4</option>
+        <option value="8" selected>8</option>
+      </select>
+    </label>
+    <button id="f-play">播放参数遍历</button>
+  </div>
+  <div class="grid" id="f-grid"></div>
+  <div class="legend" id="f-legend"></div>
+  <div class="note" id="f-note"></div>
+</section>
+
+<!-- ② Ulysses -->
+<section class="panel hidden" data-scene="ulysses">
+  <h2>② Ulysses 序列并行：<code>("dp","sp")</code></h2>
+  <p class="lead">来自 <code>fsdp/transformer_impl.py:251-253</code>，形状 <code>(world_size // sp, sp)</code>。行主序、sp 在内层，所以<b>连续的全局 rank 组成一个 Ulysses 组</b>。</p>
+  <div class="controls">
+    <label>world_size
+      <select id="u-ws"><option>8</option><option selected>16</option></select>
+    </label>
+    <label>ulysses_sequence_parallel_size
+      <select id="u-sp"><option>1</option><option>2</option><option selected>4</option></select>
+    </label>
+    <button id="u-play">播放一个 batch</button>
+  </div>
+  <div class="grid" id="u-grid"></div>
+  <div class="legend" id="u-legend"></div>
+  <div class="note" id="u-note"></div>
+</section>
+
+<!-- ③ rollout 3D -->
+<section class="panel hidden" data-scene="rollout">
+  <h2>③ 推理侧三维 mesh：<code>("dp","infer_tp","infer_pp")</code></h2>
+  <p class="lead">来自 <code>verl/workers/engine_workers.py:699-714</code>。注意 <code>infer_tp = tensor_model_parallel_size × data_parallel_size</code>：推理自己的 DP 被折进了 TP 轴。</p>
+  <div class="controls">
+    <label>infer_tp <select id="r-tp"><option>1</option><option selected>2</option><option>4</option></select></label>
+    <label>infer_pp <select id="r-pp"><option selected>1</option><option>2</option></select></label>
+    <label>dp <select id="r-dp"><option>1</option><option>2</option><option selected>4</option></select></label>
+    <label>高亮 <select id="r-hl">
+      <option value="none">全部</option>
+      <option value="tp" selected>一个 infer_tp 组</option>
+      <option value="dp">一个 dp 切片</option>
+      <option value="leader">权重同步的 TP leader</option>
+    </select></label>
+    <button id="r-spin">自动旋转</button>
+  </div>
+  <div class="stage"><div class="cube" id="r-cube"></div></div>
+  <div class="note" id="r-note"></div>
+</section>
+
+<!-- ④ resync -->
+<section class="panel hidden" data-scene="resync">
+  <h2>④ 权重回收与下发：一次一个张量</h2>
+  <p class="lead">来自 <code>fsdp/transformer_impl.py:1032-1040</code> 与 <code>vllm_rollout/bucketed_weight_transfer.py:102-199</code>。关键是显存峰值只有「一个完整张量 + 一个字节桶」。</p>
+  <div class="controls">
+    <label>world_size <select id="s-ws"><option>4</option><option selected>8</option></select></label>
+    <button id="s-play">播放一轮同步</button>
+  </div>
+  <div class="grid" id="s-grid"></div>
+  <div class="bar"><i id="s-bar"></i><em id="s-bartext">IPC 字节桶 0%</em></div>
+  <div class="flow" id="s-flow"></div>
+  <div class="note" id="s-note"></div>
+</section>
+
+<section class="panel">
+  <h2>各后端的维度名对照</h2>
+  <p class="lead">只有 FSDP 的 mesh 是在 verl 仓库内字面构造的；VeOmni / TorchTitan / Automodel 的 mesh 在各自上游库里建，这里列的是 verl 实际索引的维度名。Megatron / MindSpeed 根本不用 DeviceMesh。</p>
+  <table>
+    <tr><th>维度</th><th>FSDP</th><th>Megatron / MindSpeed</th><th>VeOmni</th><th>TorchTitan</th><th>Automodel</th></tr>
+    <tr><td>mesh 对象</td><td>两次字面 init_device_mesh</td><td>无（mcore 进程组）</td><td>上游 init_parallel_state_from_config</td><td>上游 ParallelDims.build_mesh()</td><td>上游 create_device_mesh ×2</td></tr>
+    <tr><td>参数分片</td><td><code>fsdp</code></td><td>可选 megatron FSDP</td><td><code>dp_shard_size</code></td><td><code>dp_shard</code></td><td>FSDP2 / DDP</td></tr>
+    <tr><td>HSDP 复制</td><td><code>ddp</code></td><td>—</td><td><code>dp_replicate_size</code></td><td><code>dp_replicate</code></td><td><code>dp_replicate_size</code></td></tr>
+    <tr><td>数据并行</td><td><code>dp</code>（Ulysses mesh）</td><td>mpu.get_data_parallel_*</td><td><code>dp</code></td><td><code>batch</code>（不含 cp）</td><td><code>dp</code> / <code>dp_cp</code></td></tr>
+    <tr><td>张量并行</td><td>抛 NotImplementedError</td><td>tensor_model_parallel_size</td><td>抛 NotImplementedError</td><td><code>tp</code></td><td><code>tp</code></td></tr>
+    <tr><td>流水并行</td><td>—</td><td>pipeline + VPP</td><td>—</td><td><code>pp</code>（前向未实现）</td><td>断言 pp_size==1</td></tr>
+    <tr><td>上下文并行</td><td>—</td><td>context_parallel + 动态 CP</td><td>抛 NotImplementedError</td><td><code>cp</code></td><td>仅参与 DP 尺寸计算</td></tr>
+    <tr><td>专家并行</td><td>—</td><td>expert_model/tensor_parallel</td><td><code>ep</code> / <code>ep_fsdp</code></td><td><code>ep</code></td><td>moe_mesh 上的 <code>ep</code></td></tr>
+    <tr><td>Ulysses SP</td><td><code>sp</code></td><td>—</td><td><code>ulysses_size</code></td><td>—</td><td>—</td></tr>
+    <tr><td>token 预算按谁缩放</td><td>ulysses sp</td><td><b>CP</b></td><td>ulysses</td><td><b>TP</b></td><td><b>不缩放</b></td></tr>
+  </table>
+</section>
+
+<script>
+(function(){
+  "use strict";
+  var $ = function(s){ return document.querySelector(s); };
+  var $$ = function(s){ return Array.prototype.slice.call(document.querySelectorAll(s)); };
+
+  // ---- tabs ----
+  $$(".tab").forEach(function(t){
+    t.addEventListener("click", function(){
+      $$(".tab").forEach(function(x){ x.setAttribute("aria-selected", String(x===t)); });
+      $$("section.panel[data-scene]").forEach(function(p){
+        p.classList.toggle("hidden", p.dataset.scene !== t.dataset.scene);
+      });
+    });
+  });
+
+  function cols(n){ return n<=8 ? n : 8; }
+  function setGrid(el, n){ el.style.gridTemplateColumns = "repeat("+cols(n)+",minmax(0,1fr))"; }
+
+  // ================= ① FSDP =================
+  var fTimer = null;
+  function fsdpRender(step){
+    var ws = +$("#f-ws").value, fs = +$("#f-size").value;
+    var twoD = !(fs < 0 || fs >= ws);
+    var shard = twoD ? fs : ws;
+    var repl  = twoD ? ws/fs : 1;
+    var g = $("#f-grid"); setGrid(g, ws); g.innerHTML = "";
+    for (var r=0;r<ws;r++){
+      var ddp = twoD ? Math.floor(r/fs) : 0;
+      var sh  = twoD ? r%fs : r;
+      var d = document.createElement("div");
+      d.className = "rank g"+(ddp%4);
+      if (step != null && sh === step%shard) d.className += " hot";
+      d.innerHTML = "<b>rank "+r+"</b><span>"+(twoD?("ddp "+ddp+" · "):"")+"fsdp "+sh+"</span>"+
+                    "<span>参数片 "+sh+"/"+shard+"</span>";
+      g.appendChild(d);
+    }
+    $("#f-legend").innerHTML = twoD
+      ? '<span><i class="sw" style="background:var(--cyan)"></i>ddp 组 0</span>'+
+        '<span><i class="sw" style="background:var(--violet)"></i>ddp 组 1</span>'+
+        '<span>同一列 = 同一个参数分片编号</span>'
+      : '<span><i class="sw" style="background:var(--cyan)"></i>单一 fsdp 轴，全世界分片</span>';
+    $("#f-note").innerHTML = twoD
+      ? "形状 <code>("+repl+", "+fs+")</code>，维度名 <code>[\"ddp\",\"fsdp\"]</code>。mesh 是二维，所以 FSDP 走 HYBRID_SHARD："+
+        "参数在 fsdp 轴上切成 "+fs+" 份，在 ddp 轴上复制 "+repl+" 份。"
+      : "形状 <code>("+ws+",)</code>，维度名 <code>[\"fsdp\"]</code>。mesh 是一维，所以走 FULL_SHARD：每个参数被切成 "+ws+" 份，没有任何复制。";
+  }
+  ["#f-ws","#f-size"].forEach(function(s){ $(s).addEventListener("change", function(){ fsdpRender(null); }); });
+  $("#f-play").addEventListener("click", function(){
+    if (fTimer){ clearInterval(fTimer); fTimer=null; this.textContent="播放参数遍历"; fsdpRender(null); return; }
+    this.textContent = "停止";
+    var k = 0, btn = this;
+    fTimer = setInterval(function(){
+      fsdpRender(k++);
+      if (k > 24){ clearInterval(fTimer); fTimer=null; btn.textContent="播放参数遍历"; fsdpRender(null); }
+    }, 420);
+  });
+  fsdpRender(null);
+
+  // ================= ② Ulysses =================
+  var uTimer = null;
+  function ulyRender(phase){
+    var ws = +$("#u-ws").value, sp = +$("#u-sp").value;
+    var dp = ws / sp;
+    var g = $("#u-grid"); setGrid(g, ws); g.innerHTML = "";
+    for (var r=0;r<ws;r++){
+      var dpr = Math.floor(r/sp), spr = r%sp;
+      var d = document.createElement("div");
+      d.className = "rank g"+(dpr%4);
+      if (phase === "data") d.className += (spr===0 ? " hot" : "");
+      if (phase === "seq")  d.className += " hot";
+      var seqTxt = sp>1 ? ("序列段 "+spr+"/"+sp) : "整条序列";
+      d.innerHTML = "<b>rank "+r+"</b><span>dp "+dpr+" · sp "+spr+"</span><span>样本组 "+dpr+" · "+seqTxt+"</span>";
+      g.appendChild(d);
+    }
+    $("#u-legend").innerHTML =
+      '<span><i class="sw" style="background:var(--cyan)"></i>dp 组 0</span>'+
+      '<span><i class="sw" style="background:var(--violet)"></i>dp 组 1</span>'+
+      '<span><i class="sw" style="background:var(--amber)"></i>dp 组 2</span>'+
+      '<span>同色 = 同一批样本，组内按序列切分</span>';
+    $("#u-note").innerHTML = sp>1
+      ? "形状 <code>("+dp+", "+sp+")</code>，维度名 <code>[\"dp\",\"sp\"]</code>。"+
+        "batch 先按 dp 切成 "+dp+" 份；每份的序列再按 sp 切成 "+sp+" 段，注意力处用 all-to-all 换轴。"+
+        "因为 sp 在内层，<b>rank 0.."+(sp-1)+" 属于同一个 Ulysses 组</b>。"+
+        "数据并行尺寸 = world_size / sp = "+dp+"，这也是 driver 切 batch 用的 dp_size。"
+      : "sp = 1 时根本不创建 Ulysses mesh（<code>transformer_impl.py:250</code> 的条件是 sp &gt; 1），dp_rank 直接退回 <code>torch.distributed.get_rank()</code>。";
+  }
+  ["#u-ws","#u-sp"].forEach(function(s){ $(s).addEventListener("change", function(){ ulyRender(null); }); });
+  $("#u-play").addEventListener("click", function(){
+    if (uTimer){ clearInterval(uTimer); uTimer=null; this.textContent="播放一个 batch"; ulyRender(null); return; }
+    var seq = [null,"data","seq",null], i=0, btn=this; btn.textContent="停止";
+    uTimer = setInterval(function(){
+      ulyRender(seq[i%seq.length]); i++;
+      if (i>12){ clearInterval(uTimer); uTimer=null; btn.textContent="播放一个 batch"; ulyRender(null); }
+    }, 700);
+  });
+  ulyRender(null);
+
+  // ================= ③ rollout 3D =================
+  var spin = false, ang = -28, rafId = null;
+  function rollRender(){
+    var tp = +$("#r-tp").value, pp = +$("#r-pp").value, dp = +$("#r-dp").value;
+    var hl = $("#r-hl").value;
+    var cube = $("#r-cube"); cube.innerHTML = "";
+    var gap = 72;
+    var ox = (dp-1)/2, oy = (tp-1)/2, oz = (pp-1)/2;
+    for (var d=0; d<dp; d++)
+      for (var t=0; t<tp; t++)
+        for (var p=0; p<pp; p++){
+          var n = document.createElement("div");
+          n.className = "node";
+          var on = (hl==="none") ||
+                   (hl==="tp" && d===0 && p===0) ||
+                   (hl==="dp" && d===0) ||
+                   (hl==="leader" && t===0);
+          n.className += on ? " on" : " off";
+          n.textContent = d+","+t+","+p;
+          n.style.transform = "translate3d("+((d-ox)*gap)+"px,"+((t-oy)*gap)+"px,"+((p-oz)*gap)+"px)";
+          cube.appendChild(n);
+        }
+    var ax = document.createElement("div");
+    ax.className="axis";
+    ax.style.transform = "translate3d("+(-(ox+1)*gap)+"px,"+(-(oy+1)*gap)+"px,0)";
+    ax.textContent = "x=dp  y=infer_tp  z=infer_pp";
+    cube.appendChild(ax);
+    cube.style.transform = "rotateX(-18deg) rotateY("+ang+"deg)";
+    var world = dp*tp*pp;
+    var txt = "形状 <code>("+dp+", "+tp+", "+pp+")</code>，共 "+world+" 个训练 rank。"+
+      "推理世界大小 = infer_tp × infer_pp = "+(tp*pp)+"，dp = world_size / (infer_tp × infer_pp) = "+dp+"。";
+    if (hl==="tp") txt += " 高亮的是一个 <code>infer_tp</code> 组：同一份模型被切在这些 rank 上。";
+    if (hl==="dp") txt += " 高亮的是一个 <code>dp</code> 切片：这些 rank 共同承载一个推理副本。";
+    if (hl==="leader") txt += " 高亮的是每组 <code>infer_tp</code> 的 0 号 rank——权重同步时所有 IPC 句柄都 gather 到它身上，HTTP 分发也只由它发起。";
+    $("#r-note").innerHTML = txt;
+  }
+  ["#r-tp","#r-pp","#r-dp","#r-hl"].forEach(function(s){ $(s).addEventListener("change", rollRender); });
+  $("#r-spin").addEventListener("click", function(){
+    spin = !spin; this.textContent = spin ? "停止旋转" : "自动旋转";
+    if (spin){
+      var loop = function(){ if(!spin) return; ang += 0.35; $("#r-cube").style.transform = "rotateX(-18deg) rotateY("+ang+"deg)"; rafId = requestAnimationFrame(loop); };
+      loop();
+    } else if (rafId) cancelAnimationFrame(rafId);
+  });
+  rollRender();
+
+  // ================= ④ resync =================
+  var sTimer = null;
+  var STEPS = [
+    { b:"① resume(weights)", s:"推理引擎先把权重显存要回来，新权重直接写进已有缓冲" },
+    { b:"② full_tensor()", s:"逐个参数在自己的 mesh 上 all-gather，峰值只有一个完整张量" },
+    { b:"③ 填 IPC 字节桶", s:"拷进常驻的 CUDA IPC 缓冲，满桶就发一次 ZMQ 元数据" },
+    { b:"④ barrier + KV", s:"所有训练 rank 卸载完后才重建 KV cache" }
+  ];
+  function resyncRender(stage, frac, hot){
+    var ws = +$("#s-ws").value;
+    var g = $("#s-grid"); setGrid(g, ws); g.innerHTML = "";
+    for (var r=0;r<ws;r++){
+      var d = document.createElement("div");
+      d.className = "rank g0" + (hot!=null && (stage===1) ? " hot" : "");
+      var state = stage===0 ? "持有分片" : stage===1 ? "参与 all-gather" : stage===2 ? "已交给 IPC" : "参数已卸载到 CPU";
+      d.innerHTML = "<b>rank "+r+"</b><span>参数片 "+r+"/"+ws+"</span><span>"+state+"</span>";
+      g.appendChild(d);
+    }
+    var f = Math.max(0, Math.min(1, frac||0));
+    $("#s-bar").style.right = (100 - f*100) + "%";
+    $("#s-bartext").textContent = "IPC 字节桶 " + Math.round(f*100) + "%" + (f>=1 ? "（满桶 → 发送句柄）" : "");
+    var fl = $("#s-flow"); fl.innerHTML = "";
+    STEPS.forEach(function(st,i){
+      var e = document.createElement("div");
+      e.className = "step" + (i===stage ? " active" : "");
+      e.innerHTML = "<b>"+st.b+"</b><span>"+st.s+"</span>";
+      fl.appendChild(e);
+    });
+    $("#s-note").innerHTML = "默认桶大小 <code>update_weights_bucket_megabytes = 2048</code>。"+
+      "比整桶还大的单个张量会单独走自己的 IPC 句柄。"+
+      "<b>所有 rank 都必须迭代权重生成器</b>——<code>full_tensor()</code> 是集合通信，"+
+      "哪怕某个 rank 不负责发送也不能跳过，否则其他 rank 会卡死在 all-gather 上。";
+  }
+  $("#s-ws").addEventListener("change", function(){ resyncRender(0,0,null); });
+  $("#s-play").addEventListener("click", function(){
+    if (sTimer){ clearInterval(sTimer); sTimer=null; this.textContent="播放一轮同步"; resyncRender(0,0,null); return; }
+    var k=0, btn=this; btn.textContent="停止";
+    sTimer = setInterval(function(){
+      var cycle = k % 16;
+      if (cycle < 2)       resyncRender(0, 0, null);
+      else if (cycle < 8)  resyncRender(1, (cycle-2)/6*0.8, 1);
+      else if (cycle < 13) resyncRender(2, 0.8 + (cycle-8)/5*0.2, null);
+      else                 resyncRender(3, 0, null);
+      k++;
+      if (k>32){ clearInterval(sTimer); sTimer=null; btn.textContent="播放一轮同步"; resyncRender(0,0,null); }
+    }, 380);
+  });
+  resyncRender(0,0,null);
+})();
+</script>
+</div>
+</body>
+</html>

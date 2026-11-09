@@ -1,0 +1,877 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "verl 初始化流程总分图",
+    "locale": "zh-CN",
+    "output": "arch/verl-init.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "lanes": [
+    {
+      "id": "spine",
+      "label": "主干：六个阶段"
+    },
+    {
+      "id": "cfg",
+      "label": "配置与校验"
+    },
+    {
+      "id": "data",
+      "label": "分词器与数据集"
+    },
+    {
+      "id": "ray",
+      "label": "Ray 资源与 Worker"
+    },
+    {
+      "id": "model",
+      "label": "训练引擎与模型"
+    },
+    {
+      "id": "rollout",
+      "label": "推理副本与权重"
+    },
+    {
+      "id": "legacy",
+      "label": "旧版 v0 路径",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "boot",
+      "label": "启动",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "assemble",
+      "label": "装配",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "ready",
+      "label": "就绪",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "p0",
+    "p1",
+    "p2",
+    "p3",
+    "p4",
+    "p5"
+  ],
+  "nodes": [
+    {
+      "id": "p0",
+      "lane": "spine",
+      "col": 0,
+      "type": "cloud",
+      "icon": "start",
+      "label": "① 启动与 Ray 集群",
+      "sublabel": "main_ppo → run_ppo → ray.init",
+      "sources": [
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 170,
+          "end_line": 196,
+          "label": "main()"
+        },
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 35,
+          "end_line": 78,
+          "label": "run_ppo"
+        }
+      ]
+    },
+    {
+      "id": "p1",
+      "lane": "spine",
+      "col": 1,
+      "type": "messagebus",
+      "label": "⑤ TaskRunner 与选型",
+      "sublabel": "tq.init → get_trainer_cls",
+      "sources": [
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 137,
+          "end_line": 159,
+          "label": "TaskRunnerV1.run"
+        },
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 2664,
+          "end_line": 2670,
+          "label": "get_trainer_cls"
+        }
+      ]
+    },
+    {
+      "id": "p2",
+      "lane": "spine",
+      "col": 2,
+      "type": "database",
+      "label": "⑦ 数据面装配",
+      "sublabel": "_setup 第 1–3 步",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 487,
+          "end_line": 493,
+          "label": "_setup 开头"
+        }
+      ]
+    },
+    {
+      "id": "p3",
+      "lane": "spine",
+      "col": 3,
+      "type": "cloud",
+      "label": "⑩ 资源池与 Worker",
+      "sublabel": "_setup 第 4–10 步",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 491,
+          "end_line": 578,
+          "label": "资源池与 worker group"
+        }
+      ]
+    },
+    {
+      "id": "p4",
+      "lane": "spine",
+      "col": 4,
+      "type": "backend",
+      "label": "⑮ 引擎与模型",
+      "sublabel": "_setup 第 11–15 步",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 580,
+          "end_line": 624,
+          "label": "critic / actor / ref / rm"
+        }
+      ]
+    },
+    {
+      "id": "p5",
+      "lane": "spine",
+      "col": 5,
+      "type": "backend",
+      "icon": "success",
+      "label": "⑱ 就绪与首推权重",
+      "sublabel": "_setup 第 16–19 步 → fit",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 626,
+          "end_line": 655,
+          "label": "server / ckpt / load"
+        },
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 115,
+          "end_line": 135,
+          "label": "agent loop manager"
+        }
+      ]
+    },
+    {
+      "id": "hydra",
+      "lane": "cfg",
+      "col": 0,
+      "type": "external",
+      "label": "② @hydra.main",
+      "sublabel": "yaml < 实验 yaml < CLI",
+      "sources": [
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 170,
+          "end_line": 176,
+          "label": "hydra 入口"
+        }
+      ]
+    },
+    {
+      "id": "valcfg",
+      "lane": "cfg",
+      "col": 1,
+      "type": "security",
+      "label": "③ validate_config",
+      "sublabel": "角色判定 + 设备推断",
+      "tag": "NPU 自动改 device",
+      "sources": [
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 177,
+          "end_line": 185,
+          "label": "校验与设备"
+        }
+      ]
+    },
+    {
+      "id": "detenv",
+      "lane": "cfg",
+      "col": 2,
+      "type": "security",
+      "label": "④ 确定性开关",
+      "sublabel": "VERL_FULL_DETERMINISM 等",
+      "sources": [
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 44,
+          "end_line": 55,
+          "label": "确定性环境变量"
+        }
+      ]
+    },
+    {
+      "id": "tok",
+      "lane": "data",
+      "col": 2,
+      "type": "backend",
+      "label": "⑧ _init_tokenizer",
+      "sublabel": "tokenizer / processor",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 962,
+          "end_line": 967,
+          "label": "_init_tokenizer"
+        }
+      ]
+    },
+    {
+      "id": "dl",
+      "lane": "data",
+      "col": 3,
+      "type": "database",
+      "label": "⑨ _init_dataloader",
+      "sublabel": "StatefulDataLoader + sampler",
+      "tag": "非 sync：gen_batch=1",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 969,
+          "end_line": 1047,
+          "label": "_init_dataloader"
+        }
+      ]
+    },
+    {
+      "id": "rpm",
+      "lane": "ray",
+      "col": 3,
+      "type": "cloud",
+      "label": "⑪ 资源池与 PG",
+      "sublabel": "global / reward / teacher",
+      "tag": "每进程 1 bundle",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1049,
+          "end_line": 1109,
+          "label": "资源池声明"
+        },
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 135,
+          "end_line": 171,
+          "label": "PlacementGroup"
+        },
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 208,
+          "end_line": 254,
+          "label": "资源校验"
+        }
+      ]
+    },
+    {
+      "id": "wg",
+      "lane": "ray",
+      "col": 4,
+      "type": "cloud",
+      "label": "⑫ WorkerDict + spawn",
+      "sublabel": "一卡一 actor，方法带前缀",
+      "sources": [
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 1012,
+          "end_line": 1053,
+          "label": "colocated worker cls"
+        },
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 742,
+          "end_line": 775,
+          "label": "spawn 剥前缀"
+        }
+      ]
+    },
+    {
+      "id": "criticinit",
+      "lane": "model",
+      "col": 4,
+      "type": "backend",
+      "label": "⑯ critic_wg.reset",
+      "sublabel": "set_loss_fn(value_loss)",
+      "tag": "仅 use_critic",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 580,
+          "end_line": 586,
+          "label": "critic 引擎"
+        }
+      ]
+    },
+    {
+      "id": "actorinit",
+      "lane": "model",
+      "col": 5,
+      "type": "backend",
+      "label": "⑰ actor_wg.init_model",
+      "sublabel": "FSDP / Megatron + mesh",
+      "tag": "LoRA 时 ref_in_actor",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 588,
+          "end_line": 600,
+          "label": "actor + ref"
+        },
+        {
+          "path": "verl/workers/engine_workers.py",
+          "line": 179,
+          "end_line": 183,
+          "label": "注册 mesh"
+        }
+      ]
+    },
+    {
+      "id": "llmsrv",
+      "lane": "rollout",
+      "col": 4,
+      "type": "cloud",
+      "label": "⑲ LLMServerManager",
+      "sublabel": "hybrid 副本或 empty",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 626,
+          "end_line": 639,
+          "label": "server 管理器"
+        }
+      ]
+    },
+    {
+      "id": "ckptmgr",
+      "lane": "rollout",
+      "col": 5,
+      "type": "messagebus",
+      "label": "⑳ ckpt 引擎与恢复",
+      "sublabel": "sleep → load → 推权重",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 641,
+          "end_line": 655,
+          "label": "ckpt + sleep"
+        },
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1111,
+          "end_line": 1169,
+          "label": "_load_checkpoint"
+        },
+        {
+          "path": "verl/trainer/ppo/v1/trainer_sync.py",
+          "line": 31,
+          "end_line": 33,
+          "label": "on_init_end"
+        }
+      ]
+    },
+    {
+      "id": "v0",
+      "lane": "legacy",
+      "col": 1,
+      "type": "external",
+      "icon": "stop",
+      "label": "⑥ v0 TaskRunner",
+      "sublabel": "use_v1=False，已弃用",
+      "sources": [
+        {
+          "path": "verl/trainer/main_ppo.py",
+          "line": 187,
+          "end_line": 196,
+          "label": "v1 / v0 分支"
+        }
+      ]
+    },
+    {
+      "id": "noncolo",
+      "lane": "ray",
+      "col": 5,
+      "type": "cloud",
+      "label": "⑬ 否则：角色各自成组",
+      "sublabel": "Role.Actor + 独立 RefPolicy",
+      "tag": "_enable_hybrid_replicas=False",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1062,
+          "end_line": 1071,
+          "label": "角色选择分支"
+        },
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 516,
+          "end_line": 523,
+          "label": "独立 ref 类"
+        }
+      ]
+    },
+    {
+      "id": "pd",
+      "lane": "rollout",
+      "col": 3,
+      "type": "security",
+      "label": "⑭ PD 分离副本类",
+      "sublabel": "1 prefill + N decode",
+      "tag": "disaggregation.enabled",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/replica.py",
+          "line": 407,
+          "end_line": 432,
+          "label": "副本类选择"
+        },
+        {
+          "path": "verl/workers/rollout/llm_server.py",
+          "line": 459,
+          "end_line": 472,
+          "label": "world_size 放大"
+        },
+        {
+          "path": "verl/workers/config/disaggregation.py",
+          "line": 26,
+          "end_line": 54,
+          "label": "配置与校验"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-hydra",
+      "from": "hydra",
+      "to": "p0",
+      "label": "配置",
+      "variant": "default"
+    },
+    {
+      "id": "e-p0-p1",
+      "from": "p0",
+      "to": "p1",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-val",
+      "from": "valcfg",
+      "to": "p1",
+      "label": "校验",
+      "variant": "security"
+    },
+    {
+      "id": "e-v0",
+      "from": "p0",
+      "to": "v0",
+      "label": "use_v1=False",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-p1-p2",
+      "from": "p1",
+      "to": "p2",
+      "label": "init()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-det",
+      "from": "detenv",
+      "to": "p2",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-p2-tok",
+      "from": "p2",
+      "to": "tok",
+      "label": "第1步",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e-tok-dl",
+      "from": "tok",
+      "to": "dl",
+      "label": "第2步",
+      "variant": "default"
+    },
+    {
+      "id": "e-p2-p3",
+      "from": "p2",
+      "to": "p3",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-dl-p3",
+      "from": "dl",
+      "to": "p3",
+      "label": "步数",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "e-p3-rpm",
+      "from": "p3",
+      "to": "rpm",
+      "label": "第4–5步",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e-rpm-wg",
+      "from": "rpm",
+      "to": "wg",
+      "label": "第7–10步",
+      "variant": "default"
+    },
+    {
+      "id": "e-p3-p4",
+      "from": "p3",
+      "to": "p4",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-wg-critic",
+      "from": "wg",
+      "to": "criticinit",
+      "label": "第11步",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e-critic-actor",
+      "from": "criticinit",
+      "to": "actorinit",
+      "label": "第12–13步",
+      "variant": "default"
+    },
+    {
+      "id": "e-p4-p5",
+      "from": "p4",
+      "to": "p5",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-actor-llm",
+      "from": "actorinit",
+      "to": "llmsrv",
+      "label": "第16步",
+      "variant": "default",
+      "role": "return"
+    },
+    {
+      "id": "e-llm-ckpt",
+      "from": "llmsrv",
+      "to": "ckptmgr",
+      "label": "第17–19步",
+      "variant": "default"
+    },
+    {
+      "id": "e-ckpt-p5",
+      "from": "ckptmgr",
+      "to": "p5",
+      "label": "可 fit",
+      "variant": "emphasis",
+      "role": "return"
+    },
+    {
+      "id": "e-wg-noncolo",
+      "from": "wg",
+      "to": "noncolo",
+      "label": "不共卡时",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-pd-llm",
+      "from": "pd",
+      "to": "llmsrv",
+      "label": "先定副本类",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "① 启动与 Ray 集群 — run_ppo",
+      "items": [
+        "<b>触发</b>：命令行 python -m verl.trainer.main_ppo，由 @hydra.main 装饰的 main() 落到 run_ppo。",
+        "<b>为什么先建集群</b>：TaskRunner 本身就是个 Ray actor，没有集群就无处安放。",
+        "<b>怎么做</b>：if not ray.is_initialized() 时才 ray.init，所以可以挂到外部已有集群上。",
+        "runtime_env 三层合并：verl 默认 < 平台设置（如 TPU 的 setup hook）< 用户 ray_kwargs.ray_init.runtime_env，冲突时用户赢。",
+        "开了 nsys 时 TaskRunner 带 runtime_env={\"nsight\": ...} 创建，否则普通 .remote()。源码：main_ppo.py:35-78"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "② 配置组装 — @hydra.main",
+      "items": [
+        "<b>触发</b>：进程入口，比一切都早。config_path=\"config\"、config_name=\"ppo_trainer\"。",
+        "<b>为什么分层</b>：让实验脚本只写差异项，不必复制整份默认配置。",
+        "<b>怎么做</b>：verl 默认 yaml < 实验 yaml < 命令行覆盖，由 hydra 合成一个 DictConfig。",
+        "合成结果在 run_ppo 里被 pprint 出来，再 OmegaConf.resolve 把插值求值掉。",
+        "源码：main_ppo.py:170-176"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "③ 校验与设备推断 — validate_config",
+      "items": [
+        "<b>触发</b>：main() 里紧跟 auto_set_device 之后，在 run_ppo <b>之前</b>。",
+        "<b>为什么放这么早</b>：它的结论决定后面建哪些 worker、跑哪些阶段——错配置要在拉起集群前就报出来。",
+        "<b>怎么做</b>：算三个布尔量 need_reference_policy / need_critic / need_teacher_policy 并交叉校验。",
+        "auto_set_device 在昇腾上把 trainer.device 自动改成 npu，所以用户不必手写。",
+        "源码：main_ppo.py:177-185"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "④ 确定性开关 — 为什么必须在 ray.init 之前",
+      "items": [
+        "<b>触发</b>：run_ppo 函数体第一段，早于 ray.init。",
+        "<b>为什么顺序不能反</b>：get_ppo_ray_runtime_env 要把这些变量<b>转发给所有 Ray actor</b>；ray.init 之后再写 os.environ 就只影响 driver。",
+        "<b>怎么做</b>：rollout.full_determinism 或 reward RM 的同名开关为真时，写 VERL_FULL_DETERMINISM=1、VLLM_BATCH_INVARIANT=1、PYTHONHASHSEED=seed。",
+        "另外 logger 里含 rl_insight 时写 VERL_RL_INSIGHT_ENABLE=1；transfer_queue.enable 时把 TRANSFER_QUEUE_ENABLE 放进<b>默认</b> runtime_env 而不是 ray_init.runtime_env——后者是 struct DictConfig，加键会抛 ConfigKeyError。",
+        "源码：main_ppo.py:44-70"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑤ TaskRunnerV1 与 trainer 选型",
+      "items": [
+        "<b>触发</b>：ray.get(runner.run.remote(config))，此时已在 Ray actor 进程里。",
+        "<b>为什么先 tq.init</b>：replay buffer 和 agent loop 都依赖 TransferQueue，trainer 构造时就要能用；这里还强制 config.transfer_queue.enable=True。",
+        "<b>怎么选 trainer</b>：模块级 TRAINER_REGISTRY 字典 + @register_trainer(name) 装饰器；注册靠 v1/__init__.py 的导入副作用，查不到会抛错并列出可选名。",
+        "构造顺序：build_checkpoint_callback → 算三个 use_* → 按需建 KL 控制器 → 读 parameter_sync_step → 建 replay buffer（sync 用 ReplayBuffer，异步用 Async 版，也可换自定义类）。",
+        "finally 里先 logger.finish(exit_code) 再 tq.close()，所以崩了也留下带退出码的记录。源码：main_ppo.py:137-167、trainer_base.py:2643-2670"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑥ v0 旧版路径 — 什么时候还会走到",
+      "items": [
+        "<b>触发</b>：config.trainer.use_v1 为 False 时，main() 改用 main_ppo_v0.TaskRunner。",
+        "<b>为什么还留着</b>：v1 把数据面换成了 TransferQueue，老配方迁移需要时间。",
+        "<b>怎么提示</b>：走这条路会打 warning，明说「已弃用，计划 v0.9.0 移除，请设 trainer.use_v1=True」。",
+        "两条路的 run_ppo 是同一个，只是 task_runner_class 不同。",
+        "源码：main_ppo.py:187-196"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑦ 数据面装配 — _setup 的头三步",
+      "items": [
+        "<b>触发</b>：trainer.init() → _setup()，由 TaskRunnerV1.run 调用。",
+        "<b>为什么数据面最先</b>：后面算总步数、LR 计划、资源池都要先知道数据集有多大。",
+        "<b>怎么做</b>：①_init_tokenizer ②_init_dataloader ③_init_dump_executor，严格按这个顺序。",
+        "_init_dump_executor 只是个单线程 ThreadPoolExecutor，给校验样本落盘用，不阻塞主流程。",
+        "源码：trainer_base.py:487-493"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑧ _init_tokenizer",
+      "items": [
+        "<b>触发</b>：_setup 第 1 步。",
+        "<b>为什么要单独一步</b>：数据集构造、agent loop 渲染、校验解码都要用同一个 tokenizer 实例。",
+        "<b>怎么做</b>：把 actor_rollout_ref.model 经 omega_conf_to_dataclass 变成 HFModelConfig，再取它的 tokenizer 与 processor。",
+        "processor 可以是 None——纯文本模型没有多模态处理器。",
+        "源码：trainer_base.py:962-967"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑨ _init_dataloader — 一个会被悄悄改掉的配置",
+      "items": [
+        "<b>触发</b>：_setup 第 2 步。",
+        "<b>为什么用 Stateful</b>：StatefulDataLoader 能存取采样进度，断点续训才不会重复或跳过样本。",
+        "<b>怎么算步数</b>：steps_per_epoch = len(train_dataset) // train_batch_size；total_training_steps 可被 trainer.total_training_steps 覆盖。",
+        "<b>会被改掉的配置</b>：trainer_mode != \"sync\"、或 filter_groups.enable、或 sampler.sync_refill_failed_groups 任一成立时，<b>gen_batch_size 被强制改成 1</b>（用户显式设过会打 warning）。",
+        "LR 计划的 horizon 写的是 total_training_steps × parameter_sync_step，因为一个 global step 内部要做多次优化器更新。源码：trainer_base.py:969-1047"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑩ 资源池与 WorkerGroup — _setup 第 4–10 步",
+      "items": [
+        "<b>触发</b>：_setup 第 4 步起，紧接数据面。",
+        "<b>为什么角色要先定</b>：角色决定建哪些 worker 类、映射到哪个资源池，而资源池又决定 PlacementGroup 的形状。",
+        "<b>怎么做</b>：④_init_resource_pool_mgr ⑤create_resource_pool ⑦⑧⑨ 注册 actor / ref / critic 的 RayClassWithInitArgs ⑩ 每池一次 create_colocated_worker_cls + RayWorkerGroup + spawn。",
+        "ref_in_actor = (lora.rank > 0 或 model.lora_adapter_path 非空)：LoRA 时 ref 就是 actor，不单独建。",
+        "源码：trainer_base.py:491-578"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑪ 资源池与 PlacementGroup",
+      "items": [
+        "<b>触发</b>：_init_resource_pool_mgr 之后的 create_resource_pool()。",
+        "<b>为什么一节点一个 PG</b>：bundle 要落在具体节点上才能保证同组 worker 同机，NCCL 才走得通。",
+        "<b>怎么做</b>：global_pool = [n_gpus_per_node] × nnodes；bundle = {\"CPU\": max_colocate_count} 再加 {device: 1}；每进程一个 bundle。",
+        "<b>max_colocate_count 有两个效果必须一起看</b>：bundle 的 CPU 请求数，以及每 actor 的 num_gpus = 1 / max_colocate_count——后者才是多个 WorkerGroup 共享一张卡的机制。",
+        "PG 按节点 IP 排序后再分 rank，让 RANK 跨 Ray job 稳定（FSDP 检查点写的是 rank 本地分片）。资源校验<b>只验总量</b>，PG 排不下会一直阻塞在 pg.ready() 而不是报错。源码：trainer_base.py:1049-1109、ray/base.py:135-171"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑫ WorkerDict 与 spawn — 共卡怎么成立",
+      "items": [
+        "<b>触发</b>：_setup 第 10 步，对每个非空资源池各做一次。",
+        "<b>为什么只跑一次 __init__</b>：WorkerDict.__init__ 里 super().__init__() 只调一次，于是整个 actor 只有一份 rank / world_size / MASTER_ADDR 和<b>一次</b> torch.distributed 握手。",
+        "<b>怎么装角色</b>：各角色类用 _unwrap_ray_remote 剥掉 Ray 装饰后，在本地实例化成<b>普通对象</b>塞进 self.worker_dict——不是嵌套 actor。",
+        "<b>方法怎么namespace</b>：改名成 f\"{role}_{method}\" 并把原 MAGIC_ATTR 复制到转发函数上；driver 侧 spawn(prefix_set) 用 from_detached 对同一批 handle 建门面再剥前缀。",
+        "代码明确警告：各角色要用不同并行度就别用 create_colocated_worker_cls，改传分开的资源池。源码：ray/base.py:1012-1053、:742-775"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑬ 非共卡模式 — 角色各自成组",
+      "items": [
+        "<b>触发</b>：self._enable_hybrid_replicas 为 False。只有 PPOTrainerSeparateAsync 会这样：hybrid_engine=False，或 hybrid 换挡没开。",
+        "<b>为什么会退化成 Role.Actor</b>：共卡角色（ActorRolloutRef / ActorRollout）的意义是推理引擎与训练引擎<b>在同一批 worker 进程里</b>；不共卡就没必要把 rollout 揉进角色名。",
+        "<b>怎么补 ref</b>：此时 if role == Role.Actor and need_reference_policy and not ref_in_actor 成立，<b>额外注册一个独立 Role.RefPolicy</b>，走自己的 RayClassWithInitArgs 和 init_model()。",
+        "这是唯一会出现「独立 ref worker group」的情况：共卡时 ref 要么是 actor 本身（LoRA），要么是同一组 worker 的 \"ref\" mesh。",
+        "<b>资源池与共卡是两件事</b>：即使共卡模式下 reward_pool / teacher_pool 也是独立池，各自单独走一遍 create_colocated_worker_cls。源码：trainer_base.py:1062-1071、:516-523"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑭ PD 分离部署 — prefill 与 decode 拆开",
+      "items": [
+        "<b>触发</b>：rollout.disaggregation.enabled，且 rollout.name ∈ (sglang, vllm)——其它后端在 RolloutConfig.__post_init__ 直接报错。",
+        "<b>为什么副本数算法要变</b>：一个副本内部同时放 prefill 和 decode server，足迹被放大；漏算会让 init_hybrid 切过 worker_group 边界，replica_rank ≥ 1 拿到<b>空 worker</b>（代码注释写明了）。",
+        "<b>怎么算</b>：rollout_world_size = (prefill_tp × prefill_replicas + decode_tp × decode_replicas) × dp × pp。",
+        "decode_tp 默认等于 prefill_tp，可单独指定——<b>支持非对称 TP</b>；注释特别说明运行期必须<b>内联</b>这个默认值，因为 OmegaConf / Ray 序列化会丢掉 dataclass 方法。",
+        "MVP 限制：prefill_replicas 必须为 1，整个副本要在同一节点。KV 传输后端 nixl（默认）/ mooncake / ascend / mori / fake。源码：replica.py:407-432、llm_server.py:459-472、disaggregation.py:26-62"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑮ 引擎与模型初始化 — _setup 第 11–15 步",
+      "items": [
+        "<b>触发</b>：WorkerGroup 建好之后，按 critic → actor → ref → reward → teacher 的顺序。",
+        "<b>为什么 critic 在 actor 之前</b>：critic 的 reset + set_loss_fn 不依赖 actor，而 actor 的 init_model 是整个 _setup 里最慢的一步，放后面能让前面的失败更早暴露。",
+        "<b>怎么做</b>：critic_wg.reset() + set_loss_fn → actor_rollout_wg.init_model() → ref 接线 → RewardLoopManager → 可选 MultiTeacherModelManager。",
+        "模型在设备上<b>怎么建起来、权重怎么切片</b>，见单独的「模型初始化与设备放置」页面。",
+        "源码：trainer_base.py:580-624"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑯ critic 引擎 — 损失函数是注入的",
+      "items": [
+        "<b>触发</b>：仅当 use_critic 为真，即显式 critic.enable，否则只有 adv_estimator == gae 时为真。",
+        "<b>为什么分两步</b>：reset() 建引擎与优化器，set_loss_fn 才决定算什么损失——同一个 TrainingWorker 可以被复用成别的角色。",
+        "<b>怎么注入</b>：critic_wg.set_loss_fn(partial(value_loss, config=critic_cfg))，损失函数作为参数传进 worker，而不是写死在 worker 里。",
+        "critic 的 TrainingWorkerConfig 里 model_type=\"value_model\"，会让建模时把 lm_head 换成单维输出头。",
+        "源码：trainer_base.py:526-548、:580-586"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑰ actor 引擎 — 顺带注册 dispatch mesh",
+      "items": [
+        "<b>触发</b>：critic 之后，actor_rollout_wg.init_model()。",
+        "<b>为什么要注册 mesh</b>：driver 不知道引擎内部的并行布局，必须由 worker 自己把 dp_rank 登记上来，后面数据面切分才知道切几份、谁拿哪份。",
+        "<b>怎么登记</b>：_register_dispatch_collect_info(mesh_name=\"train\", dp_rank=engine.get_data_parallel_rank(), is_collect=engine.is_mp_src_rank_with_outputs())。",
+        "ref 的三种接法：ref_in_actor（ref 就是 actor，靠 no_lora_adapter 临时禁 adapter）、共卡同一组 worker 的 \"ref\" mesh、独立 Role.RefPolicy。",
+        "源码：trainer_base.py:588-600、engine_workers.py:179-183"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑱ 就绪与首推权重 — _setup 第 16–19 步",
+      "items": [
+        "<b>触发</b>：模型建好之后，_setup 的最后一段。",
+        "<b>为什么 sleep 要排在 load 之前</b>：载入断点要显存，而推理副本此时占着权重与 KV——先让副本睡眠腾地方。",
+        "<b>怎么做</b>：LLMServerManager.create → CheckpointEngineManager → sleep_replicas() → _load_checkpoint() → on_init_end 里第一次 update_weights。",
+        "基类的 CheckpointEngineManager 的 backend 在这里被<b>强制写成 naive</b>；separate_async 另建一个用真实 backend 的 standalone 管理器。",
+        "源码：trainer_base.py:626-655"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑲ LLMServerManager — 什么时候根本不建副本",
+      "items": [
+        "<b>触发</b>：_setup 第 16 步。",
+        "<b>为什么有两个入口</b>：生成既可以由训练卡上的 hybrid 副本承担，也可以完全交给独占卡的 standalone 副本。",
+        "<b>怎么分</b>：_enable_hybrid_replicas 为真时 LLMServerManager.create(config, worker_group=actor_rollout_wg, ...)；否则 create_empty(config)——不建任何副本、均衡器为空。",
+        "副本数 = world_size // rollout_world_size；init 方式按有无 worker_group 分 init_hybrid / init_hybrid_colocated（trtllm）/ init_standalone。",
+        "源码：trainer_base.py:626-639、llm_server.py:442-522"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑳ 检查点引擎、断点恢复与首推权重",
+      "items": [
+        "<b>触发</b>：_setup 第 17–19 步，然后 init() 返回、on_init_end 执行。",
+        "<b>为什么恢复要分两段</b>：权重与 dataloader 状态能同步恢复，但<b>在飞的生成</b>不能——那要等 fit() 里重新提交。",
+        "<b>怎么恢复</b>：resume_mode 三种（disable 直接返回 / auto 找最新 global_step_* / resume_path 断言路径含 global_step_）；载入 actor、critic、data.pt；非 sync 模式还 tq.load_checkpoint 并记下 _restored_tq_prompt_count。",
+        "<b>在飞生成的恢复</b>推迟到 fit() 的 _reissue_inflight_prompts：挑 status ∈ {pending, running} 的 prompt，清掉过期轨迹键，重新打 pending 标签再提交。",
+        "on_init_end 才第一次推权重；separate_async 先推 standalone，再按需推 hybrid。源码：trainer_base.py:641-655、:1111-1169、:1171-1207、trainer_sync.py:31-33"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：三种 trainer_mode 与 separate_async 的额外初始化",
+      "items": [
+        "sync → PPOTrainerSync：训练与推理严格轮流占卡，parameter_sync_step 默认 1。",
+        "colocate_async → PPOTrainerColocateAsync：同卡，支持 abort / resume 的部分 rollout。",
+        "separate_async → PPOTrainerSeparateAsync：推理独占卡，训练卡按收益借出；parameter_sync_step 默认 4。",
+        "separate_async 构造前硬校验 train_batch_size == parameter_sync_step × ppo_mini_batch_size；actor worker 换成 DetachActorWorker；禁止同卡 reward model。",
+        "配置默认是 sync（ppo_trainer.yaml:246）。源码：trainer_sync.py:24-25、trainer_colocate_async.py:19-20、trainer_separate_async.py:45-46、:56-199"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：init() 里还没建好的东西 / 读图提示",
+      "items": [
+        "Tracking、ValidationGenerationsLogger、DapoFilteredRewardTableLogger、SkipManager.init 都在 <b>fit() 开头</b>才创建（trainer_base.py:682-697）。",
+        "AgentLoopManagerTQ 由 TaskRunnerV1 在 trainer.init() <b>之后</b>创建，拿的是 trainer 的 llm_client、teacher_client 和 reward handles。",
+        "torch.distributed 不在 Worker 基类初始化，由 worker 子类调 initialize_global_process_group_ray，并用 is_initialized() 幂等保护。",
+        "没有 register center：MASTER_ADDR / PORT 由钉在 PG 0 bundle 0 上的 Ray task 返回；ray_wait_register_center_timeout 被接收但从未读过。",
+        "编号 ①–⑳ 按流程顺序排，与图上节点一一对应。行号对应 revision f4becf6e。"
+      ]
+    }
+  ]
+}

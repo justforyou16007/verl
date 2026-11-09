@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "f2996844-22d1-4e29-9c97-87c257b7351e",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rollout.candidate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-rollout.html",
+  "specification": {
+    "sha256": "6d81100f65a673a194d9778a6c7b38b7362b03d0946c187614b415e4df687df8",
+    "bytes": 20829
+  },
+  "artifact": {
+    "sha256": "3626a1cb3b1cf79e56d49801495edbc0b6c35ab1106f953d628073a9550f1a6a",
+    "bytes": 869889
+  }
+}

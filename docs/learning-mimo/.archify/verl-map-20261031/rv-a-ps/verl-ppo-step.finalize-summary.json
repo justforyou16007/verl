@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "finalize",
+  "status": "fail",
+  "type": "sequence",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/ppo-step.candidate.json",
+    "sha256": "662607f0edff63c5f7237de29bb88003138f4e68e7a0d8ed307a17b033962801",
+    "bytes": 21062
+  },
+  "artifact": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-ppo-step.html",
+    "sha256": "c3c88078bdd71dee628ea9252b57f5cafe2a8317d7132e03ec38886baabb1558",
+    "bytes": 857456
+  },
+  "gates": {
+    "validate": "fail",
+    "deliver": "not-run",
+    "check": "not-run",
+    "browser-check": "not-run"
+  },
+  "failedStage": "validate",
+  "diagnostics": [
+    {
+      "code": "schema/enum",
+      "severity": "error",
+      "message": "/cards/3/dot must be equal to one of the allowed values",
+      "subject": {
+        "diagramType": "sequence",
+        "path": "/cards/3/dot"
+      },
+      "evidence": {
+        "keyword": "enum",
+        "allowedValues": [
+          "cyan",
+          "emerald",
+          "violet",
+          "amber",
+          "rose",
+          "orange",
+          "slate"
+        ]
+      },
+      "supportedFixes": [
+        "choose one of the allowed values"
+      ]
+    },
+    {
+      "code": "schema/enum",
+      "severity": "error",
+      "message": "/cards/4/dot must be equal to one of the allowed values",
+      "subject": {
+        "diagramType": "sequence",
+        "path": "/cards/4/dot"
+      },
+      "evidence": {
+        "keyword": "enum",
+        "allowedValues": [
+          "cyan",
+          "emerald",
+          "violet",
+          "amber",
+          "rose",
+          "orange",
+          "slate"
+        ]
+      },
+      "supportedFixes": [
+        "choose one of the allowed values"
+      ]
+    }
+  ],
+  "diagnosticSummary": {
+    "total": 2,
+    "shown": 2,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rv-a-ps/verl-ppo-step.finalize.json",
+    "summaryReceipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rv-a-ps/verl-ppo-step.finalize-summary.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-30T16:19:25.419Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 253,
+  "browserCheck": {
+    "requested": true,
+    "ran": false
+  },
+  "nextAction": {
+    "action": "edit-in-place",
+    "candidate": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/ppo-step.candidate.json",
+    "constraint": "Preserve unaffected semantics and geometry; apply each diagnostic's supportedFixes, or the fix its message names, and do not replace the whole candidate.",
+    "then": "finalize-once"
+  }
+}

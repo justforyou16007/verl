@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "472980cc-7a6f-4da0-83f5-c828c16345b0",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/engines.candidate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-engines.html",
+  "specification": {
+    "sha256": "2a1863f9a2c1d2e7e0c1939ad44d8651deb67caba2ae4ba202c2ca1f4fef2ba4",
+    "bytes": 23616
+  },
+  "artifact": {
+    "sha256": "30e02253273480e2feda137e04e96a094adda5d29c7b6dbe7f66c6f383a027b6",
+    "bytes": 875935
+  }
+}

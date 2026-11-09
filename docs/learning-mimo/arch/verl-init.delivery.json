@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "03464501-c624-432e-b123-0f3625ba1cd0",
+  "status": "current",
+  "command": "deliver",
+  "type": "workflow",
+  "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/init.candidate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-init.html",
+  "specification": {
+    "sha256": "ced884b35ab91c828512cd4585ef73a619809bff19165e2d21f1bf2149286833",
+    "bytes": 32203
+  },
+  "artifact": {
+    "sha256": "253b9703aeca895e0513cb411dbdd1b73fa7d78dfb67f7593653d34f8e77ab60",
+    "bytes": 895719
+  }
+}

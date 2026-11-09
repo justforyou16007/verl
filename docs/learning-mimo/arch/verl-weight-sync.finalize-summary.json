@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "finalize",
+  "status": "fail",
+  "type": "sequence",
+  "quality": "showcase",
+  "specification": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/weight-sync.candidate.json",
+    "sha256": "c6c32d210af600cca5ceafe05954d3dd14347c18c4a7432e3cacbff69ded72a3",
+    "bytes": 18104
+  },
+  "artifact": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-weight-sync.html",
+    "sha256": "063870b939db1b98165c1716948aad9c40dddc00e679f256fb2e84e3a625852f",
+    "bytes": 853978
+  },
+  "gates": {
+    "validate": "pass",
+    "deliver": "pass",
+    "check": "pass",
+    "browser-check": "fail"
+  },
+  "failedStage": "browser-check",
+  "diagnostics": [
+    {
+      "code": "viewer/evidence-path-conflict",
+      "severity": "error",
+      "message": "browser-check will not replace the existing unowned evidence path \"/home/liu/projects/verl/docs/learning-mimo/arch/verl-weight-sync.browser-check.json\".",
+      "subject": {
+        "artifact": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-weight-sync.html",
+        "evidencePath": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-weight-sync.browser-check.json"
+      },
+      "evidence": {
+        "reason": {
+          "code": "ownership-artifact-mismatch"
+        }
+      },
+      "supportedFixes": [
+        "move the conflicting file aside, or choose a separate --out-dir, then rerun browser-check"
+      ]
+    }
+  ],
+  "diagnosticSummary": {
+    "total": 1,
+    "shown": 1,
+    "truncated": false
+  },
+  "evidence": {
+    "receipt": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-weight-sync.finalize.json",
+    "summaryReceipt": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-weight-sync.finalize-summary.json",
+    "browserCheckReceipt": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-weight-sync.browser-check.json"
+  },
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-30T16:19:25.419Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  },
+  "visualReview": "not-requested",
+  "durationMs": 515,
+  "browserCheck": {
+    "requested": true,
+    "ran": false
+  }
+}

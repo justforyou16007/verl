@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插课 E：SeparateAsync 的初始化 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>插课 E：SeparateAsync 的初始化</h2>
+  <ol>
+    <li><a href="#xe-0">0. trainer 是怎么选出来的</a></li>
+    <li><a href="#xe-1">1. 初始化分两段：__init__ 与 init()</a></li>
+    <li><a href="#xe-2">2. __init__ 前半：五条前置检查</a></li>
+    <li><a href="#xe-3">3. super().__init__：基类准备了什么</a></li>
+    <li><a href="#xe-4">4. __init__ 后半：要不要在训练 GPU 上放推理副本</a></li>
+    <li><a href="#xe-5">5. init() → _setup：子类插入的三个点</a></li>
+    <li><a href="#xe-6">6. 插入点①：worker 换成 DetachActorWorker</a></li>
+    <li><a href="#xe-7">7. 基类 _setup 的十步（只看和本模式相关的）</a></li>
+    <li><a href="#xe-8">8. 插入点②：拉起独立推理池</a></li>
+    <li><a href="#xe-9">9. 插入点③：on_init_end 推第一次权重</a></li>
+    <li><a href="#xe-10">10. 初始化完成后的样子</a></li>
+    <li><a href="#xe-11">11. 小结与思考题</a></li>
+    <li><a href="#xe-12">12. 追问：standalone 这三行到底在干什么</a>
+      <ol>
+        <li><a href="#xe-12-1">一句话</a></li>
+        <li><a href="#xe-12-2">三个参数</a></li>
+        <li><a href="#xe-12-3">create() 的三步</a></li>
+        <li><a href="#xe-12-4">副本数怎么算出来</a></li>
+        <li><a href="#xe-12-5">init_standalone：要 GPU、建 worker、起服务</a></li>
+        <li><a href="#xe-12-6">一个副本内部长什么样</a></li>
+        <li><a href="#xe-12-7">为什么 get_replicas() 对权重同步重要</a></li>
+        <li><a href="#xe-12-8">standalone 与 hybrid 的对照</a></li>
+      </ol>
+    </li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xd-k8s-identity.html">← 插课 D：k8s 身份</a></div>
+
+<h2 id="xe">插课 E：SeparateAsync 的初始化</h2>
+<div class="box ask"><b>提问</b>：<code>self.trainer = trainer_cls(config=config)</code> 这里会加载哪个 trainer？——带我一起看下 SeparateAsync 的 init。</div>
+<p class="meta">代码基于分支 <code>mimo-agent-env</code>（合入上游 321e4e45 后）。主文件 <code>verl/trainer/ppo/v1/trainer_separate_async.py</code>，基类在 <code>verl/trainer/ppo/v1/trainer_base.py</code>。</p>
+
+<h3 id="xe-0">0. trainer 是怎么选出来的</h3>
+<span class="src">verl/trainer/main_ppo.py:143</span>
+<pre><code>from verl.trainer.ppo.v1 import get_trainer_cls
+trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)
+...
+self.trainer = trainer_cls(config=config)   # ← 这一行只跑 __init__
+self.trainer.init()                         # ← 真正拉起 GPU 进程在这里
+self.init_agent_loop_manager()
+self.trainer.fit(self.agent_loop_manager)</code></pre>
+<p><code>import verl.trainer.ppo.v1</code> 时，<code>__init__.py</code> 会导入三个 trainer 文件，每个类上的 <code>@register_trainer("名字")</code> 把自己登记进 <code>TRAINER_REGISTRY</code> 字典；<code>get_trainer_cls</code> 只是按名字查这个字典。</p>
+<table>
+  <tr><th><code>trainer.v1.trainer_mode</code></th><th>类</th><th>一句话</th></tr>
+  <tr><td><code>sync</code>（默认）</td><td><code>PPOTrainerSync</code></td><td>生成完一批再训练，训练和推理共用 GPU 轮流用</td></tr>
+  <tr><td><code>colocate_async</code></td><td><code>PPOTrainerColocateAsync</code></td><td>仍共用 GPU，但提前预取下一批</td></tr>
+  <tr><td><code>separate_async</code></td><td><code>PPOTrainerSeparateAsync</code></td><td><b>训练和推理各占一批 GPU</b>，同时跑；本篇主角</td></tr>
+</table>
+
+<h3 id="xe-1">1. 初始化分两段：__init__ 与 init()</h3>
+<p>先建立全局印象。SeparateAsync 本身代码不多，大部分工作在基类里做，子类只在几个"钩子"上插入自己的逻辑（模板方法模式）：</p>
+<pre><code>trainer_cls(config)                    ── 只读配置、检查、建 Python 对象，不碰 GPU
+  PPOTrainerSeparateAsync.__init__
+    ├ ① 五条前置检查                                          §2
+    ├ ② super().__init__  → replay_buffer 等                 §3
+    └ ③ 决定 _enable_hybrid_replicas，可选初始化切换状态      §4
+
+trainer.init()                         ── 真正创建 Ray worker、加载模型、起推理服务
+  PPOTrainer.init
+    ├ self._setup()            （子类重写，先调 super）
+    │   PPOTrainerSeparateAsync._setup
+    │     ├ super()._setup()   基类十步                       §7
+    │     │    └ 其中调用 self._init_resource_pool_mgr()  ← 子类重写   §6
+    │     └ 独立推理池 + 第二个权重同步器 + 路由               §8
+    └ self.on_init_end()       （子类重写）推第一次权重        §9</code></pre>
+<div class="box key">记住一个关键变量：<b><code>_enable_hybrid_replicas</code></b>。它在 <code>__init__</code> 里定下来，之后被基类 <code>_init_resource_pool_mgr</code>、基类 <code>_setup</code> 第 9 步、子类 <code>_setup</code>、<code>on_init_end</code> 以及所有 switch 方法读取。它回答的问题是：<b>训练用的 GPU 上要不要也放一份推理引擎？</b> 默认是<b>不要</b>。</div>
+
+<h3 id="xe-2">2. __init__ 前半：五条前置检查</h3>
+<span class="src">trainer_separate_async.py:56</span>
+<pre><code>train_batch_size     = config.data.train_batch_size
+ppo_mini_batch_size  = config.actor_rollout_ref.actor.ppo_mini_batch_size
+parameter_sync_step  = config.trainer.v1.separate_async.parameter_sync_step   # 默认 4
+assert train_batch_size == parameter_sync_step * ppo_mini_batch_size            # (a)
+assert config.actor_rollout_ref.rollout.nnodes > 0                              # (b)
+assert config.actor_rollout_ref.rollout.n_gpus_per_node > 0                     # (b)
+assert config.actor_rollout_ref.rollout.checkpoint_engine.backend != "naive"    # (c)
+if need_reward_model(config):
+    assert config.reward.reward_model.enable_resource_pool                      # (d)</code></pre>
+<table>
+  <tr><th>检查</th><th>为什么</th></tr>
+  <tr><td>(a) <code>train_batch_size = parameter_sync_step × ppo_mini_batch_size</code></td>
+      <td>这个模式里，一个 step 不是"一大批数据做一次更新"，而是<b>连续做 <code>parameter_sync_step</code> 次小更新</b>，每次从 replay_buffer 取一个 mini-batch（基类 <code>step()</code>，<code>trainer_base.py:810</code> 的 for 循环）。做完这几次后才把新权重推给推理服务一次。等式保证"一次小更新 = 一个 mini-batch"，不会再在内部切分。</td></tr>
+  <tr><td>(b) <code>rollout.nnodes / n_gpus_per_node &gt; 0</code></td>
+      <td>推理要有<b>自己的</b> GPU。在 sync 模式里这两个值可以是 0（推理借用训练的 GPU）；这里必须单独指定，否则独立推理池没机器可用。</td></tr>
+  <tr><td>(c) 权重同步不能用 <code>naive</code></td>
+      <td><code>naive</code> 的意思是"推理引擎和训练在同一个进程、同一块 GPU 上，直接把权重交过去"（<code>checkpoint_engine/base.py:518</code>）。独立推理池在别的 GPU、甚至别的机器上，只能走 nccl / nixl / mooncake 这类跨进程通信。</td></tr>
+  <tr><td>(d) 奖励模型必须独立资源池</td>
+      <td>共用 GPU 的奖励模型需要推理"停下来让出显存"才能跑，而独立推理池<b>从不暂停</b>，所以只能给奖励模型单独的 GPU。</td></tr>
+</table>
+
+<h3 id="xe-3">3. super().__init__：基类准备了什么</h3>
+<span class="src">trainer_base.py:375</span>
+<pre><code>self.config = config
+self.use_critic / use_reference_policy / use_teacher_policy = need_xxx(config)
+self.trainer_mode = "separate_async"
+self.parameter_sync_step = config.trainer.v1.separate_async.parameter_sync_step   # 4
+self.replay_buffer = self._build_replay_buffer()
+self.local_trigger_step = 0          # 当前是这个 step 里的第几次小更新（0..3）</code></pre>
+<p>和本模式相关的两点：</p>
+<ul>
+  <li><b>replay_buffer 的类型</b>：没配自定义 sampler 时，<code>sync</code> 用 <code>ReplayBuffer</code>，其余模式用 <code>ReplayBufferAsync</code>（<code>trainer_base.py:414</code>）。异步版本允许取到"旧一点的权重生成的数据"，旧到什么程度由 <code>max_off_policy_threshold</code> 控制。</li>
+  <li><b><code>local_trigger_step</code></b>：§6 里 DetachActorWorker 存/取 CPU 副本时用它当编号。</li>
+</ul>
+<div class="box note">注意顺序：子类在调用 <code>super().__init__</code> <b>之后</b>才去读 <code>self.replay_buffer</code>（§4 检查它有没有 <code>wait_for_sampleable</code>），所以必须先调基类。</div>
+
+<h3 id="xe-4">4. __init__ 后半：要不要在训练 GPU 上放推理副本</h3>
+<span class="src">trainer_separate_async.py:91</span>
+<pre><code>self.hybrid_rollout_config = omega_conf_to_dataclass(
+    self.config.trainer.v1.separate_async.hybrid_rollout)      # HybridRolloutSwitchConfig
+if not config.actor_rollout_ref.get("hybrid_engine", True) and self.hybrid_rollout_config.enable_switch:
+    logger.warning("... enable_switch is ignored ...")
+    self.hybrid_rollout_config = replace(self.hybrid_rollout_config, enable_switch=False)
+self._enable_hybrid_replicas = self.hybrid_rollout_config.enable_switch</code></pre>
+<p>背景：训练 GPU 在"等数据"的时候是闲的。<code>enable_switch=True</code> 时，会在训练 GPU 上<b>也放一份推理引擎</b>（叫 hybrid 副本），训练闲下来就切成推理帮忙生成，数据够了再切回来训练。</p>
+<table>
+  <tr><th><code>actor_rollout_ref.hybrid_engine</code></th><th><code>hybrid_rollout.enable_switch</code></th><th>结果 <code>_enable_hybrid_replicas</code></th></tr>
+  <tr><td>True（默认）</td><td>False（默认）</td><td><b>False</b>：训练 GPU 只训练</td></tr>
+  <tr><td>True</td><td>True</td><td><b>True</b>：训练 GPU 空闲时借给推理</td></tr>
+  <tr><td>False</td><td>True</td><td>False，并打 warning（<code>hybrid_engine=False</code> 优先）</td></tr>
+  <tr><td>False</td><td>False</td><td>False</td></tr>
+</table>
+<p>默认关掉的理由写在注释里：hybrid 副本如果不切换，在正常训练时一直睡着，只在 warmup / 验证时有用，却要付出引擎初始化、启动时多一次权重同步、显存预留的代价。</p>
+
+<h4>enable_switch=True 时多做的事</h4>
+<pre><code>if self.hybrid_rollout_config.enable_switch:
+    if rollout.disaggregation.enabled: raise ValueError(...)        # 不支持 PD 分离
+    for m in ("wait_for_sampleable", "get_sampleable_count"):
+        if not hasattr(self.replay_buffer, m): raise TypeError(...)   # sampler 要能报告"攒够了没"
+    self._init_hybrid_rollout_state()</code></pre>
+<ul>
+  <li>PD 分离不支持：切换时要把副本暂停、让新请求排队，PD 分离的副本做不到。</li>
+  <li>sampler 必须能回答"现在有多少条可训练的数据"，否则 trainer 不知道什么时候该把 GPU 拿回来。</li>
+</ul>
+<p><code>_init_hybrid_rollout_state</code>（:134）只是初始化一组计数器，供运行时决定"何时切换"：</p>
+<table>
+  <tr><th>变量</th><th>含义</th></tr>
+  <tr><td><code>_switch_threshold_ratio</code></td><td>可训练数据达到 <code>train_batch_size × 比例</code>（默认 0.4）就把 GPU 收回训练</td></tr>
+  <tr><td><code>_idle_steps / _calm_steps</code></td><td>连续"训练在干等"/"没干等"的 step 数，用来自适应调高/调低阈值</td></tr>
+  <tr><td><code>_step_sample_wait_seconds</code>、<code>_wait_seconds</code> 等</td><td>每 step 等数据的耗时统计</td></tr>
+  <tr><td><code>_to_rollout_costs / _to_trainer_costs</code></td><td>最近 N 次（默认 3）切换的耗时，滑动窗口</td></tr>
+  <tr><td><code>_scaling_factor</code></td><td><code>(训练GPU + 推理GPU) / 推理GPU</code>：借出训练 GPU 后推理吞吐大约放大多少倍（代码里标了 TODO，是粗估）</td></tr>
+</table>
+
+<h3 id="xe-5">5. init() → _setup：子类插入的三个点</h3>
+<span class="src">trainer_base.py:475</span>
+<pre><code>def init(self):
+    self._setup()
+    self.on_init_end()</code></pre>
+<p>子类重写了三个方法，基类在合适的时机调用它们：</p>
+<table>
+  <tr><th>子类方法</th><th>被谁调用</th><th>作用</th></tr>
+  <tr><td><code>_init_resource_pool_mgr</code></td><td>基类 <code>_setup</code> 的第 4 行</td><td>把 actor worker 类换成 <code>DetachActorWorker</code>（§6）</td></tr>
+  <tr><td><code>_setup</code></td><td><code>init()</code></td><td>先跑基类全部，再拉独立推理池（§8）</td></tr>
+  <tr><td><code>on_init_end</code></td><td><code>init()</code></td><td>把加载好的权重推给推理（§9）</td></tr>
+</table>
+
+<h3 id="xe-6">6. 插入点①：worker 换成 DetachActorWorker</h3>
+<p>基类先决定 actor 用哪个"角色"（<code>trainer_base.py:1062</code>）：</p>
+<pre><code>if not self._enable_hybrid_replicas:
+    role = Role.Actor                       # 只训练，不带推理引擎
+else:
+    role = Role.ActorRolloutRef 或 Role.ActorRollout   # 训练 + 推理（+ ref）同进程
+self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
+if role == Role.Actor and 需要 ref:
+    self.role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)</code></pre>
+<p>然后子类把这些映射里的类统统替换（:120）：</p>
+<pre><code>super()._init_resource_pool_mgr()
+if Role.Actor in mapping:            mapping[Role.Actor] = DetachActorWorker
+                                     (有 RefPolicy 的话也换)
+elif Role.ActorRolloutRef in mapping: mapping[Role.ActorRolloutRef] = DetachActorWorker
+elif Role.ActorRollout in mapping:    mapping[Role.ActorRollout] = DetachActorWorker</code></pre>
+<p><b>为什么要换？</b> <code>DetachActorWorker</code> 继承 <code>ActorRolloutRefWorker</code>，只多了一个能力：<b>把当前模型参数存一份到 CPU，之后再还原</b>（<code>save_model_to_cpu(n)</code> / <code>restore_model_from_cpu(n)</code> / <code>clear_cpu_model(n)</code>，<code>verl/experimental/separation/engine_workers.py:139</code>）。</p>
+<p>用途在 <code>_compute_old_log_prob</code>（:201）：一个 step 里做 4 次小更新，第 2、3、4 次时 actor 已经被前面的小更新改过了。Decoupled PPO 要求这 4 次用<b>同一个</b> π_old 算 old_log_prob，所以：</p>
+<pre><code>local_trigger_step == 0：   当前权重就是 π_old → 存到 CPU 槽位 0 → 直接算
+local_trigger_step == k≥1： 当前权重存到槽位 k → 还原槽位 0（π_old）→ 算
+                            → 还原槽位 k（当前权重）→ 删掉槽位 k</code></pre>
+<div class="box note">如果开了 <code>rollout_correction.bypass_mode</code>，就不重算，直接用推理时记录的 logprob，也就用不到这个存取。</div>
+
+<h3 id="xe-7">7. 基类 _setup 的十步（只看和本模式相关的）</h3>
+<p>基类 <code>_setup</code>（<code>trainer_base.py:487</code>）对所有模式都一样，<a href="01-main-ppo.html#l1-3">第一课 §3</a> 讲过。这里只标出 SeparateAsync 下不同的地方：</p>
+<table>
+  <tr><th>步骤</th><th>做什么</th><th>SeparateAsync 下</th></tr>
+  <tr><td>前置</td><td>tokenizer、dataloader、资源池</td><td>资源池 <code>global_pool</code> 只按 <code>trainer.nnodes × n_gpus_per_node</code> 建，<b>不包含</b>推理 GPU</td></tr>
+  <tr><td>1–6</td><td>建 actor / ref / critic worker，<code>init_model()</code> 加载模型</td><td>worker 类是 <code>DetachActorWorker</code></td></tr>
+  <tr><td>7–8</td><td>奖励、teacher 管理器</td><td>奖励模型在独立池（§2 的检查 d）</td></tr>
+  <tr><td><b>9</b></td><td>建 <code>self.llm_server_manager</code></td><td>
+    <code>_enable_hybrid_replicas=True</code>：<code>LLMServerManager.create(worker_group=actor_wg)</code>，在训练 GPU 上起 hybrid 副本<br>
+    <code>False</code>（默认）：<code>LLMServerManager.create_empty()</code>，<b>一个副本都不起</b>，只建一个空的负载均衡器</td></tr>
+  <tr><td>10</td><td><code>self.checkpoint_manager</code>，强制 <code>backend="naive"</code></td><td>只管 hybrid 副本（默认是空列表）</td></tr>
+  <tr><td>收尾</td><td><code>sleep_replicas()</code>，<code>_load_checkpoint()</code></td><td>睡 hybrid 副本（默认是空操作）；从 checkpoint 恢复则设置 <code>global_steps</code></td></tr>
+</table>
+
+<h3 id="xe-8">8. 插入点②：拉起独立推理池</h3>
+<span class="src">trainer_separate_async.py:154</span>
+<pre><code>super()._setup()
+
+hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas)     # 默认 0
+standalone_config = deepcopy(self.config)
+if rollout.standalone_gpu_memory_utilization is not None:
+    standalone_config...gpu_memory_utilization = standalone_gpu_memory_utilization
+self.standalone_server_manager = LLMServerManager.create(
+    config=standalone_config, start_rank=hybrid_num_replicas)           # (1)
+
+if rollout.prometheus.enable:
+    update_prometheus_config(..., hybrid 地址 + standalone 地址, ...)   # (2)
+
+self.standalone_checkpoint_manager = CheckpointEngineManager(
+    config=checkpoint_engine 配置（nccl 等，不改成 naive）,
+    actor_wg=self.actor_rollout_wg,
+    replicas=self.standalone_server_manager.get_replicas())             # (3)
+
+if self._enable_hybrid_replicas:                                        # (4)
+    self.current_mode = HybridEngineMode.ROLLOUT
+    self.add_replicas_to_balancer()
+else:
+    self.current_mode = HybridEngineMode.TRAINER</code></pre>
+
+<h4>(1) 独立推理池</h4>
+<ul>
+  <li>没传 <code>worker_group</code>，所以 <code>LLMServerManager</code> 走 standalone 分支（<code>llm_server.py:501</code> 的 <code>init_standalone()</code>）：自己申请 <code>rollout.nnodes × rollout.n_gpus_per_node</code> 块新 GPU。</li>
+  <li>副本数 = 推理 GPU 总数 ÷ (TP × DP × PP)。</li>
+  <li><code>start_rank</code>：副本编号从 hybrid 副本数开始，避免两个管理器起出同名的 Ray actor。</li>
+  <li>显存比例可以单独设：独立副本的 GPU 不用给训练留空间，可以设得更高。用 <code>deepcopy</code> 是为了不影响 hybrid 副本那份配置。</li>
+  <li><code>create()</code> 最后还会建一个<b>全局负载均衡器</b>（<code>standalone_server_manager.global_load_balancer</code>），所有生成请求都经过它分发。</li>
+</ul>
+
+<h4>(3) 两个权重同步器</h4>
+<table>
+  <tr><th></th><th><code>checkpoint_manager</code>（基类建）</th><th><code>standalone_checkpoint_manager</code>（子类建）</th></tr>
+  <tr><td>目标</td><td>hybrid 副本（同进程同 GPU）</td><td>独立副本（别的 GPU / 机器）</td></tr>
+  <tr><td>backend</td><td>强制 <code>naive</code>：直接交过去</td><td>配置的 nccl / nixl / mooncake：建通信组广播</td></tr>
+  <tr><td>默认情况</td><td>副本列表为空，等于没用</td><td>真正干活的那个</td></tr>
+</table>
+<p>非 naive 的 <code>update_weights</code>（<code>checkpoint_engine/base.py:510</code>）流程：中止进行中的请求并保存 → 释放 KV cache → 建通信组 → actor 发、推理收 → 恢复 KV cache → <b>继续刚才中止的请求</b>。最后一步就是"partial rollout"：生成到一半的轨迹换了权重接着生成。</p>
+
+<h4>(4) 初始模式</h4>
+<ul>
+  <li>开了 hybrid：模式设为 ROLLOUT，并把 hybrid 副本的地址加进独立池的负载均衡器——从此负载均衡器同时向两种副本派请求。</li>
+  <li>默认：模式固定为 TRAINER，所有 <code>switch_to_rollout / switch_to_trainer / add/remove_replicas_*</code> 一进来就 <code>return</code>，变成空操作。</li>
+</ul>
+
+<h3 id="xe-9">9. 插入点③：on_init_end 推第一次权重</h3>
+<span class="src">trainer_separate_async.py:238</span>
+<pre><code>def on_init_end(self):
+    self.standalone_checkpoint_manager.update_weights(self.global_steps)
+    if self._enable_hybrid_replicas:
+        self.checkpoint_manager.update_weights(self.global_steps)</code></pre>
+<p>推理服务启动时加载的是 <code>model.path</code> 的原始权重；如果刚才 <code>_load_checkpoint</code> 恢复了训练到一半的 actor，两边就不一致。这里把 actor 当前的权重推一次，并带上 <code>global_steps</code> 作为版本号——之后 replay_buffer 判断"数据有多旧"就靠这个版本号。</p>
+
+<h4>顺带：init 之后 main_ppo 拿到的 client</h4>
+<pre><code>def get_llm_client(self):       # :227
+    return self.standalone_server_manager.get_client(client_cls=FullyAsyncLLMServerClient)</code></pre>
+<p><code>TaskRunnerV1.init_agent_loop_manager</code> 用这个 client 构造 agent loop 管理器。<code>FullyAsyncLLMServerClient</code> 的特点是：请求被权重同步中断后会自动续上，agent loop 感觉不到中断。client 连的是独立池的负载均衡器，所以开了 hybrid 时也能自动用上 hybrid 副本。</p>
+
+<h3 id="xe-10">10. 初始化完成后的样子</h3>
+<pre><code>默认（enable_switch=False）
+
+  训练 GPU（trainer.nnodes × n_gpus_per_node）      推理 GPU（rollout.nnodes × n_gpus_per_node）
+  ┌──────────────────────────────┐                ┌──────────────────────────────┐
+  │ DetachActorWorker × N        │   nccl 等      │ 独立推理副本 × M              │
+  │  (Role.Actor，只训练)         │ ─────────────▶ │  standalone_server_manager   │
+  │  + RefPolicy worker（如需要）│ standalone_    │  global_load_balancer ◀──────┼── agent loop
+  │ llm_server_manager = 空       │ checkpoint_    └──────────────────────────────┘   (FullyAsync client)
+  │ checkpoint_manager  = 空      │ manager
+  └──────────────────────────────┘
+  current_mode = TRAINER（永不切换）
+
+enable_switch=True 多出来的部分
+
+  训练 GPU 上每个 worker 是 ActorRollout(Ref)，同进程带一份推理引擎（hybrid 副本）
+  checkpoint_manager（naive）负责给它们换权重
+  hybrid 副本地址被加进同一个 global_load_balancer
+  current_mode 初始 = ROLLOUT；运行时按 §4 的阈值在 TRAINER / ROLLOUT 之间切换</code></pre>
+
+<h3 id="xe-11">11. 小结与思考题</h3>
+<div class="box key">
+<ul>
+  <li><code>trainer_cls(config)</code> 只做检查和建 Python 对象；GPU 上的东西全在 <code>trainer.init()</code> 里建。</li>
+  <li>SeparateAsync = 基类全部流程 + 三个钩子：换 worker 类（为了存/取 π_old）、额外起一个独立推理池和一个跨机权重同步器、启动后推一次权重。</li>
+  <li><code>_enable_hybrid_replicas</code> 决定训练 GPU 上要不要放推理副本，默认不放；开了才有"闲时借 GPU 给推理"的切换逻辑。</li>
+  <li>前置检查 (b)(c)(d) 都源于同一个事实：推理在<b>别的 GPU 上、从不暂停</b>；(a) 则保证一次小更新正好吃一个 mini-batch。</li>
+</ul>
+</div>
+<details><summary>思考题 1：如果 train_batch_size=256、ppo_mini_batch_size=64，但 parameter_sync_step 保持默认 4，会怎样？换成 parameter_sync_step=1 呢？</summary>
+<p>256 = 4 × 64，检查通过：每个 step 做 4 次小更新，推一次权重。改成 1 则 256 ≠ 64，<code>__init__</code> 直接 assert 失败；需要把 mini-batch 也改成 256，变成"一次更新一次同步"，此时 <code>local_trigger_step</code> 永远是 0，DetachActorWorker 的还原逻辑不会触发。</p></details>
+<details><summary>思考题 2：默认配置下 base 的 checkpoint_manager 还有用吗？</summary>
+<p>副本列表为空，<code>sleep_replicas</code> / <code>update_weights</code> 对它都不起作用；<code>on_init_end</code> 和 switch 方法也都会因为 <code>_enable_hybrid_replicas=False</code> 跳过它。它存在只是因为基类 <code>_setup</code> 对所有模式统一建。</p></details>
+<details><summary>思考题 3：为什么 standalone 副本的编号要从 hybrid 副本数开始？</summary>
+<p>两个 <code>LLMServerManager</code> 都会以 <code>replica_rank</code> 起名创建 Ray 命名 actor；如果都从 0 开始，开了 hybrid 时会撞名（<code>llm_server.py:446</code> 的注释）。</p></details>
+<div class="box warn">本篇只读代码得出，没有实际运行验证。下一步可以接着看运行期：<code>on_step_begin / prepare_step / _wait_for_sampleable_and_switch / on_step_end</code>（切换阈值如何自适应、何时推权重）。</div>
+
+<h3 id="xe-12">12. 追问：standalone 这三行到底在干什么</h3>
+<div class="box ask"><b>提问</b>：（选中 <code>trainer_separate_async.py:167-169</code>）standalone 这部分在干吗？</div>
+
+<h4 id="xe-12-1">12.1 一句话</h4>
+<pre><code>self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
+    config=standalone_config, start_rank=hybrid_num_replicas
+)</code></pre>
+<div class="box key">这三行是"separate"这个名字的全部含义所在：<b>在训练 GPU 之外的另一批 GPU 上，真正把推理服务进程拉起来</b>——申请 GPU、起 M 个 SGLang/vLLM HTTP 服务、再建一个路由入口，让 agent loop 把生成请求发进去。<br>
+§8 里基类建的那个 <code>self.llm_server_manager</code> 默认是<b>空的</b>（<code>create_empty</code>，一个副本都没有）。所以默认配置下，<b>全训练过程中唯一真正提供生成能力的就是这里创建的这一套</b>。</div>
+
+<h4 id="xe-12-2">12.2 三个参数</h4>
+<table>
+  <tr><th>参数</th><th>值</th><th>为什么</th></tr>
+  <tr><td><code>config</code></td><td><code>standalone_config</code>（<code>deepcopy</code> 来的）</td><td>要改 <code>gpu_memory_utilization</code>：独立副本独占 GPU，不用给训练留显存，可以调得更高（<code>rollout.standalone_gpu_memory_utilization</code>）。深拷贝是为了不污染原 config——hybrid 副本和训练共享 GPU，必须用原来那个更保守的比例。</td></tr>
+  <tr><td><b>没传</b> <code>worker_group</code></td><td><code>None</code></td><td><b>这是 standalone 与 hybrid 的分叉点。</b>hybrid 要传训练 worker group（推理引擎塞进训练进程里），这里不传 → 走"自己去要新 GPU"的分支。</td></tr>
+  <tr><td><code>start_rank</code></td><td><code>hybrid_num_replicas</code>（默认 0）</td><td>副本编号的起点。编号会进 Ray 命名 actor 的名字，两套管理器都从 0 开始就会撞名（见 12.6）。</td></tr>
+</table>
+
+<h4 id="xe-12-3">12.3 create() 的三步</h4>
+<span class="src">verl/workers/rollout/llm_server.py:418</span>
+<pre><code>@classmethod
+@auto_await
+async def create(cls, *args, **kwargs):
+    instance = cls(*args, **kwargs)              # ① __init__：只存配置、选副本类
+    await instance._initialize_llm_servers()     # ② 真正起服务（耗时在这里）
+    await instance._init_global_load_balancer()  # ③ 建路由
+    return instance</code></pre>
+<p>注意这是 <b>classmethod + <code>auto_await</code></b>：构造过程里有大量异步等待（起进程、等 HTTP 端口就绪），不能写在 <code>__init__</code> 里，所以用 <code>create()</code> 当工厂方法；<code>auto_await</code> 让同步代码也能像普通函数一样调用它。</p>
+<p>① 里只做两件事：<code>assert worker_group is not None or rollout.nnodes &gt; 0</code>（就是 §2 检查 (b) 的兜底），以及按 <code>rollout.name</code> 选副本类（<code>get_rollout_replica_class</code>，sglang / vllm / trtllm，开了 PD 分离则选 PD 版本）。</p>
+
+<h4 id="xe-12-4">12.4 副本数怎么算出来</h4>
+<span class="src">verl/workers/rollout/llm_server.py:442</span>
+<pre><code>rollout_world_size = TP × DP × PP                       # 一个副本要几块 GPU
+world_size = (self.worker_group.world_size if self.worker_group      # hybrid 分支
+              else rollout.n_gpus_per_node × rollout.nnodes)         # ← standalone 走这里
+num_replicas = world_size // rollout_world_size
+
+self.rollout_replicas = [
+    self.rollout_replica_class(replica_rank=start_rank + i, ...)
+    for i in range(num_replicas)
+]
+if self.worker_group ...:  await gather(*[s.init_hybrid(worker_group) ...])
+else:                      await gather(*[s.init_standalone() for s in self.rollout_replicas])  # ← 这里</code></pre>
+<p>举个数：<code>rollout.nnodes=2, n_gpus_per_node=8</code> → 16 块推理 GPU；<code>TP=4, DP=1, PP=1</code> → 每副本 4 块 → <b>起 4 个副本</b>，<code>replica_rank</code> = 0,1,2,3（默认 <code>start_rank=0</code>）。四个副本的 <code>init_standalone()</code> 用 <code>asyncio.gather</code> <b>并行</b>拉起。</p>
+
+<h4 id="xe-12-5">12.5 init_standalone：要 GPU、建 worker、起服务</h4>
+<span class="src">verl/workers/rollout/replica.py:189</span>
+<pre><code>self.rollout_mode = RolloutMode.STANDALONE
+if resource_pool is None:                                  # trainer 没传，走这里
+    resource_pool_spec = {f"rollout_pool_{replica_rank}": [gpus_per_replica_node] * nnodes}
+    ResourcePoolManager(..., max_colocate_count=2).create_resource_pool()   # ①
+
+worker_group = RayWorkerGroup(                                               # ②
+    resource_pool=self.resource_pool,
+    ray_cls_with_init=self.get_ray_class_with_init_args(),   # → CheckpointEngineWorker
+    bin_pack=False,
+    name_prefix=f"rollout_standalone_{replica_rank}",
+    use_gpu=get_platform().supports_colocated_worker_groups(),
+)
+self.workers = worker_group.workers
+await self.launch_servers()                                                  # ③</code></pre>
+<table>
+  <tr><th>步</th><th>做什么</th><th>要点</th></tr>
+  <tr><td>①</td><td><b>每个副本自己建一个 Ray 资源池</b>（placement group）</td><td>这就是"独立"的实现方式：<b>不经过</b> trainer 的 <code>resource_pool_manager</code>（那个只圈了训练 GPU），而是直接向 Ray 申请新的 GPU bundle。<code>max_colocate_count=2</code> 允许同一块 GPU 上放两类进程（下面的 worker 和引擎自己的进程）。</td></tr>
+  <tr><td>②</td><td>在这些 GPU 上建一组 <code>CheckpointEngineWorker</code></td><td>这组 worker <b>不是推理引擎本身</b>，而是<b>权重同步的接收端</b>（12.7）。注释说明它们与引擎自己的进程共享同一块设备，所以 TPU 这种不能共享设备的平台上 <code>use_gpu=False</code>、不去占卡。</td></tr>
+  <tr><td>③</td><td><code>launch_servers()</code> 起 HTTP 服务</td><td>后端各自实现（SGLang 版在 <code>async_sglang_server.py:852</code>）。</td></tr>
+</table>
+
+<h4 id="xe-12-6">12.6 一个副本内部长什么样</h4>
+<p>以 SGLang 为例，<code>launch_servers</code> 的流程：</p>
+<ol>
+  <li>问每个 worker 自己在哪个节点、拿到了哪些 <code>CUDA_VISIBLE_DEVICES</code>。</li>
+  <li>按节点分组，<b>每个节点起一个 server actor</b>，名字 <code>sglang_server_{replica_rank}_{node_rank}</code>，用 <code>NodeAffinitySchedulingStrategy(soft=False)</code> <b>硬绑</b>到那个节点，并把该节点的 GPU 列表传进去。</li>
+  <li><code>max_concurrency</code> = <code>max_num_seqs</code> + 控制调用预留：多出来的请求在 Ray 层排队，而不是堆进引擎内部。</li>
+  <li>多节点副本（如 TP=16 跨两台 8 卡机）先从 node_rank 0 取 master 地址，再并行 <code>launch_server</code>。</li>
+  <li>最后把 <b>node_rank 0 的 server 记作这个副本的代表</b>：<code>_server_handle</code> / <code>_server_address</code>。后续 <code>abort_all_requests</code>、<code>resume_generation</code> 这些控制调用也只发给它（SGLang 只有 0 号服务响应控制 RPC）。</li>
+</ol>
+<div class="box note"><b>这就回答了思考题 3：</b><code>replica_rank</code> 直接进 Ray 命名 actor 的名字（<code>sglang_server_0_0</code>、worker group 的 <code>name_prefix</code>、资源池名 <code>rollout_pool_0</code>）。Ray 的命名 actor 全局唯一，开了 hybrid 时两套副本都从 0 编号就会撞名——所以 <code>start_rank=hybrid_num_replicas</code> 把独立副本的编号接在 hybrid 副本之后。</div>
+<p>回到管理器：拿到所有副本的 <code>_server_address</code> / <code>_server_handle</code> 后，<code>_init_global_load_balancer</code> 用这些地址建路由 actor（<code>global_load_balancer</code>）。<code>get_llm_client()</code> 返回的 client 只持有这个路由的句柄，所以 agent loop 不需要知道有几个副本、在哪台机器上。</p>
+
+<h4 id="xe-12-7">12.7 为什么 get_replicas() 对权重同步重要</h4>
+<p>紧接着的 <code>standalone_checkpoint_manager</code> 传的是 <code>self.standalone_server_manager.get_replicas()</code>，也就是上面这些 <code>RolloutReplica</code> 对象。权重同步时（<code>checkpoint_engine/base.py:510</code>）：</p>
+<pre><code>workers = []
+for replica in self.replicas:
+    workers.extend(replica.workers)        # ← 12.5 步②建的 CheckpointEngineWorker
+rollout = RayWorkerGroup(worker_handles=workers, ...)   # 临时拼一个 worker group
+... build_process_group(rollout) → actor 发 / rollout 收</code></pre>
+<p>也就是说：<b>HTTP 服务负责对外生成，<code>replica.workers</code> 负责对内收权重</b>，两者在同一批 GPU 上。这也解释了 §2 检查 (c) 为什么禁止 <code>naive</code>——naive 直接让 actor 自己换权重（<code>backend == "naive"</code> 时 <code>update_weights</code> 第一行就 return 了），根本不走这个跨进程通信组。</p>
+
+<h4 id="xe-12-8">12.8 standalone 与 hybrid 的对照</h4>
+<table>
+  <tr><th></th><th>hybrid 副本（<code>init_hybrid</code>）</th><th>独立副本（<code>init_standalone</code>）</th></tr>
+  <tr><td>GPU 从哪来</td><td>复用训练 worker group 的 GPU</td><td>自己向 Ray 申请新的资源池</td></tr>
+  <tr><td>副本数依据</td><td>训练 world_size ÷ (TP×DP×PP)</td><td><code>rollout.nnodes × n_gpus_per_node</code> ÷ (TP×DP×PP)</td></tr>
+  <tr><td>与训练的关系</td><td>同进程，抢同一块显存，要睡/醒</td><td>完全分开，<b>从不暂停</b></td></tr>
+  <tr><td>权重同步</td><td><code>naive</code>，进程内直接给</td><td>nccl / nixl / mooncake 通信组</td></tr>
+  <tr><td>默认是否存在</td><td>否（<code>create_empty</code>）</td><td><b>是</b>，这三行创建</td></tr>
+</table>
+<pre><code>LLMServerManager.create(standalone_config, start_rank=0)
+ ├ __init__                     选副本类（sglang / vllm / trtllm / PD）
+ ├ _initialize_llm_servers      16 卡 ÷ TP4 = 4 个副本，并行 init_standalone()
+ │   └ 每个副本：
+ │       ├ 建资源池 rollout_pool_{rank}      ← 新 GPU，不走 trainer 的池
+ │       ├ RayWorkerGroup(CheckpointEngineWorker)   ← 权重接收端
+ │       └ launch_servers()  每节点一个 sglang_server_{rank}_{node}（硬绑节点）
+ │             └ 记下 node_rank 0 为副本代表（地址 + 句柄）
+ └ _init_global_load_balancer   用 4 个地址建路由 → get_llm_client() 给 agent loop</code></pre>
+</main>
+</body>
+</html>

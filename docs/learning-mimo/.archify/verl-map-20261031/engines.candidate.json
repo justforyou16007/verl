@@ -1,0 +1,490 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "推理引擎内部：vLLM v0.32.0 与 SGLang v0.5.20",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-engines.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "components": [
+    {
+      "id": "verl",
+      "type": "backend",
+      "label": "① verl ServerAdapter",
+      "sublabel": "按 (name, mode) 选后端",
+      "pos": [
+        40,
+        180
+      ],
+      "size": [
+        160,
+        80
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/rollout/base.py",
+          "line": 89,
+          "end_line": 110,
+          "label": "_ROLLOUT_REGISTRY"
+        }
+      ]
+    },
+    {
+      "id": "vfront",
+      "type": "external",
+      "label": "② AsyncLLM 前端",
+      "sublabel": "Ray actor 进程内",
+      "pos": [
+        240,
+        40
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "vcore",
+      "type": "external",
+      "label": "③ EngineCoreProc",
+      "sublabel": "独立 OS 进程",
+      "pos": [
+        440,
+        40
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "vsched",
+      "type": "external",
+      "label": "④ Scheduler",
+      "sublabel": "连续批 + 分块 prefill",
+      "pos": [
+        640,
+        40
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "vexec",
+      "type": "external",
+      "label": "⑤ MultiprocExecutor",
+      "sublabel": "spawn 每个 TP rank",
+      "pos": [
+        840,
+        40
+      ],
+      "size": [
+        160,
+        80
+      ],
+      "tag": "backend = mp"
+    },
+    {
+      "id": "vrun",
+      "type": "external",
+      "label": "⑥ GPUModelRunner",
+      "sublabel": "每 worker 一个",
+      "pos": [
+        1040,
+        40
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "vkv",
+      "type": "external",
+      "label": "⑦ KV cache 块",
+      "sublabel": "CuMem 池，带标签",
+      "pos": [
+        1040,
+        170
+      ],
+      "size": [
+        160,
+        80
+      ],
+      "tag": "weights / kv_cache"
+    },
+    {
+      "id": "sfront",
+      "type": "external",
+      "label": "⑧ TokenizerManager",
+      "sublabel": "asyncio，主进程",
+      "pos": [
+        240,
+        330
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "ssched",
+      "type": "external",
+      "label": "⑨ Scheduler 子进程",
+      "sublabel": "每个 (pp, tp) 一个",
+      "pos": [
+        440,
+        330
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "stpw",
+      "type": "external",
+      "label": "⑩ TpModelWorker",
+      "sublabel": "Scheduler 内的对象",
+      "pos": [
+        640,
+        330
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "srun",
+      "type": "external",
+      "label": "⑪ ModelRunner",
+      "sublabel": "权重 / 图 / 注意力后端",
+      "pos": [
+        840,
+        330
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "sradix",
+      "type": "external",
+      "label": "⑫ RadixAttention",
+      "sublabel": "前缀树 + KV 池",
+      "pos": [
+        1040,
+        330
+      ],
+      "size": [
+        160,
+        80
+      ]
+    },
+    {
+      "id": "sdetok",
+      "type": "external",
+      "label": "⑬ DetokenizerManager",
+      "sublabel": "独立子进程",
+      "pos": [
+        440,
+        460
+      ],
+      "size": [
+        160,
+        80
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "vLLM v0.32.0 · 5df63a7",
+      "wraps": [
+        "vfront",
+        "vcore",
+        "vsched",
+        "vexec",
+        "vrun",
+        "vkv"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "SGLang v0.5.20 · 94602c9",
+      "wraps": [
+        "sfront",
+        "ssched",
+        "stpw",
+        "srun",
+        "sradix",
+        "sdetok"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "e1",
+      "from": "verl",
+      "to": "vfront",
+      "label": "Ray RPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e2",
+      "from": "verl",
+      "to": "sfront",
+      "label": "Ray RPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e3",
+      "from": "vfront",
+      "to": "vcore",
+      "label": "ZMQ msgpack"
+    },
+    {
+      "id": "e4",
+      "from": "vcore",
+      "to": "vsched",
+      "label": "busy loop"
+    },
+    {
+      "id": "e5",
+      "from": "vsched",
+      "to": "vexec",
+      "label": "每步一批"
+    },
+    {
+      "id": "e6",
+      "from": "vexec",
+      "to": "vrun",
+      "label": "共享内存环"
+    },
+    {
+      "id": "e7",
+      "from": "vrun",
+      "to": "vkv",
+      "label": "分页读写",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "e8",
+      "from": "sfront",
+      "to": "ssched",
+      "label": "ZMQ ipc://"
+    },
+    {
+      "id": "e9",
+      "from": "ssched",
+      "to": "stpw",
+      "label": "进程内"
+    },
+    {
+      "id": "e10",
+      "from": "stpw",
+      "to": "srun",
+      "label": "前向"
+    },
+    {
+      "id": "e11",
+      "from": "srun",
+      "to": "sradix",
+      "label": "前缀匹配"
+    },
+    {
+      "id": "e12",
+      "from": "ssched",
+      "to": "sdetok",
+      "label": "ZMQ PUSH",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "e13",
+      "from": "sdetok",
+      "to": "sfront",
+      "label": "回传文本",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "slate",
+      "title": "① verl ServerAdapter — 后端怎么选出来",
+      "items": [
+        "<b>触发</b>：hybrid 时由 engine_workers 构造；colocated / standalone 时由 CheckpointEngineWorker.__init__ 构造。",
+        "<b>为什么用字符串注册表</b>：值是 FQN 字符串、importlib 懒加载，避免在非目标后端的机器上 import 失败。",
+        "<b>怎么分派</b>：_ROLLOUT_REGISTRY 以 (name, mode) 为键；mode 实际只有 async 可达（sync 直接 raise）。",
+        "接口只有四个：resume(tags)、update_weights(weights, wire_format)、release()、generate_sequences()——最后一个在 vLLM 下直接 NotImplementedError。",
+        "源码：verl/workers/rollout/base.py:29-110；两个构造点 engine_workers.py:711-714、checkpoint_engine/base.py:342-349"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "② vLLM AsyncLLM 前端 — 住在 Ray actor 进程里",
+      "items": [
+        "<b>触发</b>：server actor 的 launch_server，node_rank == 0 时走 run_server。",
+        "<b>为什么是这种接法</b>：verl 自己拼出 `vllm serve <model> ...` 的 <b>argv 列表</b>，再建 FlexibleArgumentParser、注册 vLLM 自己的 CLI 子命令、parse_args——而不是直接构造 Python 配置对象。这样能复用 vLLM 全部的参数校验与默认值逻辑。",
+        "<b>配置构造顺序</b>：AsyncEngineArgs.from_cli_args → create_engine_config，内部 DeviceConfig → create_model_config → CacheConfig → ParallelConfig → create_speculative_config → SchedulerConfig → create_load_config → VllmConfig。",
+        "<b>前端自己的构造顺序</b>：renderer → InputProcessor → OutputProcessor → EngineCoreClient.make_async_mp_client（<b>这一步 fork 出引擎核心进程</b>）→ StatLoggerManager → _run_output_handler()。",
+        "node_rank > 0 的节点改跑 run_headless：api_server_count=0，在线程里跑，一旦返回就 os._exit(1)。源码：vllm_async_server.py:290、:510-588；async_llm.py:241、:87"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "③ EngineCoreProc — 独立进程里的忙循环",
+      "items": [
+        "<b>触发</b>：make_async_mp_client 时被 fork 出来。",
+        "<b>为什么要独立进程</b>：调度与 GPU 执行不能被前端的 asyncio 事件循环拖慢；ZMQ 把两者彻底解耦。",
+        "<b>构造顺序</b>：load_general_plugins() → <b>executor_class(vllm_config)</b>（执行器、worker、模型全在这一步起来）→ measure_encoder_output_widths → <b>_initialize_kv_caches</b> → StructuredOutputManager → get_scheduler_cls() → Scheduler(...) → 可选 batch queue → freeze_gc_heap()。",
+        "<b>通道</b>：MPClient 建 ZMQ 上下文，输入是 ROUTER、输出是 PULL；请求 msgpack 序列化后推进来，由 process_input_sockets 线程反序列化丢进 input_queue。",
+        "step_fn 的选择：max_concurrent_batches > 1 时用 step_with_batch_queue，否则 step。DP 时客户端类型还会变（AsyncMPClient / DPLBAsyncMPClient / DPAsyncMPClient）。源码：core.py:118-258、:1128、:1831、:1547-1558"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "④ vLLM Scheduler — 连续批处理的实际规则",
+      "items": [
+        "<b>触发</b>：忙循环每一轮调一次 schedule()。",
+        "<b>为什么有两个预算</b>：token_budget = max_num_scheduled_tokens 限制总计算量，input_budget = max_num_batched_tokens 限制实际入模 token（还要为每请求扣 draft_slots）。",
+        "<b>先排已在跑的</b>。分块 prefill 裁剪链：num_tokens_with_spec + num_output_placeholders − num_computed_tokens → long-prefill 上限 → min(token_budget, input_budget − draft_slots) → max_model_len 裁剪 → mamba 块对齐 → encoder 输入可再压 → 预留 lookahead。裁到 0 就跳过该请求继续下一个——<b>这里故意打破了严格 FCFS</b>，代码注释写明了。",
+        "<b>再排等待队列</b>，但整段以 not preempted_reqs 为前提：<b>这一步抢占过谁，就一个新请求都不收</b>。关掉分块 prefill 时，装不下的请求直接 break（不切块、不抢占）。",
+        "<b>抢占</b>：FCFS 选 self.running[-1]（最新的），PRIORITY 选 (priority, arrival_time) 最大的；被抢占者 free 掉 KV、num_computed_tokens 归零、<b>prepend</b> 回等待队列；恢复时重做前缀查找并<b>整表替换</b>块表。源码：sched/scheduler.py:591、:657-887、:899-1401、:1571-1614"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "⑤ MultiprocExecutor — verl 用的就是这个后端",
+      "items": [
+        "<b>触发</b>：EngineCore 构造时 executor_class(vllm_config)。",
+        "<b>为什么是 mp 而不是 external_launcher</b>：verl 把 distributed_executor_backend <b>硬编码</b>成 \"mp\"（vllm_async_server.py:350），走的是 vLLM 自己 fork worker 的路，不是协同 RL 常见的外部启动器。",
+        "<b>_init_executor 顺序</b>：算并行尺寸并断言 world_size == tp×pp×pcp → set_multiprocessing_worker_envs（强制 spawn、钉 OMP_NUM_THREADS）→ 建 distributed_init_method → <b>建 rpc_broadcast_mq</b> 并 export_handle() → 逐 rank fork WorkerProc → wait_for_ready → 起监视线程 → 接 response_mqs。",
+        "<b>握手顺序不能换</b>：先 rpc_broadcast_mq.wait_until_ready()，再等各 response MQ——注释写了「换顺序会死锁」。广播通道不是 ZMQ 而是 <b>ShmRingBuffer 共享内存环形缓冲</b> + ZMQ XPUB/SUB 做通知。",
+        "<b>output_rank = world_size − tp_size × pcp_size</b>，即最后一个 PP stage 的 TP rank 0；只有它的输出被回收。is_driver_worker = (rank % tp_size == 0)。源码：multiproc_executor.py:118-267、:548；分派表 executor/abstract.py:64-110"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "⑥ Worker 与 GPUModelRunner — 权重落在哪个池",
+      "items": [
+        "<b>触发</b>：WorkerProc 子进程里先 init_device() 再 load_model()。",
+        "<b>为什么分布式初始化要在显存快照之前</b>：注释写得很直白——这样测可用显存时 NCCL 缓冲已经在里面了。顺序是 set_device → init_distributed_environment → ensure_model_parallel_initialized → 拍 MemorySnapshot → 之后才 load_model。",
+        "<b>关键一行</b>：load_model 时 <code>with self._maybe_get_memory_pool_context(tag=\"weights\")</code>，再配 set_current_vllm_config 和临时 max_split_size_mb=20。<b>权重因此落在 CuMem 池的 weights 标签下</b>——这正是 sleep / wake 能分别处理权重与 KV 的根因。",
+        "<b>verl 还插一刀</b>：HTTP app 起来之前 collective_rpc(\"monkey_patch_model\", ...)，这是 verl 自己注入的扩展方法。",
+        "每步输入准备：_update_states 维护 block_ids（resumed_from_preemption 时整表替换）→ append_row → commit_block_table（<b>唯一一次 H2D 拷贝</b>）→ compute_slot_mapping（Triton kernel）→ _build_attention_metadata。源码：gpu_worker.py:436-545、:587-595；gpu_model_runner.py:1418-1449、:1940"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑦ KV cache — 块是元数据，内存是一整块",
+      "items": [
+        "<b>触发</b>：_initialize_kv_caches → initialize_from_config → Worker.initialize_from_config。",
+        "<b>为什么块不持有内存</b>：KVCacheBlock 只是「block_id + ref_cnt + hash」这样的元数据；真正的显存是每 worker <b>一块扁平 int8 缓冲</b>，各层用 torch.as_strided 开视图。这样一次分配就能覆盖所有层，避免碎片。",
+        "<b>一个全注意力层看到的形状</b>：[num_blocks, num_kv_heads, block_size, head_size + head_size_v]；FlashAttention 用的时候再 kv_cache.transpose(1,2).split(head_size, dim=-1) 拆成 key/value。",
+        "<b>空闲块的两端策略</b>：手写侵入式双向链表支持 O(1) 中间删除；<b>未哈希的块 LIFO 入队</b>（保局部性），<b>已哈希的块 FIFO 入队</b>（近似 LRU 淘汰）。块 0 永久保留为 null block。",
+        "<b>容量判断只有一处</b>：num_blocks_to_allocate + watermark_blocks > free_blocks − reserved_blocks 就 return None，调度器据此决定抢占或不收。源码：kv_cache_utils.py:175、:246；block_pool.py:136-198、:666-805；worker/utils.py:564-627"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑦′ 前缀缓存与淘汰",
+      "items": [
+        "<b>怎么哈希</b>：按 hash_block_size 对齐的整块做<b>链式</b>哈希（父哈希参与），extra_keys 里带多模态、LoRA、prompt-embeds 和 cache_salt。",
+        "<b>怎么匹配</b>：逐块比对，<b>第一个 miss 就 break</b>——链式哈希保证后面必然全 miss。",
+        "<b>最大命中长度是 num_tokens − 1</b>：最后一个 token 必须重算才能拿到 logits。",
+        "<b>淘汰是隐式的</b>：分配新块时顺带 _maybe_evict_cached_block，顺序就是空闲队列顺序。reset_prefix_cache 是显式入口，文档里就写明给 RLHF 权重更新用——verl 的 clear_kv_cache 最终打到这里。",
+        "<b>v0.32.0 里 cascade attention 已被移除</b>：get_num_common_prefix_blocks 恒返回 0，相关字段是死的，不要画。源码：kv_cache_manager.py:264-321、:674；block_pool.py:729；kv_cache_manager.py:691-694"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑧ SGLang TokenizerManager — 主进程的 asyncio 中枢",
+      "items": [
+        "<b>触发</b>：verl 的 launch_server 调 Engine._launch_subprocesses 之后，只有 node_rank == 0 继续。",
+        "<b>为什么绕过官方入口</b>：verl 不调 launch_server，而是<b>直接</b>调 Engine._launch_subprocesses（显式传入三个 func），拿回 (tokenizer_manager, template_manager, scheduler_info) 后自己跑 uvicorn——这样端口、生命周期都由 verl 控制。",
+        "<b>它持有什么</b>：tokenizer / processor、ModelConfig、rid_to_state、模板管理器、LoRA 注册表、model_update_lock、暂停条件变量，并跑 handle_loop。",
+        "<b>一次请求的入口链</b>：generate_request → auto_create_handle_loop → normalize_batch_and_arguments → _init_req_state → 等 is_pause_cond → 在 model_update_lock.reader_lock 下 _validate_and_resolve_lora → _tokenize_one_request → _create_tokenized_object → _send_one_request。",
+        "<b>注意那把 model_update_lock</b>：权重更新要拿写锁，所以更新期间新请求会被挡住——这是 RL 场景下必须的一致性保证。源码：async_sglang_server.py:437-479；tokenizer_manager.py:413、:848-899、:1440-1483"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑨ SGLang Scheduler — 每个 (pp, tp) 一个子进程",
+      "items": [
+        "<b>触发</b>：_launch_subprocesses 为每个 (pp_rank, tp_rank) spawn 一个。",
+        "<b>为什么默认走 overlap</b>：enable_overlap = not disable_overlap_schedule and not use_mlx。重叠能让上一轮的 CPU 后处理与本轮的 GPU 前向同时进行。",
+        "<b>event_loop_overlap 每轮</b>：ingest_requests → get_next_batch_to_run → run_batch → _apply_war_barrier → 把本轮结果压入 result_queue → <b>pop_and_process 处理上一轮的结果</b>。",
+        "<b>重叠的机器</b>：FutureMap 用 req_pool_idx 索引 output_tokens_buf / new_seq_lens_buf，配 pinned 主机镜像和私有 D2H 流；decode 时直接 batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]，不等 CPU 同步。batch_record_buf = [None]×2 让 GPU 张量多活两轮。",
+        "<b>版本差异</b>：ModelWorkerBatch <b>已经不存在</b>，ScheduleBatch 直接变 ForwardBatch；也没有 overlap worker 进程 / 线程（没有 TpModelWorkerClient）。源码：scheduler.py:442、:1857-2012、overlap_utils.py:248-303"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑩⑪ TpModelWorker 与 ModelRunner",
+      "items": [
+        "<b>触发</b>：Scheduler.run_batch 调 model_worker.forward_batch_generation。",
+        "<b>为什么它们是进程内对象</b>：Scheduler 已经是一个独立进程，前向不需要再跨进程——TpModelWorker 和 ModelRunner 都住在同一个进程里。",
+        "<b>forward_batch_generation</b>：set_hicache_consumer → ForwardBatch.init_new(batch, model_runner, ...) → model_runner.forward(...) → 包成 GenerationBatchResult；带 grammar 的重叠路径返回延迟采样闭包，否则当场 sample()。",
+        "<b>ModelRunner.forward 三岔</b>：能走图就 decode_cuda_graph_runner.execute；否则 _prepare_eager_forward_batch 之后按 SPLIT_PREFILL / prefill_cuda_graph_runner / eager_runner 分流。",
+        "<b>采样</b>：positions 在 decode 时是 forward_batch.positions，其它模式是 <b>seq_lens − 1</b>；Sampler 内部先 sanitize_nan_logits，全贪心就 argmax，否则按 need_top_p / top_k / min_p 判断能否走 simple_sampling_case。源码：tp_worker.py:593-672、model_runner.py:1628-1945、sampler.py:109-290"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑫ RadixAttention — 默认实现已经换了",
+      "items": [
+        "<b>触发</b>：Scheduler 构造时 build_kv_cache → create_tree_cache → default_radix_cache_factory。",
+        "<b>版本差异</b>：<b>经典的 RadixCache 不再是默认</b>，默认链路最终走 UnifiedRadixCache；RadixCache 仍完整保留，并作为 PureSWARadixCache / LMCRadixCache / FlexKVRadixCache / HiRadixCache 的基类。",
+        "<b>缓存键 RadixKey</b>：token_ids（array(\"q\") 即 int64）、extra_key、cache_salt、is_bigram、limit。<b>extra_key 就是 LoRA 的隔离钩子</b>——schedule_batch 里把 lora_id 追加进去，所以不同 adapter 永不共享前缀节点。",
+        "<b>匹配</b>：_match_prefix_helper 按 child_key 下行，<b>每访问一个节点就刷新 last_access_time——这就是驱动 LRU 的东西</b>；child.key.match 用 C 级 array 切片比较做 galloping search 再二分，结果向下取整到 page_size；prefix_len < len(child.key) 时 _split_node 把节点劈开。",
+        "<b>TreeNode.lock_ref > 0 表示被保护不可淘汰</b>；根节点 priority = −sys.maxsize 且 lock_ref = 1，永不淘汰。三个有实现但<b>没有构造调用点</b>的：HiRadixCache、SWARadixCache、MambaRadixCache。源码：registry.py:80-190、radix_cache.py:59-256、:397-456、:724-750"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "⑬ DetokenizerManager 与 ZMQ 接线",
+      "items": [
+        "<b>触发</b>：Scheduler 的 output_streamer 把 BatchTokenIDOutput PUSH 过来。",
+        "<b>为什么要增量解码</b>：流式输出必须一段段吐，但多字节字符可能跨 token 边界。做法是 batch 解码 read_ids 与 surr_ids，new_text = read_texts[i][len(surr_texts[i]):]，<b>只有当 new_text 不以替换字符结尾时才提交偏移</b>。",
+        "<b>ZMQ 方向约定</b>：scheduler_input 是 <b>PUSH 绑定 / PULL 连接</b>；tokenizer_ipc 与 detokenizer_ipc 反过来是 <b>PULL 绑定 / PUSH 连接</b>。",
+        "<b>四条通道</b>：① TokenizerManager PUSH → Scheduler PULL（DP > 1 时中间插 DataParallelController）② Scheduler PUSH → Detokenizer PULL ③ Detokenizer PUSH → TokenizerManager PULL ④ Scheduler 在 tokenizer_ipc 上的第二条 PUSH，专走控制请求的回复（权重更新、显存释放的 Output 就从这条回来）。",
+        "端点在任何 fork <b>之前</b>就由 PortArgs.init_new 分配好；单机用 ipc:// unix socket，只有 DP-attention 才切 tcp://。<b>verl 从不绑定 rpc 通道</b>，所以 collective_rpc 在 verl 的用法下不可用。源码：detokenizer_manager.py:102-153、:303-405；ipc_channels.py:34-78；server_args.py:749-921"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "附：两边的权重更新入口对照",
+      "items": [
+        "<b>vLLM</b>：一块常驻 CUDA IPC 字节缓冲 + 每桶一次 ZMQ REQ/REP 元数据。接收方是 verl 注入的 worker_extension_cls，由 WorkerWrapperBase.init_worker 混入真实 worker 类。",
+        "<b>SGLang</b>：逐张量 MultiprocessingSerializer.serialize → dist.gather_object 汇到 infer_tp 的 0 号 rank → 拼成 LocalSerializedTensor 提交一次 UpdateWeightsFromTensorReqInput，走「控制请求」那条 ZMQ 通道。",
+        "<b>共同的硬约束</b>：所有训练 rank 都必须一起迭代权重生成器，因为 DTensor.full_tensor() 是集合通信，跳过会死锁。",
+        "<b>TP 切分都在接收侧完成</b>，发送端交出去的始终是完整的 HF 命名张量。",
+        "完整时序见「权重同步」页面；模型初次加载见「模型初始化与设备放置」页面。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：版本与读图提示",
+      "items": [
+        "编号 ①–⑬ 按流程顺序排，与图上节点一一对应：②–⑦ 是 vLLM，⑧–⑬ 是 SGLang。",
+        "两个引擎都以 git submodule 固定在 third_party/：vLLM v0.32.0 · 5df63a7，SGLang v0.5.20 · 94602c9。",
+        "本页卡片里的行号是各自 checkout 内的<b>相对路径</b>行号，不是 verl 仓库的行号。",
+        "NPU 分支另配 vllm-ascend releases/v0.23.0 搭配 vLLM v0.23.0，与这里的 0.32.0 不是同一条线，见 NPU 页面。",
+        "生成请求不走 HTTP，是打到 node-rank-0 server actor 的 Ray RPC——副本与路由见「推理副本与路由」页面。"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,435 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "verl 权重同步：训练分片 → 推理引擎（naive 同卡路径）",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-weight-sync.html",
+    "viewBox": [
+      1085,
+      640
+    ],
+    "column_fit": "spread",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "participants": [
+    {
+      "id": "trainer",
+      "type": "backend",
+      "label": "Trainer",
+      "sublabel": "CheckpointEngineManager",
+      "sources": [
+        {
+          "path": "verl/checkpoint_engine/base.py",
+          "line": 509,
+          "end_line": 562,
+          "label": "update_weights 编排"
+        }
+      ]
+    },
+    {
+      "id": "worker",
+      "type": "backend",
+      "label": "TrainingWorker",
+      "sublabel": "update_weights",
+      "sources": [
+        {
+          "path": "verl/workers/engine_workers.py",
+          "line": 827,
+          "end_line": 885,
+          "label": "naive 分支"
+        }
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "cloud",
+      "label": "训练引擎",
+      "sublabel": "FSDP / Megatron",
+      "sources": [
+        {
+          "path": "verl/workers/engine/fsdp/transformer_impl.py",
+          "line": 981,
+          "end_line": 1065,
+          "label": "get_per_tensor_param"
+        }
+      ]
+    },
+    {
+      "id": "wire",
+      "type": "messagebus",
+      "label": "IPC 通道",
+      "sublabel": "CUDA IPC + ZMQ",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py",
+          "line": 102,
+          "end_line": 199,
+          "label": "分桶发送"
+        }
+      ]
+    },
+    {
+      "id": "rollout",
+      "type": "cloud",
+      "label": "Rollout 适配器",
+      "sublabel": "ServerAdapter",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/base.py",
+          "line": 44,
+          "end_line": 75,
+          "label": "resume / update / release"
+        }
+      ]
+    },
+    {
+      "id": "infer",
+      "type": "external",
+      "label": "推理引擎",
+      "sublabel": "vLLM / SGLang",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/vllm_rollout/utils.py",
+          "line": 248,
+          "end_line": 330,
+          "label": "update_weights_from_ipc"
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 240,
+      "label": "①–③ 先还权重显存"
+    },
+    {
+      "from": 242,
+      "to": 380,
+      "label": "④⑤ 聚合与改名"
+    },
+    {
+      "from": 382,
+      "to": 540,
+      "label": "⑥–⑬ 搬运与收尾"
+    }
+  ],
+  "messages": [
+    {
+      "id": "w1",
+      "from": "trainer",
+      "to": "worker",
+      "y": 170,
+      "label": "① on_step_end → update_weights",
+      "variant": "emphasis"
+    },
+    {
+      "id": "w2",
+      "from": "worker",
+      "to": "rollout",
+      "y": 198,
+      "label": "② resume(tags=[weights])",
+      "variant": "default"
+    },
+    {
+      "id": "w3",
+      "from": "rollout",
+      "to": "infer",
+      "y": 226,
+      "label": "③ wake_up / resume_memory",
+      "variant": "security"
+    },
+    {
+      "id": "w4",
+      "from": "worker",
+      "to": "engine",
+      "y": 254,
+      "label": "④ get_per_tensor_param()",
+      "variant": "emphasis"
+    },
+    {
+      "id": "w5",
+      "from": "engine",
+      "to": "worker",
+      "y": 282,
+      "label": "⑤ 改名与拆专家",
+      "variant": "return"
+    },
+    {
+      "id": "w6",
+      "from": "worker",
+      "to": "wire",
+      "y": 310,
+      "label": "⑥ 拷入 IPC 字节桶",
+      "variant": "default"
+    },
+    {
+      "id": "w7",
+      "from": "wire",
+      "to": "infer",
+      "y": 338,
+      "label": "⑦ 发句柄与桶元数据",
+      "variant": "emphasis"
+    },
+    {
+      "id": "w8",
+      "from": "infer",
+      "to": "wire",
+      "y": 366,
+      "label": "⑧ 本桶已装载",
+      "variant": "return"
+    },
+    {
+      "id": "w9",
+      "from": "worker",
+      "to": "engine",
+      "y": 394,
+      "label": "⑨ to(cpu) 卸载参数",
+      "variant": "dashed"
+    },
+    {
+      "id": "w10",
+      "from": "worker",
+      "to": "wire",
+      "y": 422,
+      "label": "⑩ distributed.barrier",
+      "variant": "security"
+    },
+    {
+      "id": "w11",
+      "from": "worker",
+      "to": "rollout",
+      "y": 450,
+      "label": "⑪ resume(tags=[kv_cache])",
+      "variant": "default"
+    },
+    {
+      "id": "w12",
+      "from": "rollout",
+      "to": "infer",
+      "y": 478,
+      "label": "⑫ 重建 KV cache",
+      "variant": "default"
+    },
+    {
+      "id": "w13",
+      "from": "worker",
+      "to": "trainer",
+      "y": 506,
+      "label": "⑬ 回传同步指标",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "worker",
+      "from": 164,
+      "to": 512,
+      "type": "backend"
+    },
+    {
+      "participant": "engine",
+      "from": 249,
+      "to": 288,
+      "type": "cloud"
+    },
+    {
+      "participant": "wire",
+      "from": 305,
+      "to": 372,
+      "type": "messagebus"
+    },
+    {
+      "participant": "infer",
+      "from": 221,
+      "to": 484,
+      "type": "external"
+    },
+    {
+      "participant": "rollout",
+      "from": 193,
+      "to": 232,
+      "type": "cloud"
+    },
+    {
+      "participant": "rollout",
+      "from": 445,
+      "to": 484,
+      "type": "cloud"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "① on_step_end → update_weights",
+      "items": [
+        "<b>触发</b>：fit() 在 parameter_sync_step 次 _step_once 跑完、存完检查点之后调 on_step_end。",
+        "<b>为什么编排者本身不搬字节</b>：它只负责把「谁先谁后」排对；排错一步就 OOM，或者把旧权重喂给推理引擎。",
+        "<b>naive 直接短路</b>：self.backend == \"naive\" 时它 ray.get(actor_wg.update_weights(...)) 后 return {}，由训练 worker 在自己进程里推给同进程的推理适配器——这就是「同卡」的含义。",
+        "<b>非 naive 的完整编排</b>：abort 副本 → 临时建覆盖所有副本的 RayWorkerGroup → <b>只释放 KV</b> → build_process_group → 两侧 update_weights → finalize → 恢复 KV 与生成。",
+        "为什么只释放 KV 而保留权重缓冲：新权重能原地写进去，省掉一次「释放再分配等体积显存」的峰值。源码：checkpoint_engine/base.py:510-562、:518-520、:493-497"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "② resume(tags=[\"weights\"]) — 只要回一块",
+      "items": [
+        "<b>触发</b>：naive 分支开头，engine_workers.py 的 update_weights 里。",
+        "<b>为什么能只恢复权重</b>：vLLM 在 load_model 时把权重分配在 CuMemAllocator 的 <b>weights</b> 标签下、KV cache 在 <b>kv_cache</b> 标签下，于是两者可按标签独立释放 / 恢复。",
+        "<b>条件按后端不同</b>：SGLang 要 free_cache_engine 为真<b>且</b> sleep_level != 1；vLLM 只看 free_cache_engine。",
+        "<b>同时还做两件事</b>：set_expandable_segments(False) + empty_cache()——可扩展段会让后面的 IPC 内存注册失败。",
+        "源码：engine_workers.py:827-841；引擎侧 third_party/vllm 的 gpu_worker.py:294-330"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "③ 引擎侧 wake_up — 三种模式语义不同",
+      "items": [
+        "<b>触发</b>：适配器把 resume 转给引擎。",
+        "<b>为什么分三种</b>：显存是不是和训练抢，决定了要不要真的 sleep / wake。",
+        "<b>HYBRID</b>（与训练同卡）：完整的 sleep / resume 循环，每步都走这一整套。",
+        "<b>COLOCATED</b>（同 placement group 但独立进程）：wake_up / sleep(level=1) 直接调，<b>不同步权重</b>——给 GRM / LLM-as-judge 这类不需要跟训练同步的用途。",
+        "<b>STANDALONE</b>（独占卡）：vLLM 下 wake_up / sleep <b>直接是空操作</b>，SGLang 下只动 KV cache。源码：replica.py:54-67、vllm_async_server.py:942-957"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "④ get_per_tensor_param — 整条链的核心变换",
+      "items": [
+        "<b>触发</b>：权重显存恢复好之后，由训练 worker 调引擎。",
+        "<b>为什么峰值只有一个张量</b>：它是<b>生成器</b>，消费到哪个参数才聚合哪个，聚合完交给下游立刻可以释放。",
+        "<b>怎么聚合</b>：逐参数 param.to(device).full_tensor()，对每个参数在<b>它自己的 mesh</b> 上做一次 all-gather。",
+        "<b>要不要先把整模型搬上卡</b>：_skip_staging = (fsdp_version == 2 and not _is_peft)。FSDP2 的 state_dict() 只收集 DTensor 引用，可逐片惰性上卡；FSDP1 与 LoRA 的 state_dict() 会在卡上就地 unshard，必须先整模型上卡。",
+        "<b>硬约束</b>：所有 rank 都必须迭代这个生成器——full_tensor() 是集合通信，某个 rank 因为「我不负责发送」而跳过，其余 rank 会永久卡在 all-gather 上。源码：fsdp/transformer_impl.py:981-1065、:1032-1040、sglang_rollout.py:340-341"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "⑤ 改名与拆专家 — 两个纯布局变换",
+      "items": [
+        "<b>触发</b>：在生成器链里，发生在 all-gather <b>之前</b>（改名）和之后（拆专家）。",
+        "<b>为什么要改名</b>：训练侧参数名带着 FSDP / PEFT / 模型包装器的前缀，推理引擎只认 HF 原始命名；不改会在 load_weights 时报找不到参数。改名是纯字符串重写，不碰数据，代价极低。",
+        "<b>为什么要拆专家</b>：Transformers 5 把一层所有专家打包成三维大张量，推理引擎要的是每个专家独立的二维权重。",
+        "<b>形状变换</b>：gate_up_proj [E, 2I, H] --chunk(2, dim=1)--> mlp.experts.{e}.{gate,up}_proj.weight 各 [I, H]；down_proj [E, H, I] --> mlp.experts.{e}.down_proj.weight [H, I]。它是 generator-to-generator，不构造完整 dict，拆出的切片是原张量的 view。",
+        "<b>一个例外</b>：gpt_oss 原样透传不拆，因为 vLLM 的 GPT-OSS 加载器自己会在 TP 切分时索引那个三维张量。源码：fsdp/utils.py:90-123、:105-107；Megatron 侧换成 AutoBridge.export_hf_weights"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑥ 拷入 IPC 字节桶（vLLM 路径）",
+      "items": [
+        "<b>触发</b>：每从生成器拿到一个张量就拷一次。",
+        "<b>为什么用一块常驻缓冲</b>：逐个张量发 IPC 句柄太慢；一块缓冲只分配一次、句柄只发一次，之后每桶只发元数据。",
+        "<b>怎么拷</b>：offset 先按 weight.element_size() 对齐，再 buffer[off:off+nbytes].view(dtype).view(shape).copy_(weight, non_blocking=True)。桶里存的是<b>裸字节</b>，形状和 dtype 靠随后的 bucket_meta 描述。",
+        "<b>装不下了怎么办</b>：先 synchronize()（必须等拷贝真的完成）→ 发 {bucket_meta, is_last: False} → 阻塞 recv() 等确认 → offset 归零复用同一块缓冲。",
+        "<b>两个边界情况</b>：单张量比整桶还大时绕过缓冲、自己做一次 reduce_tensor 直发句柄；NPU 不支持 CUDA IPC 时改用 shared_memory，命名 verl_weights_{uuid4}。桶大小默认 2048 MB。源码：bucketed_weight_transfer.py:102-199"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑦ 发句柄与桶元数据",
+      "items": [
+        "<b>触发</b>：首次（发句柄）与每次满桶（发元数据）。",
+        "<b>为什么数据和元数据分两条通道</b>：数据走 CUDA IPC 是零拷贝的（两边映射同一块物理内存），而元数据很小、需要可靠的请求-应答语义，走 ZMQ REQ/REP 更合适。",
+        "<b>怎么跨进程重建</b>：rebuild_ipc 把句柄里的 args[6] 改写成<b>接收方</b>的设备号，这样两边 CUDA_VISIBLE_DEVICES 不一致也能重建。",
+        "<b>SGLang 是另一套</b>：逐张量 MultiprocessingSerializer.serialize → dist.gather_object 汇到 infer_tp 的 0 号 rank → 由它拼成 LocalSerializedTensor 提交一次 UpdateWeightsFromTensorReqInput。",
+        "SGLang 的分桶按字节数，并且会把 DeepSeek-V4 的 fusion group 成员保持在同一个桶里。源码：bucketed_weight_transfer.py:44-52、:179-199；sglang_rollout.py:365-382、sglang_rollout/utils.py:189-256"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑧ 引擎侧装载 — resharding 真正发生的地方",
+      "items": [
+        "<b>触发</b>：收到每个桶的元数据。",
+        "<b>verl 怎么挤进 vLLM 的 worker</b>：拼 vllm serve 参数时传 worker_extension_cls（恒为 vLLMColocateWorkerExtension），vLLM 的 WorkerWrapperBase.init_worker 把它<b>混入</b>真实 worker 类，于是 verl 的方法能被 collective_rpc 调到并直接访问 model_runner。",
+        "<b>怎么还原张量</b>：首次用句柄 rebuild_ipc 出同一块字节缓冲（与发送端同一份物理内存，不拷贝）→ 按 bucket_meta 把每段字节 view 成对应 dtype 和 shape → 调模型自己的 load_weights。",
+        "<b>关键</b>：TP 切分是在<b>接收侧</b>做的。发送端交出去的始终是完整张量，每个 TP rank 自己从里面取属于自己的那一段。",
+        "<b>所以训练侧的分片方式和推理侧的 TP 度数可以完全无关</b>——中间态是「完整的 HF 命名张量」。这就是权重 resharding 的答案。源码：vllm_rollout/utils.py:248-330、vllm_async_server.py:348-351、:1495-1497"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑨ to(cpu) — 只卸参数，不动优化器",
+      "items": [
+        "<b>触发</b>：权重交出去之后，条件是 is_param_offload_enabled。",
+        "<b>为什么只卸参数</b>：优化器状态下一步 step() 马上要用，搬下去再搬上来纯属浪费；参数在下次前向之前不需要，正好让位给 KV cache。",
+        "<b>怎么调</b>：engine.to(\"cpu\", model=True, optimizer=False, grad=False)。",
+        "<b>一条断言</b>：BaseEngine.to() 要求 grad ⇒ model（要搬梯度就必须同时搬模型）；这里 grad=False 所以不触发。",
+        "随后 synchronize() + empty_cache()，把搬走后的碎片真正还给分配器，否则 KV 重建时仍可能分不到连续块。源码：engine_workers.py:869-872、engine/base.py:248-259、fsdp_utils.py:169-205"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑩ barrier — 为什么必须是全局的",
+      "items": [
+        "<b>触发</b>：条件是 config.rollout.free_cache_engine 为真（不释放 KV 就没有重建这一步）。",
+        "<b>为什么不能各自为政</b>：KV cache 大小是按「当前可用显存」算出来的。若 rank 0 已卸完开始重建 KV、而 rank 1 的参数还在卡上，两边看到的可用显存不同、算出不同的 KV 块数，之后的集合通信就会形状不匹配。",
+        "<b>怎么调</b>：await asyncio.to_thread(torch.distributed.barrier)——整个 update_weights 是 async 函数而 barrier() 是阻塞调用，丢进线程池才不会堵住事件循环。",
+        "最后 set_expandable_segments(True) 把 ② 里关掉的可扩展段恢复回来：IPC 注册已结束，训练阶段重新享受它减少碎片的好处。",
+        "源码：engine_workers.py:880-885"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑪⑫ 重建 KV cache",
+      "items": [
+        "<b>触发</b>：barrier 过后。",
+        "<b>为什么放到最后</b>：此时训练参数已卸走，引擎能拿到的连续显存最大。",
+        "<b>怎么做</b>：rollout.resume(tags=[\"kv_cache\"]) → 引擎按标签重新分配分页 KV 池，块表清空。",
+        "<b>块数不是固定值</b>：启动时用一次 profiling 跑出来——所以同一个模型在不同 gpu_memory_utilization 下 KV 容量不同，能并发的序列数也不同。",
+        "<b>KV 被清空意味着前缀缓存全失效</b>；colocate_async 的半成品轨迹是靠重新提交 prompt + 已生成 token 续跑的，不是靠保留 KV。源码：engine_workers.py:880-881"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑬ 回传同步指标",
+      "items": [
+        "<b>触发</b>：整轮同步结束。",
+        "<b>为什么要单独回传</b>：同步耗时和传输量是排查性能的关键，但它发生在 worker 侧。",
+        "<b>怎么回</b>：非 naive 路径里编排者合并各发送端的指标；separate_async 把返回值存进 _pending_sync_metrics，由步尾 _consume_sync_metrics 取走。",
+        "sync 模式则直接在 marked_timer(\"update_weights\") 里计时。",
+        "源码：checkpoint_engine/base.py:545-548、trainer_separate_async.py:394-397、trainer_base.py:935-940"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：非 naive 的六种检查点引擎",
+      "items": [
+        "<b>nccl</b>：ray.util.collective 从 0 号 rank 广播定长字节桶，<b>双缓冲</b>（2×bucket_size 显存开销），元数据走 ZMQ PUB/SUB；rank 0 的同节点 actor 可作 NVLink 中继，跨节点 peer 拿 rank −1 但仍要迭代生成器。",
+        "<b>nccl on NPU（HCCL）</b>：同样的字节桶 + ZMQ 形状，但用 pyhccl.broadcast；它注册的是<b>同一个 \"nccl\" 名字</b>，靠「没有 torch_npu 就导入失败」实现与 CUDA 版互斥。",
+        "<b>nixl / mooncake</b>：单边 RDMA READ 成环拉取，完成信号用 4 字节魔数回写后轮询。",
+        "<b>kimi_ckpt_engine</b>：CPU 落地 + Mooncake P2P 读 + 组内广播，广播根按桶轮换。",
+        "<b>delta_sharded</b>：继承 nccl，只传增量。effective_mode 判定在 engine_workers.py:812；各实现在 verl/checkpoint_engine/*_checkpoint_engine.py"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：LoRA 的两条岔路",
+      "items": [
+        "<b>合并导出</b>：merged_lora_context 里把 adapter 就地合并进 base，导出合并后的完整权重并统一 cast 成 bfloat16，退出时还原。",
+        "<b>一个真实的陷阱</b>：state_dict() 返回的是活存储的别名，上下文必须在<b>整个消费过程中</b>保持打开；普通张量要 detach().clone()，防止带缓冲的发送端在还原之后才 flush。",
+        "<b>不合并</b>：把 rollout.sleep_level 压成 1（base 只在首轮同步一次、之后必须常驻显存），do_lora_base_sync = not base_sync_done，先推 base 再推 adapter，完成后置 base_sync_done=True。",
+        "<b>接收侧配合</b>：LoRA 的桶会被累积，直到收到 is_last 才一次性 add_lora，并且要把 IPC 缓冲里的数据拷到 CPU（缓冲会被复用）。",
+        "连带影响：ref_in_actor 为真时 ref 就是 actor，算 ref logprob 靠 no_lora_adapter=True 临时禁 adapter。源码：fsdp/transformer_impl.py:1067-1096、engine_workers.py:845-867、vllm_rollout/utils.py:290-310"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：读图提示",
+      "items": [
+        "编号 ①–⑬ 是消息顺序，与图上消息标签一一对应。",
+        "本图画的是默认的 <b>naive 同卡路径</b>（基类管理器 backend 被强制成 naive 的那套）。",
+        "非 naive 的六种后端只替换 ⑥⑦⑧ 这一段「搬运」实现，前后的显存编排是一样的。",
+        "一步之内的显存归属：生成 → sleep_replicas 释放权重与 KV → 训练 → update_weights（本图）。",
+        "行号：verl 侧对应 revision f4becf6e；引擎侧相对各自 checkout。"
+      ]
+    }
+  ]
+}

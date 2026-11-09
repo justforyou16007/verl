@@ -1,0 +1,434 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "verl NPU 分支：Ascend 补丁分层",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-npu.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "components": [
+    {
+      "id": "verl_eng",
+      "type": "backend",
+      "label": "① verl mindspeed 引擎",
+      "sublabel": "只覆写 _init_device_mesh 与 to()",
+      "pos": [
+        60,
+        40
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "tag": "按 device=npu 注册",
+      "sources": [
+        {
+          "path": "verl/workers/engine/mindspeed/transformer_impl.py",
+          "line": 40,
+          "end_line": 74,
+          "label": "repatch 前置钩子"
+        },
+        {
+          "path": "verl/workers/engine/__init__.py",
+          "line": 54,
+          "end_line": 65,
+          "label": "导入顺序要求"
+        }
+      ]
+    },
+    {
+      "id": "mcore",
+      "type": "external",
+      "label": "② Megatron-LM core_v0.18.0",
+      "sublabel": "对 NPU 零感知，无设备抽象",
+      "pos": [
+        60,
+        190
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/engine/megatron/transformer_impl.py",
+          "line": 189,
+          "end_line": 189,
+          "label": "强制 use_mbridge"
+        }
+      ]
+    },
+    {
+      "id": "mindspeed",
+      "type": "security",
+      "label": "④ MindSpeed core_r0.18.0",
+      "sublabel": "256 个 megatron.* 补丁目标",
+      "pos": [
+        60,
+        340
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/engine/mindspeed/transformer_impl.py",
+          "line": 18,
+          "end_line": 21,
+          "label": "import 即激活"
+        }
+      ]
+    },
+    {
+      "id": "ma",
+      "type": "security",
+      "label": "⑤ MegatronAdaptor",
+      "sublabel": "底层 Patch 引擎 + 依赖伪造",
+      "pos": [
+        60,
+        490
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "sources": [
+        {
+          "path": "docker/ascend/Dockerfile.ascend_9.1.0_a3",
+          "line": 46,
+          "end_line": 70,
+          "label": "安装分层顺序"
+        }
+      ]
+    },
+    {
+      "id": "typewrap",
+      "type": "messagebus",
+      "label": "③ type_wrapper 的谎言",
+      "sublabel": "param.type() 把 npu 改写成 cuda",
+      "pos": [
+        380,
+        340
+      ],
+      "size": [
+        250,
+        110
+      ],
+      "tag": "整个 Ascend 策略的缩影"
+    },
+    {
+      "id": "verl_roll",
+      "type": "backend",
+      "label": "⑥ verl vllm_rollout",
+      "sublabel": "无设备分支，与 CUDA 同一套代码",
+      "pos": [
+        740,
+        40
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/rollout/replica.py",
+          "line": 407,
+          "end_line": 432,
+          "label": "只按后端名分派"
+        },
+        {
+          "path": "verl/workers/rollout/vllm_rollout/vllm_rollout.py",
+          "line": 143,
+          "end_line": 151,
+          "label": "IPC 还是共享内存"
+        }
+      ]
+    },
+    {
+      "id": "vllm_npu",
+      "type": "external",
+      "label": "⑦ vLLM v0.23.0（NPU 线）",
+      "sublabel": "与 third_party 的 0.32 不同线",
+      "pos": [
+        740,
+        190
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "sources": [
+        {
+          "path": "docker/ascend/Dockerfile.ascend_9.1.0_a3",
+          "line": 23,
+          "end_line": 31,
+          "label": "NPU 版本钉子"
+        }
+      ]
+    },
+    {
+      "id": "vascend",
+      "type": "security",
+      "label": "⑧ vllm-ascend v0.23.0",
+      "sublabel": "靠 entry_points 注册平台插件",
+      "pos": [
+        740,
+        340
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "sources": [
+        {
+          "path": "verl/utils/vllm/npu_vllm_patch.py",
+          "line": 565,
+          "end_line": 595,
+          "label": "verl 再补一层"
+        }
+      ]
+    },
+    {
+      "id": "npuplat",
+      "type": "security",
+      "label": "⑨ NPUPlatform",
+      "sublabel": "换 worker / 注意力后端 / 通信器",
+      "pos": [
+        740,
+        490
+      ],
+      "size": [
+        210,
+        82
+      ],
+      "sources": [
+        {
+          "path": "verl/utils/distributed.py",
+          "line": 143,
+          "end_line": 146,
+          "label": "换成 PyHccl 通信器"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "Ascend 训练补丁层（import 即生效）",
+      "wraps": [
+        "mindspeed",
+        "ma"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "vllm-ascend 插件层",
+      "wraps": [
+        "vascend",
+        "npuplat"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "n1",
+      "from": "verl_eng",
+      "to": "mcore",
+      "label": "AutoBridge"
+    },
+    {
+      "id": "n2",
+      "from": "mindspeed",
+      "to": "mcore",
+      "label": "setattr 替换",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "n3",
+      "from": "ma",
+      "to": "mindspeed",
+      "label": "Patch 引擎",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "n4",
+      "from": "ma",
+      "to": "typewrap",
+      "label": "注册包装器",
+      "variant": "dashed"
+    },
+    {
+      "id": "n5",
+      "from": "typewrap",
+      "to": "mcore",
+      "label": "分布式优化器才能构造",
+      "variant": "emphasis"
+    },
+    {
+      "id": "n6",
+      "from": "verl_eng",
+      "to": "verl_roll",
+      "label": "HCCL 权重面",
+      "variant": "security"
+    },
+    {
+      "id": "n7",
+      "from": "verl_roll",
+      "to": "vllm_npu",
+      "label": "标准路径"
+    },
+    {
+      "id": "n8",
+      "from": "vascend",
+      "to": "vllm_npu",
+      "label": "platform plugin",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "n9",
+      "from": "npuplat",
+      "to": "vascend",
+      "label": "register() 返回",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "① verl 的 mindspeed 引擎 — 一共 155 行",
+      "items": [
+        "<b>触发</b>：EngineRegistry 按 <b>device 而不是配置开关</b>选引擎——get_device_name()（可被 VERL_ENGINE_DEVICE 覆盖）解析出 npu 就拿到它。",
+        "<b>为什么这么小</b>：它是「子类 + 前置钩子」，不是重新实现；训练数学完全没改。三个文件：__init__.py 17 行只做再导出、transformer_impl.py 108 行、utils.py 30 行。",
+        "<b>唯一的结构性覆写</b>：_init_device_mesh 里先 _mindspeed_repatch(engine_config)，<b>然后</b>才 super()._init_device_mesh()。",
+        "<b>为什么必须这个顺序</b>：repatch 要在 initialize_model_parallel 之前跑，initialize_model_parallel_cp_wrapper 才生效。因为 verl 通过 hydra 配置传 CP 尺寸、而不是 --context-parallel-size 命令行参数，MindSpeed 首轮打补丁时看到的 context_parallel_size 还是 1。",
+        "<b>导入顺序是硬约束</b>：engine/__init__.py 的注释写着「Mindspeed must be imported before Megatron」，两个 import 都包在 try/except ImportError 里，所以非 NPU 机器只是没注册 NPU 引擎而不报错。源码：mindspeed/transformer_impl.py:18-21、:40-74、engine/__init__.py:54-65"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② Megatron-LM — 对 NPU 零感知",
+      "items": [
+        "<b>触发</b>：mindspeed 引擎的父类就是 MegatronEngineWithLMHead，所有训练逻辑都在它里面。",
+        "<b>为什么这是个问题</b>：全仓 grep -rniE \"\\bnpu\\b|torch_npu|ascend|hccl\" 扫 megatron/core/ <b>只命中 \"ascending\" 这类误报</b>——没有 device_utils.py，也没有加速器抽象层。",
+        "<b>所以昇腾不能靠「实现一个后端」接入</b>，只能靠在运行期替换符号。",
+        "verl 这边还有个额外约束：Megatron 引擎<b>硬断言 use_mbridge=True</b>，所以权重导出一定走 AutoBridge。",
+        "mcore 这一版也<b>没有</b> zero-bubble / DualPipe 调度；DualPipe 是 MindSpeed 用补丁加上去的，属于昇腾层。源码：megatron/transformer_impl.py:189"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "③ type_wrapper — 一句话看懂整个 Ascend 策略",
+      "items": [
+        "<b>触发</b>：MegatronAdaptor 的 patch_features() 在 import 时注册，给 torch.nn.parameter.Parameter.type 和 torch.Tensor.type 各套一层。",
+        "<b>为什么非得这样</b>：Megatron 的分布式优化器用<b>字面 CUDA 类型字符串</b>判断参数类型：if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor'] … else raise TypeError。",
+        "<b>在昇腾上会怎样</b>：param.type() 返回 'torch.npu.BFloat16Tensor'，于是 _build_model_and_main_param_groups 直接抛 TypeError——<b>分布式优化器根本构造不出来</b>。",
+        "<b>解法</b>：包装器拿到返回值后做 res.replace('npu', 'cuda')。也就是说，未改动的 Megatron 问「你是 CUDA 张量吗」，昇腾层的回答是<b>把字符串里的 npu 改成 cuda</b>。",
+        "<b>同类手法还有两处</b>：apex 的 fused_weight_gradient_mlp_cuda 被 create_dummy=True <b>凭空造出来</b>，好让 layers.py 的 RuntimeError 分支不触发；TransformerEngineNPU 顶替 megatron.core.extensions.transformer_engine 这个模块名。源码：distrib_optimizer.py:378、:453-460；MegatronAdaptor requirements.py:29-30、:7-15、:58-67"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "④ MindSpeed — 机制与激活方式",
+      "items": [
+        "<b>触发</b>：<b>纯 import 副作用</b>。setup.py 的 entry_points 是空的；import mindspeed.megatron_adaptor 时模块底部的 patch_features() 直接执行。",
+        "<b>它顶上那行 from megatron_adaptor.auto_execute import AutoExecuteFunction 顺带点亮了 MegatronAdaptor 自己的 patch_features()</b>——所以 verl 的一次 import 同时点亮两层。",
+        "<b>它是什么</b>：一堆 NPU 优化实现（mindspeed/core/**）+ 一个声明式<b>特性注册表</b>，把每个替换实现绑定到一个全限定的 megatron.* 符号上，在 import 时 setattr 上去。<b>它从不 fork Megatron-LM</b>。",
+        "<b>repatch(args) 做什么</b>：remove_patches() → 用调用方的 dict 改写共享的 get_full_args() 命名空间 → 重跑 pre-patches 和 patches。这正是 verl 调的那个函数。",
+        "<b>语义约定</b>：new_func 名字以 wrapper 或 decorator 结尾的会被<b>叠加成装饰器</b>（可重复叠），否则是<b>替换</b>；force_patch=False 时禁止重复替换；create_dummy=True 可为不存在的目标凭空造一个。源码：megatron_adaptor.py:13-63、patch_utils.py:29-81"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "④′ 替换范围（实测，不是猜）",
+      "items": [
+        "<b>349 个 register_patch 调用点，256 个不同目标</b>。",
+        "按命名空间：megatron.core 283 处、megatron.training 37、mindspeed.core 13、transformer_engine.pytorch 4、torch.distributed 3、torch.utils 1、mindspeed.optimizer 1、apex.optimizers 1。",
+        "按子系统：<b>并行状态 getter 约 60 个</b>（整个 get_*_parallel_{group,rank,world_size} 面 + initialize_model_parallel + is_pipeline_*_stage）、MoE 13、流水线调度 13、优化器 13、DDP 梯度缓冲 16、张量并行 12、transformer 非 MoE 约 25、TE 互操作 6。",
+        "所以「补内核还是补并行状态还是补优化器」的答案是：<b>全都补</b>，外加流水线调度、DDP 梯度缓冲、MoE 分发和 TE 互操作。",
+        "--optimization-level {0,1,2} 控制启用深度（0 最小补丁集 / 1 亲和性优化 / 2 高级加速）。源码：features_manager/ 下各 feature 文件；npu_enhancement.py:31-177"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑤ MegatronAdaptor — 底座，不是叠在 MindSpeed 上",
+      "items": [
+        "<b>触发</b>：同样是 import 副作用（import megatron_adaptor），没有 entry_points。",
+        "<b>谁在上谁在下</b>：MegatronAdaptor 是<b>底座</b>，MindSpeed 叠在它上面——不是反过来。README 写明昇腾基础训练方案 = Megatron-LM + MegatronAdaptor + TransformerEngineNPU。",
+        "<b>两个注册表的设计意图</b>：MindSpeed <b>复用</b> MegatronAdaptor 的 Patch 类，但用<b>独立的 patches_info 注册表</b>。于是 MindSpeed 的 remove_patches 只撤自己那一层，<b>MA 的补丁留在下面不动</b>——这正是 verl 能反复 repatch 的前提。它故意不继承 MA 的 PatchesManager。",
+        "<b>一个值得知道的细节</b>：iter_alias_modules() 会遍历 sys.modules 并改写 from X import f 形成的别名（跳过自己的命名空间），否则「已经 import 进来的旧引用」不会被补丁覆盖。",
+        "<b>相关的两个</b>：MindSpeed-Bridge 是给 Megatron-Bridge 用的昇腾插件层，不是独立转换器；Megatron-Bridge v0.5.0 则是 verl 的硬依赖。源码：MegatronAdaptor patch_manager.py:126-291、:111-123、__init__.py:8"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑥ verl 的推理侧 — 没有任何 NPU 专属代码",
+      "items": [
+        "<b>四条证据</b>：① verl/workers/rollout/ 下<b>没有</b>任何 npu_* 模块；② get_rollout_replica_class 纯按后端名分派，全函数里没有 get_device_name()；③ worker_extension_cls 恒为同一个字符串，无设备分支；④ verl 自己的文档写明 Ascend 通过 vllm-ascend 插件支持 vLLM，遵循 RFC #11162 的可插拔接口。",
+        "<b>所以 verl 在 NPU 上的推理侧工作只有四件</b>：环境变量（PlatformNPU.rollout_env_vars）、sleep level 用 1 而不是 2、权重面换成 PyHcclCommunicator、IPC 不可用时改用共享内存。",
+        "<b>IPC 的判据</b>：self.use_shm = not is_support_ipc()，警告里点名 Ascend HDK ≥ 25.3.rc1 / CANN ≥ 8.3.RC1。",
+        "<b>verl 还在 vllm-ascend 之上再叠一层</b>：npu_vllm_patch.py（595 行），入口先判断 is_torch_npu_available，然后按 vLLM 版本区间（0.23.0 ≤ v < 0.24.0）打 sched_yield、FIA decode mask、DeepSeek-V4 权重加载器等补丁；部分补丁带源码文本检测，已修过的 vllm-ascend 会被跳过。",
+        "源码：replica.py:407-432、vllm_rollout.py:143-151、verl/utils/distributed.py:143-146、npu_vllm_patch.py:565-595"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "⑦ vLLM（NPU 线）— 和 CUDA 线不是同一个版本",
+      "items": [
+        "<b>触发</b>：Ascend Dockerfile 里 clone 的是 vLLM <b>v0.23.0</b>，用 VLLM_TARGET_DEVICE=empty 安装。",
+        "<b>为什么要 empty</b>：NPU 上不编译 CUDA kernel，算子由 vllm-ascend 用 COMPILE_CUSTOM_KERNELS=1 单独编。",
+        "<b>一个无法两全的地方</b>：CUDA 线（pyproject.toml 的 vllm extra）要 v0.32.0，NPU 线要 v0.23.0。一个 submodule 路径只能钉一个提交，所以 third_party/vllm 停在 0.32.0，NPU 的版本差异只在图上标注，<b>没有复制第二份 checkout</b>。",
+        "安装顺序本身就是补丁分层顺序，不能调换：vllm → vllm-ascend → Megatron-LM → MindSpeed → MegatronAdaptor → TransformerEngineNPU → MindSpeed-Ops → MindSpeed-Bridge → Megatron-Bridge → transformers。",
+        "源码：docker/ascend/Dockerfile.ascend_9.1.0_a3:23-31、:46-70"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "⑧ vllm-ascend — 靠 entry_points 挂进去",
+      "items": [
+        "<b>触发</b>：pip 安装时注册 \"vllm.platform_plugins\": [\"ascend = vllm_ascend:register\"]，vLLM 的插件加载器 import 这个字符串并把返回值装成 current_platform。",
+        "<b>register() 返回什么</b>：字符串 \"vllm_ascend.platform.NPUPlatform\"。",
+        "<b>另有四个 general_plugins</b>：kv_connector、model_loader、service_profiling、model。注释解释了为什么要走这条路：<b>vLLM 在 engine-core 子进程里才加载 general plugins</b>，所以全局补丁也必须通过入口点进去。",
+        "<b>补丁分两个作用域</b>：adapt_patch(is_global_patch=True) → from vllm_ascend.patch import platform（每个进程都跑，含 engine-core 子进程，约 30 个）；False → import worker（只在 NPU worker 里跑，约 30 个）。",
+        "源码：vllm-ascend setup.py:543-551、__init__.py:21-78"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "⑨ NPUPlatform — 换掉了什么",
+      "items": [
+        "<b>触发</b>：被装成 vllm.platforms.current_platform 之后，vLLM 的每个扩展点都来问它。",
+        "<b>注意力后端</b>：按 (use_mla, use_sparse, use_compress) 分派到 AscendAttentionBackend / AscendFABackend / 310P 专用等。",
+        "<b>worker 类</b>：parallel_config.worker_cls == \"auto\" 时换成 NPUWorker（它的 __init__ 里调 adapt_patch() 打 worker 级补丁）。",
+        "<b>其它</b>：设备通信器换 NPUCommunicator、图包装器换 ACLGraphWrapper、LoRA punica 换 PunicaWrapperNPU，并把 <b>simple_compile_backend 设成 \"eager\"，即关掉 torch.compile</b>。",
+        "还有一处有意不实现：get_device_total_memory <b>故意不实现</b>，因为那会过早初始化 torch_npu。源码：platform.py:128-896"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：版本钉子与读图提示",
+      "items": [
+        "权威来源是 docker/ascend/Dockerfile.ascend_9.1.0_a3：基础镜像 cann:9.1.0-a3-ubuntu22.04-py3.12。",
+        "vLLM v0.23.0 · vllm-ascend releases/v0.23.0 · MindSpeed core_r0.18.0 · Megatron-LM core_v0.18.0 · MegatronAdaptor core_r0.18.0 · Megatron-Bridge v0.5.0。",
+        "MindSpeed-Bridge / MindSpeed-Ops / TransformerEngineNPU 上游<b>没有打 tag</b>，Dockerfile 也取默认分支，所以 submodule 钉的是当时的默认分支 HEAD。",
+        "编号 ①–⑨ 按流程顺序排：①–⑤ 是训练路径（含两层补丁），⑥–⑨ 是推理路径。",
+        "<b>带锁标记的框是「补丁层」</b>：它们不被显式调用，靠 import 副作用生效——这也是导入顺序成为硬约束的原因。箭头从补丁层<b>向上</b>指，表示「替换上方的实现」，与调用方向相反。"
+      ]
+    }
+  ]
+}

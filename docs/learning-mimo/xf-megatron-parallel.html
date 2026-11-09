@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插课 F：Megatron / MindSpeed 的加载与 TP·PP·EP·CP·ETP 分片 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>插课 F：Megatron / MindSpeed 与五种分片</h2>
+  <ol>
+    <li><a href="#xf-0">0. 先把模型对齐：27B 有没有 Megatron 例子</a></li>
+    <li><a href="#xf-1">1. 从那一行到 GPU 上的 Megatron：五层</a></li>
+    <li><a href="#xf-2">2. 第一层：RayClassWithInitArgs 只是「配方」</a></li>
+    <li><a href="#xf-3">3. 第二层：role_worker_mapping 里装的是谁</a></li>
+    <li><a href="#xf-4">4. 第三层：外层 worker 与内层 TrainingWorker</a></li>
+    <li><a href="#xf-5">5. strategy=megatron 怎么变成 McoreEngineConfig</a></li>
+    <li><a href="#xf-6">6. 第四层：EngineRegistry 的三维键</a></li>
+    <li><a href="#xf-7">7. MindSpeed 是怎么挤进来的</a>
+      <ol>
+        <li><a href="#xf-7-1">① import 顺序</a></li>
+        <li><a href="#xf-7-2">② repatch 的时机</a></li>
+      </ol>
+    </li>
+    <li><a href="#xf-8">8. 落地点一：initialize_model_parallel 建通信组</a></li>
+    <li><a href="#xf-9">9. 落地点二：Megatron-Bridge 把并行度写进 tf_config</a></li>
+    <li><a href="#xf-10">10. 实例推演：8 卡 TP2·EP8·ETP1</a></li>
+    <li><a href="#xf-11">11. 五个维度各自切的是什么</a></li>
+    <li><a href="#xf-12">12. 四个容易踩的点</a></li>
+    <li><a href="#xf-13">13. 位置索引与小结</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xe-separate-async-init.html">← 插课 E：SeparateAsync 的初始化</a></div>
+
+<h2 id="xf">插课 F：Megatron / MindSpeed 的加载与 TP·PP·EP·CP·ETP 分片</h2>
+
+<div class="box ask"><b>提问</b>：从 <code>trainer_base.py:508</code> 的 <code>actor_rollout_cls = RayClassWithInitArgs(...)</code> 这里打开，以 Qwen3.5 27B 为例子，讲一下底层如何加载的 Megatron 和 MindSpeed，以及 TP、PP、EP、CP、ETP 等分片是如何做的，具体的位置。</div>
+
+<p class="meta">代码基于分支 <code>mimo-agent-env</code>（合入上游 <code>321e4e45</code> 后）。主线文件：<code>verl/trainer/ppo/v1/trainer_base.py</code> → <code>verl/workers/engine_workers.py</code> → <code>verl/workers/engine/base.py</code> → <code>verl/workers/engine/megatron/transformer_impl.py</code> / <code>verl/workers/engine/mindspeed/transformer_impl.py</code>。</p>
+
+<h3 id="xf-0">0. 先把模型对齐：27B 有没有 Megatron 例子</h3>
+
+<div class="box warn">
+<p>先说一个需要澄清的事实，免得后面对不上号。仓库里 <b>Qwen3.5-27B 只有 FSDP 脚本，没有 Megatron 脚本</b>：</p>
+<pre><code>examples/grpo_trainer/run_qwen3_5_27b_fsdp.sh         ← 27B，FSDP
+examples/grpo_trainer/run_qwen3_5_27b_fsdp_turbo.sh   ← 27B，FSDP-Turbo
+examples/grpo_trainer/run_qwen3_5_35b_megatron.sh     ← 35B，Megatron（MoE，带 EP/ETP）
+examples/grpo_trainer/run_qwen3_5_122b_a10b_megatron.sh
+examples/grpo_trainer/run_qwen3_5_397b_megatron.sh</code></pre>
+<p>而且 <b>EP / ETP 这两个维度只对 MoE 模型有意义</b>（没有 expert 就没有 expert parallel）。所以这一课的代码链路讲通用的，<b>具体数字用 <code>run_qwen3_5_35b_megatron.sh</code> 里实测过的那组配置</b>，它是同族的 MoE 模型，五个维度全都用上了：</p>
+<pre><code># examples/grpo_trainer/run_qwen3_5_35b_megatron.sh:38
+# Tested parallelism config (8 GPUs / 1 node):
+#   TP=2 PP=1 CP=1 EP=8 ETP=1 GEN_TP=8</code></pre>
+<p>如果你手上确实是 27B 跑 Megatron，链路一模一样，只是 <code>EP=ETP=1</code>，走 dense 分支。</p>
+</div>
+
+<h3 id="xf-1">1. 从那一行到 GPU 上的 Megatron：五层</h3>
+
+<p>你选中的那一行本身<b>什么都没加载</b>。它只是把「用哪个类、拿什么参数」记下来。真正把 Megatron 拉起来，要穿过五层：</p>
+
+<pre><code>trainer_base.py:508   RayClassWithInitArgs(cls=role_worker_mapping[actor_role], config=...)
+                      └─ 只是配方，不执行
+          ↓  trainer_base.py:552 起  RayWorkerGroup(...) 真正建 Ray actor
+engine_workers.py:485 ActorRolloutRefWorker.__init__      ← 外层：一个进程里管 actor+rollout+ref
+          ↓  init_model() 里构造内层
+engine_workers.py:688 self.actor = TrainingWorker(actor_training_config)
+          ↓  TrainingWorker.__init__:169
+engine/base.py:439    EngineRegistry.new(model_type, backend="megatron", ...)
+          ↓  按 (device, vendor) 查表
+megatron/transformer_impl.py  MegatronEngineWithLMHead.__init__
+   └─ 或 mindspeed/transformer_impl.py  MindspeedEngineWithLMHead（NPU 上自动顶替）
+          ↓
+   _init_device_mesh()  → mpu.initialize_model_parallel(...)   ← 并行度落地点 ①
+   _build_tf_config()   → Megatron-Bridge provider_overrides   ← 并行度落地点 ②
+   _build_megatron_module() → 真正 new 出被切好的模型</code></pre>
+
+<div class="box key"><b>一句话</b>：<b>并行度在两个地方落地</b>——<code>initialize_model_parallel</code> 负责<b>建通信组</b>（谁和谁一组），<code>provider_overrides</code> 负责<b>告诉模型按多少份切权重</b>。两者必须一致，所以 verl 把同一份 <code>engine_config</code> 喂给了它们俩。</div>
+
+<h3 id="xf-2">2. 第一层：RayClassWithInitArgs 只是「配方」</h3>
+
+<span class="src">verl/trainer/ppo/v1/trainer_base.py:508</span>
+<pre><code>actor_rollout_cls = RayClassWithInitArgs(
+    cls=self.role_worker_mapping[actor_role],   # 一个 ray.remote(...) 包过的类
+    config=self.config.actor_rollout_ref,       # 整个 actor_rollout_ref 配置子树
+    distillation_config=self.config.get("distillation"),
+    role=str(actor_role),                       # "actor_rollout" / "actor_rollout_ref" / "actor"
+)
+self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls</code></pre>
+
+<p>注意三件事：</p>
+<ol>
+  <li><b>没有 <code>.remote()</code></b>：这一行不创建任何 Ray actor，只把 <code>(类, 参数)</code> 打包。后面 <code>RayWorkerGroup</code> 创建时才会对每个 rank 调一次。</li>
+  <li><b>传的是整棵配置树</b>，不是切好的 engine 配置。<code>megatron.tensor_model_parallel_size</code> 之类此刻还埋在 <code>config.actor.megatron</code> 里，没人读。</li>
+  <li><b>存进 <code>resource_pool_to_cls</code></b>：按资源池分组，同一个池里的多个角色会被合并成一个 colocated worker group（这就是 actor / ref / critic 能共卡的原因）。</li>
+</ol>
+
+<h3 id="xf-3">3. 第二层：role_worker_mapping 里装的是谁</h3>
+
+<span class="src">verl/trainer/ppo/v1/trainer_base.py:1049 _init_resource_pool_mgr</span>
+<pre><code>self.role_worker_mapping = {}
+...
+if not getattr(self, "_enable_hybrid_replicas", True):
+    role = Role.Actor                       # 训练卡上不放推理副本（separate_async）
+else:
+    role = Role.ActorRolloutRef if need_reference_policy(config) and not ref_in_actor \
+           else Role.ActorRollout
+self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)   # ← 就这一个类
+self.mapping[role] = "global_pool"
+
+if need_critic(config):
+    self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)</code></pre>
+
+<div class="box note"><b>关键认知</b>：<code>role_worker_mapping</code> 里<b>只有 <code>ActorRolloutRefWorker</code> 和 <code>TrainingWorker</code> 两个类，和后端无关</b>。不存在 <code>MegatronActorWorker</code> 这种类。<b>选 Megatron 还是 FSDP 完全发生在更里面</b>（§6 的注册表）。这是 v1 trainer 相对老版本的一个结构变化：worker 层统一，引擎层多态。</div>
+
+<p><code>trainer_separate_async.py:125</code> 会把这个 mapping 里的类替换成 <code>DetachActorWorker</code>（见<a href="xe-separate-async-init.html#xe-6">插课 E §6</a>），但它是 <code>ActorRolloutRefWorker</code> 的子类，下面的链路不变。</p>
+
+<h3 id="xf-4">4. 第三层：外层 worker 与内层 TrainingWorker</h3>
+
+<p><code>ActorRolloutRefWorker</code> 是个<b>壳</b>。它的 <code>__init__</code>（<code>engine_workers.py:485</code>）只做三件事：记下 <code>role</code>、算出三个布尔开关、建 profiler：</p>
+
+<span class="src">verl/workers/engine_workers.py:505</span>
+<pre><code>assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
+self._is_actor   = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
+self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
+self._is_ref     = self.role in ["ref", "actor_rollout_ref"]</code></pre>
+
+<p>真正建模型在 <code>init_model()</code> 里，<b>actor 部分构造一个内层的 <code>TrainingWorker</code></b>：</p>
+
+<span class="src">verl/workers/engine_workers.py:646（节选）</span>
+<pre><code>actor_training_config = TrainingWorkerConfig(
+    model_type=actor_config.model_config.get("model_type", "language_model"),
+    model_config=actor_config.model_config,
+    engine_config=actor_config.engine,          # ← 这里！§5 讲它怎么来的
+    optimizer_config=actor_config.optim,
+    checkpoint_config=actor_config.checkpoint,
+    profiler_config=actor_profiler_config,
+)
+...
+self.actor = self.actor_worker_cls(config=actor_training_config)   # :688
+self.actor.reset()</code></pre>
+
+<p>所以一个进程里的层次是：</p>
+<pre><code>Ray actor 进程
+└─ ActorRolloutRefWorker            壳：路由 actor/rollout/ref 三组方法
+   ├─ TrainingWorker (actor)        ├─ MegatronEngine  ← 训练用的 Megatron 模型
+   ├─ TrainingWorker (ref)          ├─ MegatronEngine  （forward_only=True）
+   └─ BaseRollout (rollout)         └─ vLLM / SGLang   ← 推理引擎，同卡</code></pre>
+
+<h3 id="xf-5">5. strategy=megatron 怎么变成 McoreEngineConfig</h3>
+
+<p>上面 <code>engine_config=actor_config.engine</code> 这个 <code>.engine</code> 字段是<b>配置层的多态入口</b>。<code>ActorConfig</code> 的子类在 <code>__post_init__</code> 里把 <code>self.engine</code> 指向自己那一块：</p>
+
+<span class="src">verl/workers/config/actor.py</span>
+<pre><code>class McoreActorConfig(ActorConfig):
+    def __post_init__(self):
+        ...
+        self.engine = self.megatron          # :285  ← McoreEngineConfig
+
+class FSDPActorConfig(ActorConfig):
+    def __post_init__(self):
+        ...
+        self.engine = self.fsdp_config       # :321
+        object.__setattr__(self.engine, "strategy", self.strategy)
+
+class VeOmniActorConfig(ActorConfig):
+        self.engine = self.veomni            # :367</code></pre>
+
+<p>而选中哪个 <code>ActorConfig</code> 子类，是 hydra 在配置组合阶段决定的：</p>
+
+<span class="src">verl/trainer/config/actor/megatron_actor.yaml</span>
+<pre><code>defaults:
+  - ../engine@megatron: megatron    # 把 engine/megatron.yaml 挂到 megatron: 这个键下
+  - actor
+strategy: megatron                  # :16
+megatron:
+  entropy_from_logits_with_chunking: ${oc.select:...}</code></pre>
+
+<p>也就是说，<b><code>actor.strategy=megatron</code> 这一个字符串决定了整条链路</b>：决定 yaml 挂哪个 engine 配置组 → 决定 <code>.engine</code> 是 <code>McoreEngineConfig</code> → 决定 <code>engine_config.strategy == "megatron"</code> → 决定 §6 注册表里查哪个 backend。</p>
+
+<p>五个并行度的<b>声明处</b>就在 <code>McoreEngineConfig</code>：</p>
+
+<span class="src">verl/workers/config/engine.py:185</span>
+<pre><code># mcore parallelism
+tensor_model_parallel_size: int = 1               # TP
+expert_model_parallel_size: int = 1               # EP
+expert_tensor_parallel_size: Optional[int] = None # ETP，None = 跟随 TP
+pipeline_model_parallel_size: int = 1             # PP
+virtual_pipeline_model_parallel_size: Optional[int] = None   # VPP（交错式 PP）
+context_parallel_size: int = 1                    # CP
+dynamic_context_parallel: bool = False
+max_seqlen_per_dp_cp_rank: Optional[int] = None
+sequence_parallel: bool = True                    # SP，依附于 TP</code></pre>
+
+<p><b>注意没有 DP。</b> DP 不是配置项，是算出来的（见 §12）。</p>
+
+<h3 id="xf-6">6. 第四层：EngineRegistry 的三维键</h3>
+
+<span class="src">verl/workers/engine_workers.py:169（TrainingWorker.__init__）</span>
+<pre><code>self.engine: BaseEngine = EngineRegistry.new(
+    model_type=self.config.model_type,        # "language_model" / "value_model"
+    backend=self.engine_config.strategy,      # "megatron" / "fsdp" / "veomni" / "torchtitan"
+    model_config=self.model_config,
+    engine_config=self.engine_config,
+    optimizer_config=self.optimizer_config,
+    checkpoint_config=self.checkpoint_config,
+)</code></pre>
+
+<p>注册表的键是<b>三维</b>的：<code>model_type × backend × (device, vendor)</code>。注册是靠类上的装饰器：</p>
+
+<span class="src">verl/workers/engine/megatron/transformer_impl.py / mindspeed/transformer_impl.py</span>
+<pre><code>@EngineRegistry.register(model_type="language_model", backend="megatron")              # device 默认 "cuda"
+class MegatronEngineWithLMHead(MegatronEngine): ...
+
+@EngineRegistry.register(model_type="language_model", backend="megatron", device="npu")
+class MindspeedEngineWithLMHead(MegatronEngineWithLMHead): ...                         # ← 注意是子类</code></pre>
+
+<p>查表逻辑在 <code>get_engine_cls</code>：</p>
+
+<span class="src">verl/workers/engine/base.py:406</span>
+<pre><code>device = get_device_name()        # 探测 torch.cuda / torch_npu → "cuda" / "npu"
+vendor = get_vendor()             # "nvidia" / "metax" / ...
+if os.getenv("VERL_ENGINE_DEVICE"): device = os.getenv("VERL_ENGINE_DEVICE")   # 可强制覆盖
+if os.getenv("VERL_ENGINE_VENDOR"): vendor = os.getenv("VERL_ENGINE_VENDOR")
+registry = cls._engines[model_type][backend]
+
+if (device, vendor) in registry: return registry[(device, vendor)]   # ① 厂商专用
+if device in registry:           return registry[device]             # ② 设备通用
+if device == "cuda" and vendor != "nvidia":
+    if ("cuda", "nvidia") in registry: return registry[("cuda", "nvidia")]  # ③ 类 CUDA 兜底
+raise ValueError(...)</code></pre>
+
+<div class="box key"><b>MindSpeed 的选中方式</b>：用户配置里<b>没有 "mindspeed" 这个 backend</b>。配置写的始终是 <code>strategy=megatron</code>；在昇腾卡上 <code>get_device_name()</code> 返回 <code>"npu"</code>，于是 <code>(language_model, megatron, npu)</code> 这一格命中 <code>MindspeedEngineWithLMHead</code>，自动顶替掉 CUDA 的 <code>MegatronEngineWithLMHead</code>。<b>同一份训练脚本不改并行配置就能在 GPU / NPU 之间切换</b>，这就是 <code>run_qwen3_5_35b_megatron.sh</code> 里只用 <code>DEVICE=gpu|npu</code> 分支调数值、不换 backend 的原因。</div>
+
+<h3 id="xf-7">7. MindSpeed 是怎么挤进来的</h3>
+
+<p>MindSpeed 的工作方式是<b>给 Megatron-Core 打猴子补丁</b>（替换 attention、CP 实现、融合算子等）。verl 要保证两件事的顺序正确。</p>
+
+<h4 id="xf-7-1">① import 顺序</h4>
+
+<span class="src">verl/workers/engine/__init__.py:54</span>
+<pre><code># Mindspeed must be imported before Megatron to ensure the related monkey patches take effect as expected
+try:
+    from .mindspeed import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead
+    ...
+except ImportError as e:
+    warnings.warn(f"mindspeed engine is not available: {e!r}", stacklevel=1)
+    MindspeedEngineWithLMHead = None
+
+try:
+    from .megatron import MegatronEngine, MegatronEngineWithLMHead, MegatronEngineWithValueHead
+except ImportError as e:
+    warnings.warn(f"megatron engine is not available: {e!r}", stacklevel=1)</code></pre>
+
+<p>两点值得注意：</p>
+<ul>
+  <li><b>注释点明 mindspeed 必须先 import</b>。因为 <code>mindspeed/transformer_impl.py</code> 顶部就 <code>from mindspeed.megatron_adaptor import repatch</code>，而 <code>mindspeed.megatron_adaptor</code> 这个模块<b>一被 import 就开始改 Megatron 的类</b>。如果 Megatron 的符号先被绑定进别的模块命名空间，补丁就可能打不上。</li>
+  <li><b>全部用 try/except 包住</b>。GPU 机器上没装 mindspeed、NPU 机器上没装某些 CUDA 组件，都只是 warning，不会让 import 整个失败。这也是为什么注册表是「有谁注册谁」而不是静态表。</li>
+</ul>
+
+<h4 id="xf-7-2">② repatch 的时机</h4>
+
+<p>光 import 还不够。MindSpeed 第一次打补丁时看到的 CP 是默认值 1，而 verl 的 CP 是通过 hydra 配置传的，不走 Megatron 的命令行参数，所以 CP 相关的补丁没注册上。verl 的解法是在建通信组<b>之前</b>再 repatch 一次：</p>
+
+<span class="src">verl/workers/engine/mindspeed/transformer_impl.py:39</span>
+<pre><code>def _mindspeed_repatch(engine_config):
+    if repatch is not None:
+        from verl.utils.megatron_utils import mapping_string_to_attn_backend
+        repatch_config = mapping_string_to_attn_backend(
+            dict(engine_config.get("override_transformer_config", {})))
+        # flash-attn-npu batch-invariant 会替换 DotProductAttention.forward；
+        # use_flash_attn=True 时融合注意力会注册同一个补丁 → "the patch of forward exist"
+        if repatch_config.get("use_flash_attn_npu_batch_invariant"):
+            repatch_config["use_flash_attn"] = False
+        else:
+            repatch_config.setdefault("use_flash_attn", True)
+        if engine_config.context_parallel_size &gt; 1:
+            repatch_config["context_parallel_size"] = engine_config.context_parallel_size
+        repatch(repatch_config)
+
+
+class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
+    def _init_device_mesh(self):
+        # repatch must happen before initialize_model_parallel so that
+        # initialize_model_parallel_cp_wrapper is in effect when the call is made.
+        _mindspeed_repatch(self.engine_config)
+        super()._init_device_mesh()       # ← 再去调 mpu.initialize_model_parallel</code></pre>
+
+<div class="box note"><b>MindSpeed 子类总共只重写了三个方法</b>（<code>mindspeed/transformer_impl.py</code> 全文 ~110 行）：<code>_init_device_mesh</code>（插 repatch）、<code>to</code>（FP8 量化权重的搬运，调 <code>reset_fp8_reuse_quantized_weight</code>）、以及 value-head 版本的同样两个。<b>并行切分逻辑一行都没改</b>——TP/PP/EP/CP/ETP 在 NPU 上走的是完全同一套代码，差异全在 MindSpeed 对 Megatron 内部算子的替换里。</div>
+
+<p>另外在 CP 的数据预处理上，NPU 还有一处专门分支：</p>
+<span class="src">verl/models/mcore/util.py:231</span>
+<pre><code>def preprocess_for_mindspeed(input_ids, cu_seqlens_padded, seqlens_in_batch_padded, batch_size):
+    ...
+    from mindspeed.core.context_parallel.get_batch_utils import set_actual_seq_len
+    from mindspeed.utils import set_position_ids
+    ...
+    except ImportError as e:
+        logger.warning(f"Could not import mindspeed modules, skipping position_id setting: {e}")</code></pre>
+<p>变长序列 + CP 时，MindSpeed 需要用进程级全局变量拿到真实序列长度和 position_ids（它的 CP 实现是从这些全局量读的，不走函数参数），这个函数就是去设这两个全局量。</p>
+
+<h3 id="xf-8">8. 落地点一：initialize_model_parallel 建通信组</h3>
+
+<p>构造函数第一件事就是建通信组：</p>
+
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:192（MegatronEngine.__init__）</span>
+<pre><code>self.model_config = model_config
+self.engine_config = engine_config
+...
+assert self.engine_config.use_mbridge, "use_mbridge must be True"
+_check_dcp_unsupported_features(self.engine_config, self.model_config)
+self._init_device_mesh()                      # ← 并行度落地点 ①
+set_random_seed(seed=self.engine_config.seed)</code></pre>
+
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:235</span>
+<pre><code>def _init_device_mesh(self):
+    if self.engine_config.dynamic_context_parallel:
+        get_megatron_dynamic_cp_scheduler_cls()
+
+    if mpu.is_initialized():                  # ← ★ 幂等保护，见下面的说明
+        if self.engine_config.dynamic_context_parallel:
+            dpcp_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+            _validate_dcp_world_size(dpcp_size)
+            try:
+                mpu.get_dynamic_data_context_parallel_groups(group_size=1)
+            except (KeyError, AssertionError, AttributeError) as exc:
+                raise RuntimeError(
+                    "Dynamic CP is enabled on this engine, but Megatron model-parallel state was already "
+                    "initialized without dynamic DPxCP groups. Enable dynamic_context_parallel consistently "
+                    "on every colocated Megatron engine (for example the reference model)."
+                ) from exc
+        return
+
+    extra_args = dict()
+    if self.engine_config.dynamic_context_parallel:
+        assert "dynamic_context_parallel" in inspect.signature(mpu.initialize_model_parallel).parameters, (
+            "dynamic_context_parallel is not supported in your megatron version, ...")
+        dpcp_size = torch.distributed.get_world_size() // (
+            self.engine_config.tensor_model_parallel_size
+            * self.engine_config.pipeline_model_parallel_size)
+        _validate_dcp_world_size(dpcp_size)
+        extra_args["dynamic_context_parallel"] = self.engine_config.dynamic_context_parallel
+
+    mpu.initialize_model_parallel(
+        tensor_model_parallel_size=self.engine_config.tensor_model_parallel_size,
+        pipeline_model_parallel_size=self.engine_config.pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=self.engine_config.virtual_pipeline_model_parallel_size,
+        use_sharp=False,
+        context_parallel_size=self.engine_config.context_parallel_size,
+        expert_model_parallel_size=self.engine_config.expert_model_parallel_size,
+        expert_tensor_parallel_size=self.engine_config.expert_tensor_parallel_size,
+        nccl_communicator_config_path=None,
+        **extra_args,
+    )</code></pre>
+
+<div class="box key"><b>这是 verl 里唯一一处调 <code>initialize_model_parallel</code> 的地方</b>，也就是五个并行维度唯一的「建组」入口。<code>mpu</code> 是 <code>megatron.core.parallel_state</code>，这个调用会在 <b>进程级全局状态</b> 里建好若干 <code>ProcessGroup</code>：TP 组、PP 组、CP 组、DP 组、EP 组、ETP 组，以及它们的各种组合组（如 <code>tp-cp</code>、<code>dp-cp</code>）。之后 Megatron 的每一层算子都是去这个全局状态里取组来做集合通信。</div>
+
+<p><b><code>if mpu.is_initialized(): return</code> 这个保护很重要。</b> actor 和 ref 是同一个进程里的两个 <code>TrainingWorker</code>，各有一个 Megatron engine。因为 <code>mpu</code> 是进程级全局的，<b>第二个 engine 不能、也不需要再建一次组</b>，直接复用。代价是：<b>actor 和 ref 的并行度必须完全一样</b>——这也解释了源码第 236 行那个 TODO：</p>
+<pre><code># TODO: set different parallelism for actor, critic, ref</code></pre>
+<p>以及为什么训练脚本里 ref 的那几行只是把 actor 的值抄一遍：</p>
+<span class="src">examples/grpo_trainer/run_qwen3_5_35b_megatron.sh:164</span>
+<pre><code>actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${TP}
+actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${PP}
+actor_rollout_ref.ref.megatron.context_parallel_size=${CP}
+actor_rollout_ref.ref.megatron.expert_model_parallel_size=${EP}
+actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${ETP}</code></pre>
+
+<h3 id="xf-9">9. 落地点二：Megatron-Bridge 把并行度写进 tf_config</h3>
+
+<p>组建好了，还得告诉模型「你的权重要切成几份」。这发生在 <code>initialize()</code> → <code>_build_tf_config()</code>：</p>
+
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:530</span>
+<pre><code>def initialize(self):
+    self._hf_export_tasks = None
+    self._build_tf_config()                      # ← 并行度落地点 ②
+    _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
+    self.module = self._build_megatron_module()  # ← 真正 new 出模型
+    ...</code></pre>
+
+<p><code>_build_tf_config</code> 的核心是 <b>Megatron-Bridge</b>：把 HuggingFace 的 config 翻译成 Megatron 的 provider。</p>
+
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:316</span>
+<pre><code>from verl.models.mcore.bridge import AutoBridge
+
+# Use Megatron-Bridge to convert HF config to Megatron config
+bridge = AutoBridge.from_hf_pretrained(
+    self.model_config.local_path, trust_remote_code=self.model_config.trust_remote_code)
+provider = bridge.to_megatron_provider(load_weights=False)   # ← 先不读权重，只要结构</code></pre>
+
+<div class="box note"><b>这里是 Qwen3.5 系列能跑起来的关键</b>。verl 自己<b>不再维护每个模型的 Megatron 实现</b>（<code>verl/models/mcore/</code> 下只剩 bridge、patch、forward 这些胶水文件，没有 modeling 文件）。「Qwen3.5 的 MoE 层长什么样、哪些权重要怎么切」由 <b>Megatron-Bridge 的模型注册表</b>负责。所以换模型时能不能跑 Megatron，取决于 Megatron-Bridge 支不支持那个 <code>model_type</code>，而不是 verl。<code>assert self.engine_config.use_mbridge</code>（第 190 行）就是在强制这条路径，老的手写实现已经不支持了。</div>
+
+<p>然后把并行度盖到 provider 上：</p>
+
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:331</span>
+<pre><code>virtual_pipeline_model_parallel_size = self.engine_config.virtual_pipeline_model_parallel_size
+provider_overrides = {
+    "tensor_model_parallel_size":   self.engine_config.tensor_model_parallel_size,
+    "pipeline_model_parallel_size": self.engine_config.pipeline_model_parallel_size,
+    "expert_model_parallel_size":   self.engine_config.expert_model_parallel_size,
+    "expert_tensor_parallel_size":  self.engine_config.expert_tensor_parallel_size,
+    "virtual_pipeline_model_parallel_size": virtual_pipeline_model_parallel_size,
+    "context_parallel_size":        self.engine_config.context_parallel_size,
+    "sequence_parallel":            self.engine_config.sequence_parallel,
+    "overlap_p2p_comm": (virtual_pipeline_model_parallel_size is not None
+                         and virtual_pipeline_model_parallel_size &gt; 1),
+    "batch_p2p_comm": False,
+    "variable_seq_lengths": True,
+    "attention_backend": AttnBackend.flash,
+    "moe_token_dispatcher_type": "alltoall",       # ← EP 的通信方式
+    "moe_router_load_balancing_type": "none",      # RL 里不用 aux loss 做负载均衡
+}
+for key, value in override_transformer_config.items():
+    provider_overrides[key] = value                # ← 用户的 override_transformer_config 最后盖，优先级最高</code></pre>
+
+<p>最后应用：</p>
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:370</span>
+<pre><code># Megatron-Bridge >= v0.5.0 provides apply_overrides_and_finalize.
+if hasattr(provider, "apply_overrides_and_finalize"):
+    provider.apply_overrides_and_finalize(dtype=self.param_dtype, overrides=provider_overrides)
+else:
+    provider.params_dtype = self.param_dtype
+    provider.fp16 = self.param_dtype == torch.float16
+    provider.bf16 = self.param_dtype == torch.bfloat16
+    for name, value in provider_overrides.items():
+        setattr(provider, name, value)
+    if hasattr(provider, "finalize"):
+        provider.finalize()
+self.provider = provider
+self.bridge = bridge
+self.tf_config = None   # Set after the provider creates the model.</code></pre>
+
+<p>注意 <code>moe_token_dispatcher_type="alltoall"</code>：这是 EP 的实现方式——token 按 router 选中的 expert 做 all-to-all 发到对应 EP rank，算完再 all-to-all 收回。<code>run_qwen3_5_35b_megatron.sh</code> 里还会额外打开 <code>moe_permute_fusion=True</code> 和 <code>moe_grouped_gemm=True</code> 来优化这一段。</p>
+
+<h3 id="xf-10">10. 实例推演：8 卡 TP2·EP8·ETP1</h3>
+
+<p>用 <code>run_qwen3_5_35b_megatron.sh</code> 实测过的配置（GPU 分支，单机 8 卡）：</p>
+
+<span class="src">examples/grpo_trainer/run_qwen3_5_35b_megatron.sh:52</span>
+<pre><code>TP=2  PP=1  CP=1  EP=8  ETP=1  GEN_TP=8    n_devices_per_node=8</code></pre>
+
+<p>先算 DP。DP 不在配置里，是 Megatron 用剩下的卡推出来的（<b>EP 不占这个式子</b>，它是在 DP×TP 的平面内重新划分 expert 的）：</p>
+
+<pre><code>DP = world_size / (TP × PP × CP) = 8 / (2 × 1 × 1) = 4</code></pre>
+
+<p>于是<b>非 expert 部分</b>（attention、layernorm、embedding）的卡布局是：</p>
+
+<table>
+  <tr><th>rank</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th></tr>
+  <tr><td>TP rank</td><td>0</td><td>1</td><td>0</td><td>1</td><td>0</td><td>1</td><td>0</td><td>1</td></tr>
+  <tr><td>DP rank</td><td>0</td><td>0</td><td>1</td><td>1</td><td>2</td><td>2</td><td>3</td><td>3</td></tr>
+</table>
+<p class="meta">TP 组（相邻 2 卡）：{0,1} {2,3} {4,5} {6,7}；DP 组（跨 TP 组同 TP rank）：{0,2,4,6} {1,3,5,7}。TP 放在最内层是因为它每层都要 all-reduce，必须用最快的链路（NVLink / HCCS）。</p>
+
+<p>而<b>expert 部分</b>用的是另一套划分：<code>EP=8, ETP=1</code> 表示 8 张卡各自独占一组 expert，每组 expert 的权重<b>不再切分</b>（ETP=1）：</p>
+
+<table>
+  <tr><th>rank</th><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th></tr>
+  <tr><td>EP rank</td><td>0</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td></tr>
+  <tr><td>ETP rank</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td></tr>
+</table>
+
+<div class="box key"><b>这组配置的意思</b>：同一个模型的两部分用了<b>不同的切法</b>。attention 走 TP=2（权重切两半，每层 all-reduce），expert 走 EP=8（每卡独占 1/8 的 expert，不切权重，靠 all-to-all 换 token）。<b>这正是 ETP 存在的理由</b>——如果没有 ETP，expert 的 TP 就只能跟着 attention 的 TP=2，变成 EP×ETP = 8×2 = 16 > 8 卡，放不下。<code>ETP=1</code> 把 expert 的 TP 单独降到 1，让 EP 能吃满 8 张卡。</div>
+
+<h3 id="xf-11">11. 五个维度各自切的是什么</h3>
+
+<p>下表里「verl 的位置」是 verl 代码负责的部分；<b>真正的张量切分发生在 Megatron-Core / Megatron-Bridge 内部</b>（verl 只传参数，不实现切分）。</p>
+
+<table>
+  <tr><th>维度</th><th>切什么</th><th>通信</th><th>verl 配置字段</th></tr>
+  <tr>
+    <td><b>TP</b><br>tensor</td>
+    <td>每一层的<b>权重矩阵</b>。attention 按 head 切 QKV，MLP 把 <code>h→4h</code> 按列切、<code>4h→h</code> 按行切；词表也按 vocab 切</td>
+    <td>每层 2 次 all-reduce，<b>最频繁</b>，必须同节点</td>
+    <td><code>tensor_model_parallel_size</code></td>
+  </tr>
+  <tr>
+    <td><b>PP</b><br>pipeline</td>
+    <td>按<b>层</b>切。PP=2 时前一半层在 rank 组 A、后一半在 B</td>
+    <td>只在切分边界 P2P 传 activation，<b>最省带宽</b>，可跨节点</td>
+    <td><code>pipeline_model_parallel_size</code><br><code>virtual_pipeline_model_parallel_size</code>（VPP，把层打散成多段交错执行，减少气泡）</td>
+  </tr>
+  <tr>
+    <td><b>CP</b><br>context</td>
+    <td>切<b>序列长度</b>，权重不切。每卡算一段 token 的 attention</td>
+    <td>attention 要跨段拿 KV，ring / all-gather</td>
+    <td><code>context_parallel_size</code><br><code>dynamic_context_parallel</code> + <code>max_seqlen_per_dp_cp_rank</code></td>
+  </tr>
+  <tr>
+    <td><b>EP</b><br>expert</td>
+    <td>切 MoE 的<b>expert 个数</b>。每卡放 <code>n_experts / EP</code> 个完整 expert</td>
+    <td>token 的 all-to-all（<code>moe_token_dispatcher_type="alltoall"</code>）</td>
+    <td><code>expert_model_parallel_size</code></td>
+  </tr>
+  <tr>
+    <td><b>ETP</b><br>expert tensor</td>
+    <td>在 EP 之上，再把<b>单个 expert 的权重</b>按 TP 的方式切</td>
+    <td>同 TP，但只在 expert 层内</td>
+    <td><code>expert_tensor_parallel_size</code>（<code>null</code> = 跟随 TP）</td>
+  </tr>
+  <tr>
+    <td><b>SP</b><br>sequence</td>
+    <td>不是独立维度。<b>依附 TP</b>：把 TP 组内 layernorm / dropout 这些没切的部分也按序列切开，省激活显存</td>
+    <td>把 TP 的 all-reduce 拆成 reduce-scatter + all-gather</td>
+    <td><code>sequence_parallel</code>（TP=1 时自动关，见 §12）</td>
+  </tr>
+  <tr>
+    <td><b>DP</b><br>data</td>
+    <td>不切模型，切<b>数据</b>。每组拿不同的 micro-batch</td>
+    <td>梯度 all-reduce（开 <code>use_distributed_optimizer</code> 时变成 ZeRO-1 式 reduce-scatter + all-gather）</td>
+    <td><b>无配置项</b>，由 <code>world/(TP×PP×CP)</code> 推出</td>
+  </tr>
+</table>
+
+<h3 id="xf-12">12. 四个容易踩的点</h3>
+
+<p><b>① ETP 默认是 <code>null</code>，不是 1。</b></p>
+<span class="src">verl/trainer/config/engine/megatron.yaml:17</span>
+<pre><code># expert tensor parallel size (null to be same as TP)
+expert_tensor_parallel_size: null</code></pre>
+<p><code>null</code> 会原样传给 <code>initialize_model_parallel</code>，由 Megatron 解释为「跟 TP 一样」。所以 MoE 模型如果你只设了 <code>EP=8</code> 而忘了 <code>ETP=1</code>，在 <code>TP=2</code> 下实际需要 <code>EP×ETP=16</code> 张卡，8 卡会直接起不来。</p>
+
+<p><b>② TP=1 时 <code>sequence_parallel</code> 被静默改成 False。</b></p>
+<span class="src">verl/workers/config/engine.py:227</span>
+<pre><code>if self.tensor_model_parallel_size == 1:
+    warnings.warn("set sequence parallel to false as TP size is 1", stacklevel=2)
+    self.sequence_parallel = False</code></pre>
+<p>这也是 <code>McoreEngineConfig</code> 要把 <code>sequence_parallel</code> 放进 <code>_mutable_fields</code> 的原因（第 182 行）——别的字段都是冻结的，这个要留口子自动纠正。</p>
+
+<p><b>③ actor 和 ref 的并行度必须一致</b>，原因见 §8 的 <code>mpu.is_initialized()</code>。</p>
+
+<p><b>④ dynamic CP 会把 DP rank 伪装成 0。</b></p>
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:704</span>
+<pre><code>def get_data_parallel_rank(self):
+    if self.engine_config.dynamic_context_parallel:
+        # in order to let every dp-cp group has full data to split, we set dp=1
+        return 0
+    return mpu.get_data_parallel_rank()</code></pre>
+<p>这个返回值会被 <code>TrainingWorker.__init__</code> 用去注册单控制器的数据分派信息：</p>
+<span class="src">verl/workers/engine_workers.py:179</span>
+<pre><code>self._register_dispatch_collect_info(
+    mesh_name="train",
+    dp_rank=self.engine.get_data_parallel_rank(),
+    is_collect=self.engine.is_mp_src_rank_with_outputs(),
+)</code></pre>
+<p>也就是说，<b>并行度不只影响模型怎么切，还决定了单控制器往哪些 rank 发数据、从哪些 rank 收结果</b>。收集端的判定是：</p>
+<span class="src">verl/workers/engine/megatron/transformer_impl.py:522</span>
+<pre><code>def is_mp_src_rank_with_outputs(self):
+    return (
+        mpu.get_tensor_model_parallel_rank() == 0                                        # TP 组的头
+        and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1  # PP 的最后一段（logits 在这里）
+        and mpu.get_context_parallel_rank() == 0                                         # CP 组的头
+        and (not self.engine_config.dynamic_context_parallel or mpu.get_data_parallel_rank() == 0)
+    )</code></pre>
+<p>这四个条件连起来读就是：<b>只有「TP 头 + PP 尾 + CP 头」这个 rank 手里有完整可用的输出</b>，单控制器只从它们收数据。</p>
+
+<h3 id="xf-13">13. 位置索引与小结</h3>
+
+<table>
+  <tr><th>要找什么</th><th>去哪里看</th></tr>
+  <tr><td>worker 类选择（和后端无关）</td><td><code>trainer_base.py:1049</code> <code>_init_resource_pool_mgr</code></td></tr>
+  <tr><td>外层壳 / 内层引擎的分界</td><td><code>engine_workers.py:485</code> 与 <code>:688</code></td></tr>
+  <tr><td><code>strategy</code> → engine 配置类</td><td><code>workers/config/actor.py:285</code>（<code>self.engine = self.megatron</code>）</td></tr>
+  <tr><td>五个并行度的声明</td><td><code>workers/config/engine.py:185-196</code></td></tr>
+  <tr><td>yaml 默认值</td><td><code>trainer/config/engine/megatron.yaml</code></td></tr>
+  <tr><td><b>后端 + 设备 → 引擎类</b></td><td><code>engine/base.py:406</code> <code>get_engine_cls</code></td></tr>
+  <tr><td><b>MindSpeed 注册 / repatch</b></td><td><code>engine/mindspeed/transformer_impl.py:39, 55, 66</code>；import 顺序在 <code>engine/__init__.py:54</code></td></tr>
+  <tr><td><b>并行度落地 ①：建通信组</b></td><td><code>engine/megatron/transformer_impl.py:267</code> <code>mpu.initialize_model_parallel</code></td></tr>
+  <tr><td><b>并行度落地 ②：切权重</b></td><td><code>engine/megatron/transformer_impl.py:331</code> <code>provider_overrides</code></td></tr>
+  <tr><td>HF → Megatron 结构翻译</td><td><code>engine/megatron/transformer_impl.py:316</code> <code>AutoBridge</code></td></tr>
+  <tr><td>真正 new 出模型</td><td><code>utils/megatron_utils.py:240</code> <code>make_megatron_module</code></td></tr>
+  <tr><td>CP 下 NPU 的数据预处理</td><td><code>models/mcore/util.py:231</code> <code>preprocess_for_mindspeed</code></td></tr>
+  <tr><td>实测过的并行配置</td><td><code>examples/grpo_trainer/run_qwen3_5_35b_megatron.sh:38</code></td></tr>
+</table>
+
+<div class="box key">
+<b>三句话总结</b>
+<ol>
+  <li><b>Megatron 不是在 worker 层选的，是在引擎层选的。</b> worker 类只有两个，和后端无关；<code>EngineRegistry</code> 用 <code>model_type × backend × (device, vendor)</code> 三维键查表，<code>strategy=megatron</code> 在 NPU 上自然命中 MindSpeed 子类。</li>
+  <li><b>MindSpeed 是「同一套 Megatron 代码 + 猴子补丁」</b>，不是另一个后端。它的子类只重写 <code>_init_device_mesh</code>（插 repatch）和 <code>to</code>（FP8 搬运），分片代码零改动。</li>
+  <li><b>并行度要落两次</b>：<code>initialize_model_parallel</code> 建通信组（进程全局、只建一次、所以 actor/ref 必须同构），<code>provider_overrides</code> 告诉 Megatron-Bridge 按多少份切权重。<b>TP/PP/CP 决定 DP（相除得到），EP/ETP 则在这个平面内另行划分 expert</b>。</li>
+</ol>
+</div>
+
+<h3>思考题</h3>
+<ol>
+  <li>§10 那组配置里，如果把 <code>ETP</code> 从 1 改成 2，需要几张卡才跑得起来？DP 会变成多少？</li>
+  <li>为什么 <code>is_mp_src_rank_with_outputs</code> 要求的是 PP 的<b>最后</b>一段而不是第一段？（提示：想想 logits 在哪算出来。）</li>
+  <li>rollout 侧的 <code>GEN_TP=8</code> 和训练侧的 <code>TP=2</code> 不一样，权重同步时这个差异是谁负责抹平的？（提示：回到<a href="xe-separate-async-init.html">插课 E</a> 的权重同步器。）</li>
+</ol>
+
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xe-separate-async-init.html">← 插课 E</a></div>
+</main>
+</body>
+</html>

@@ -1,0 +1,189 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "command": "finalize",
+  "status": "fail",
+  "type": "sequence",
+  "quality": "showcase",
+  "startedAt": "2026-10-31T09:15:06.154Z",
+  "specification": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/ppo-step.candidate.json",
+    "sha256": "662607f0edff63c5f7237de29bb88003138f4e68e7a0d8ed307a17b033962801",
+    "bytes": 21062
+  },
+  "artifact": {
+    "path": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-ppo-step.html",
+    "sha256": "c3c88078bdd71dee628ea9252b57f5cafe2a8317d7132e03ec38886baabb1558",
+    "bytes": 857456
+  },
+  "stages": {
+    "validate": {
+      "status": "fail",
+      "exitCode": 1,
+      "durationMs": null,
+      "command": [
+        "/home/liu/.nvm/versions/node/v24.18.0/bin/node",
+        "/home/liu/.agents/skills/archify/bin/archify.mjs",
+        "deliver",
+        "sequence",
+        "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/ppo-step.candidate.json",
+        "/home/liu/projects/verl/docs/learning-mimo/arch/verl-ppo-step.html",
+        "--quality",
+        "showcase",
+        "--repo-root",
+        "/home/liu/projects/verl",
+        "--json"
+      ],
+      "receipt": {
+        "schemaVersion": 1,
+        "ok": false,
+        "command": "deliver",
+        "receiptId": "65e62ea6-bb30-42ec-8e38-8d0b09ce8556",
+        "stage": "render",
+        "type": "sequence",
+        "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/ppo-step.candidate.json",
+        "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-ppo-step.html",
+        "error": "sequence schema validation failed:\n  /cards/3/dot must be equal to one of the allowed values {\"allowedValues\":[\"cyan\",\"emerald\",\"violet\",\"amber\",\"rose\",\"orange\",\"slate\"]}\n  /cards/4/dot must be equal to one of the allowed values {\"allowedValues\":[\"cyan\",\"emerald\",\"violet\",\"amber\",\"rose\",\"orange\",\"slate\"]}",
+        "diagnostics": [
+          {
+            "code": "schema/enum",
+            "severity": "error",
+            "message": "/cards/3/dot must be equal to one of the allowed values",
+            "subject": {
+              "diagramType": "sequence",
+              "path": "/cards/3/dot"
+            },
+            "evidence": {
+              "keyword": "enum",
+              "allowedValues": [
+                "cyan",
+                "emerald",
+                "violet",
+                "amber",
+                "rose",
+                "orange",
+                "slate"
+              ]
+            },
+            "supportedFixes": [
+              "choose one of the allowed values"
+            ]
+          },
+          {
+            "code": "schema/enum",
+            "severity": "error",
+            "message": "/cards/4/dot must be equal to one of the allowed values",
+            "subject": {
+              "diagramType": "sequence",
+              "path": "/cards/4/dot"
+            },
+            "evidence": {
+              "keyword": "enum",
+              "allowedValues": [
+                "cyan",
+                "emerald",
+                "violet",
+                "amber",
+                "rose",
+                "orange",
+                "slate"
+              ]
+            },
+            "supportedFixes": [
+              "choose one of the allowed values"
+            ]
+          }
+        ],
+        "provenance": "failed",
+        "update": {
+          "status": "unavailable",
+          "installedVersion": null,
+          "availableVersion": null,
+          "releaseNotes": null,
+          "checkedAt": null,
+          "source": null,
+          "noticeRequired": false,
+          "noticeText": null,
+          "reason": "disabled"
+        }
+      },
+      "execution": "embedded-in-deliver"
+    },
+    "deliver": {
+      "status": "not-run",
+      "execution": "blocked-by-validate"
+    }
+  },
+  "browserCheck": {
+    "requested": true,
+    "ran": false
+  },
+  "diagnostics": [
+    {
+      "code": "schema/enum",
+      "severity": "error",
+      "message": "/cards/3/dot must be equal to one of the allowed values",
+      "subject": {
+        "diagramType": "sequence",
+        "path": "/cards/3/dot"
+      },
+      "evidence": {
+        "keyword": "enum",
+        "allowedValues": [
+          "cyan",
+          "emerald",
+          "violet",
+          "amber",
+          "rose",
+          "orange",
+          "slate"
+        ]
+      },
+      "supportedFixes": [
+        "choose one of the allowed values"
+      ]
+    },
+    {
+      "code": "schema/enum",
+      "severity": "error",
+      "message": "/cards/4/dot must be equal to one of the allowed values",
+      "subject": {
+        "diagramType": "sequence",
+        "path": "/cards/4/dot"
+      },
+      "evidence": {
+        "keyword": "enum",
+        "allowedValues": [
+          "cyan",
+          "emerald",
+          "violet",
+          "amber",
+          "rose",
+          "orange",
+          "slate"
+        ]
+      },
+      "supportedFixes": [
+        "choose one of the allowed values"
+      ]
+    }
+  ],
+  "evidence": {
+    "receipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rv-a-ps/verl-ppo-step.finalize.json",
+    "summaryReceipt": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/rv-a-ps/verl-ppo-step.finalize-summary.json"
+  },
+  "visualReview": "not-requested",
+  "failedStage": "validate",
+  "finishedAt": "2026-10-31T09:15:06.408Z",
+  "durationMs": 253,
+  "update": {
+    "status": "current",
+    "installedVersion": "3.2.0",
+    "availableVersion": "3.2.0",
+    "releaseNotes": null,
+    "checkedAt": "2026-10-30T16:19:25.419Z",
+    "source": "cache",
+    "noticeRequired": false,
+    "noticeText": null
+  }
+}

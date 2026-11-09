@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "7b84b190-7d54-4efb-a4e2-c338d4da448b",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/npu.candidate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-npu.html",
+  "specification": {
+    "sha256": "05815fc3cde34d0a2f044e63d66697471f03e8de2180d5c8093444826e558c25",
+    "bytes": 19115
+  },
+  "artifact": {
+    "sha256": "39c3d03de77cd70547712adcd9802e76253df818a47b380d2b0d991d7d087238",
+    "bytes": 862905
+  }
+}

@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>verl 流程细节地图 · 索引</title>
+<link rel="stylesheet" href="../style.css">
+</head>
+<body>
+<nav class="side">
+  <h2>地图索引</h2>
+  <ol>
+    <li><a href="#about">说明</a></li>
+    <li><a href="#how">怎么查</a></li>
+    <li><a href="#init">初始化</a></li>
+    <li><a href="#train">训练</a></li>
+    <li><a href="#sub">子模块</a></li>
+    <li><a href="#anim">分片动画</a></li>
+    <li><a href="#pins">版本钉子</a></li>
+    <li><a href="#caveat">已知坑与死代码</a></li>
+  </ol>
+  <h2 style="margin-top:20px">九张图</h2>
+  <ol>
+    <li><a href="verl-init.html">初始化总分图</a></li>
+    <li><a href="verl-train-loop.html">训练主循环与三模式</a></li>
+    <li><a href="verl-ppo-step.html">训练步九阶段</a></li>
+    <li><a href="verl-single-controller.html">single-controller 分派</a></li>
+    <li><a href="verl-rollout.html">推理副本与路由</a></li>
+    <li><a href="verl-weight-sync.html">权重同步</a></li>
+    <li><a href="verl-engines.html">vLLM / SGLang 内部</a></li>
+    <li><a href="verl-npu.html">NPU 补丁分层</a></li>
+    <li><a href="verl-model-init.html">模型初始化与设备放置</a></li>
+    <li><a href="verl-sharding-anim.html">并行与分片动画</a></li>
+  </ol>
+  <h2 style="margin-top:20px">返回</h2>
+  <ol><li><a href="../index.html">学习笔记总览</a></li></ol>
+</nav>
+<main>
+<div class="topbar"><a href="../index.html">← 学习笔记总览</a><span class="sp"></span></div>
+
+<h1>verl 流程细节地图 · 索引</h1>
+
+<h2 id="about">说明</h2>
+<p class="meta">仓库 <code>/home/liu/projects/verl</code>，分支 <code>mimo-agent-env</code>，revision <code>f4becf6e</code>。</p>
+<div class="box key">
+  <b>怎么用这些图</b>：图本身只回答「有哪些环节、顺序是什么」。<b>每个模块干什么、内部怎么做变换、有哪些坑，全部写在图下面的参考卡片里</b>，卡片标题用 ①②③ 与图中的环节一一对应，可以直接按编号查。
+  卡片最后一行是该模块的源码位置（文件 + 行号区间）。
+  <br><b>编号对应关系</b>：图上<b>每个</b>节点都带号，与下方卡片标题的号一一对应，已用脚本逐页核对（9 页全部对齐）。带 ′ 的（如 ②′ ④′）是同一环节下的细节层或替代路径。
+  <br><b>卡片的写法</b>：每张卡片按「<b>触发</b>（什么时候、由谁调起）→ <b>为什么</b>（这一步要解决什么问题、为什么是这个顺序）→ <b>怎么做</b>（实际代码与变换）」组织，不只写「做了什么」。
+</div>
+<ul>
+  <li>采用总—分结构：先看<b>初始化</b>和<b>训练</b>两张主干图，再按需要点进对应的子模块图。</li>
+  <li>所有图都是单文件 HTML，离线可看，右上角可切 Live / Still 控制动效，支持搜索与聚焦。</li>
+  <li>与硬件、分片相关的部分做成了<a href="verl-sharding-anim.html">可交互的 2D / 3D 动画</a>，维度名和形状全部取自真实的 <code>init_device_mesh</code> 调用。</li>
+  <li>不在本仓库的子模块（vLLM、SGLang、Megatron-LM、Ascend 全套）已按匹配版本 clone 进 <code>third_party/</code> 并登记为 git submodule，版本绑定到具体 commit，见<a href="#pins">版本钉子</a>。</li>
+</ul>
+
+<h2 id="how">怎么查</h2>
+<table>
+  <tr><th>我想知道……</th><th>看这张</th></tr>
+  <tr><td>启动一次训练，从命令行到进入 fit 都发生了什么</td><td><a href="verl-init.html">初始化总分图</a></td></tr>
+  <tr><td><code>_setup()</code> 的十九步里第 N 步是什么</td><td><a href="verl-init.html">初始化总分图</a>（紫色卡片）</td></tr>
+  <tr><td>sync / colocate_async / separate_async 到底差在哪</td><td><a href="verl-train-loop.html">训练主循环与三模式</a></td></tr>
+  <tr><td>一个 global step 里 GPU 在谁手上、什么时候换手</td><td><a href="verl-train-loop.html">训练主循环与三模式</a></td></tr>
+  <tr><td>优势、奖励、logprob 这些阶段的先后与条件</td><td><a href="verl-ppo-step.html">训练步九阶段</a></td></tr>
+  <tr><td>driver 上一行 <code>wg.xxx(batch)</code> 怎么变成 N 次远程调用</td><td><a href="verl-single-controller.html">single-controller 分派</a></td></tr>
+  <tr><td>八种 Dispatch 模式分别怎么切数据</td><td><a href="verl-single-controller.html">single-controller 分派</a></td></tr>
+  <tr><td>actor / critic / ref 怎么挤在同一张卡上</td><td><a href="verl-single-controller.html">single-controller 分派</a>（共卡卡片）</td></tr>
+  <tr><td>推理副本怎么算出来、请求怎么路由</td><td><a href="verl-rollout.html">推理副本与路由</a></td></tr>
+  <tr><td>训练完的分片权重怎么进到推理引擎里</td><td><a href="verl-weight-sync.html">权重同步</a></td></tr>
+  <tr><td>vLLM / SGLang 内部有哪些进程、怎么通信</td><td><a href="verl-engines.html">vLLM / SGLang 内部</a></td></tr>
+  <tr><td>昇腾那一套 MindSpeed / vllm-ascend 是怎么生效的</td><td><a href="verl-npu.html">NPU 补丁分层</a></td></tr>
+  <tr><td>FSDP / Ulysses / 推理 mesh 的维度名和形状</td><td><a href="verl-sharding-anim.html">并行与分片动画</a></td></tr>
+  <tr><td>某个具体参数怎么从分片聚合成完整张量</td><td><a href="verl-weight-sync.html">权重同步</a> 卡片 ③</td></tr>
+  <tr><td>MoE 专家张量的形状怎么拆（[E,2I,H] → 单专家）</td><td><a href="verl-weight-sync.html">权重同步</a> 卡片 ⑤</td></tr>
+  <tr><td>vLLM 的 KV cache 块和实际显存是什么关系</td><td><a href="verl-engines.html">vLLM / SGLang 内部</a> 卡片 ⑥</td></tr>
+  <tr><td>vLLM 调度器每步怎么裁剪 token 预算、怎么抢占</td><td><a href="verl-engines.html">vLLM / SGLang 内部</a> 卡片 ③</td></tr>
+  <tr><td>SGLang 的前缀树怎么匹配、怎么淘汰</td><td><a href="verl-engines.html">vLLM / SGLang 内部</a> 卡片 ⑩</td></tr>
+  <tr><td>Megatron 分布式优化器为什么在昇腾上能构造出来</td><td><a href="verl-npu.html">NPU 补丁分层</a> 第一张卡片</td></tr>
+  <tr><td>exp_avg / exp_avg_sq 到底存在哪个 rank 上</td><td><a href="verl-npu.html">NPU 补丁分层</a> 卡片 ②′</td></tr>
+  <tr><td>不共卡时 actor / rollout / ref 各自怎么成组</td><td><a href="verl-init.html">初始化总分图</a> 卡片 ④′</td></tr>
+  <tr><td>PD 分离后副本数怎么算、prefill 与 decode 怎么切 worker</td><td><a href="verl-init.html">初始化总分图</a> 卡片 ④″</td></tr>
+  <tr><td>Megatron 怎么在各设备上建层、读权重、切分片</td><td><a href="verl-model-init.html">模型初始化与设备放置</a></td></tr>
+  <tr><td>vLLM / SGLang 怎么加载权重、KV 块数怎么定出来</td><td><a href="verl-model-init.html">模型初始化与设备放置</a> 卡片 ④⑤</td></tr>
+  <tr><td>某个投影在 TP=8 下每个 rank 到底拿到什么形状</td><td><a href="verl-model-init.html">模型初始化与设备放置</a> 卡片 ④（实例）</td></tr>
+  <tr><td>KV 头数少于 TP 时两边各自怎么处理</td><td><a href="verl-model-init.html">模型初始化与设备放置</a> 卡片 ④（GQA）</td></tr>
+  <tr><td>hybrid 注意力 / MTP 层对 KV cache 的影响</td><td><a href="verl-model-init.html">模型初始化与设备放置</a> 卡片 ⑥</td></tr>
+</table>
+
+<h2 id="init">初始化</h2>
+<div class="cards">
+  <div class="card">
+    <h3><a href="verl-init.html">初始化总分图</a></h3>
+    <ul>
+      <li>主干 ①–⑥：启动与 Ray 集群 → TaskRunner 与选型 → 数据面 → 资源池与 WorkerGroup → 引擎与模型 → 就绪与首推权重。</li>
+      <li>每条泳道是该阶段内部的真实调用顺序；<code>_setup()</code> 十九步的编号写在箭头上（「第 N 步」），不要和卡片编号混淆。</li>
+      <li>两条非默认部署路径单独画出：<b>④′ 非共卡</b>（<code>Role.Actor</code> + 独立 <code>RefPolicy</code>，生成全交给 standalone 副本）和 <b>④″ PD 分离</b>（1 prefill + N decode，副本 world_size 被放大）。</li>
+      <li>还画了 v0 旧版路径，以及 separate_async 的额外初始化（DetachActorWorker、第二套服务与检查点管理器）。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="verl-single-controller.html">single-controller 分派</a></h3>
+    <ul>
+      <li>一次 driver 调用的六步闭包，以及八种 Dispatch 模式的切分语义。</li>
+      <li>实际在用的是「字典模式」ND mesh 分派：按 <code>dp_size</code> 切，同一 dp 组共享一个 ObjectRef。</li>
+      <li>共卡机制：<code>WorkerDict</code> 只跑一次 <code>Worker.__init__</code>，角色方法加前缀再在 driver 侧剥掉。</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="train">训练</h2>
+<div class="cards">
+  <div class="card">
+    <h3><a href="verl-train-loop.html">训练主循环与三模式</a></h3>
+    <ul>
+      <li>主干是与模式无关的一个 global step；下面三条泳道是同一个钩子在三种模式下的不同动作。</li>
+      <li>标清了容易记错的两个顺序：存检查点在 <code>on_step_end</code> <b>之前</b>，校验在<b>之后</b>。</li>
+      <li>生成侧单独一行——它在另一个进程里持续跑，只通过 TransferQueue 与主干相连。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="verl-ppo-step.html">训练步九阶段</a></h3>
+    <ul>
+      <li><code>_step_once</code> 的九个阶段画成 driver ↔ worker ↔ TQ 的消息往返，阶段名就是 <code>timing_s/*</code> 指标名。</li>
+      <li>解释了为什么 <code>compute_log_prob</code> 的返回值只被断言长度：结果其实写回了 TQ。</li>
+      <li>一个 global step ≠ 一次更新：外层还有 <code>parameter_sync_step</code> 循环（Decoupled PPO）。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="verl-weight-sync.html">权重同步</a></h3>
+    <ul>
+      <li>默认的 naive 同卡路径时序：先只恢复 weights 显存，逐张量 <code>full_tensor()</code>，填 IPC 字节桶，最后 barrier 再重建 KV cache。</li>
+      <li>显存峰值只有「一个完整张量 + 一个字节桶」，不是整个模型。</li>
+      <li>非 naive 的六种检查点引擎（nccl / hccl / nixl / mooncake / kimi / delta_sharded）各自的搬运机制。</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="sub">子模块</h2>
+<div class="cards">
+  <div class="card">
+    <h3><a href="verl-rollout.html">推理副本与路由</a></h3>
+    <ul>
+      <li>生成请求<b>根本不走 HTTP</b>，是一次打到 node-rank-0 server actor 的 Ray RPC。</li>
+      <li>副本几何：一个副本 = 一个 TP×DP×PP 组，可跨节点，每节点一个 server actor。</li>
+      <li>三种 RolloutMode（HYBRID / COLOCATED / STANDALONE）在显存与权重同步上的区别。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="verl-engines.html">vLLM / SGLang 内部</a></h3>
+    <ul>
+      <li>vLLM v0.32.0：Ray actor（AsyncLLM 前端）→ EngineCoreProc → 每 TP rank 一个 worker 子进程，executor 后端是 <code>mp</code> 而<b>不是</b> external_launcher。</li>
+      <li>SGLang v0.5.20：verl 绕过 <code>launch_server</code>，直接用 <code>Engine._launch_subprocesses</code>；这一版没有 <code>VerlEngine</code>。</li>
+      <li>睡眠 / 唤醒之所以可行，是因为权重和 KV cache 分别挂在 CuMem 分配器的不同标签下。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="verl-npu.html">NPU 补丁分层</a></h3>
+    <ul>
+      <li>一句话看懂昇腾策略：未改动的 Megatron 问「你是 CUDA 张量吗」，Ascend 层给 <code>Tensor.type</code> 套包装器，把 <code>npu</code> 改写成 <code>cuda</code>。</li>
+      <li>verl 自己的 NPU 代码只有 155 行，真正的替换由 MindSpeed / MegatronAdaptor 的 256 个补丁点在底下完成。</li>
+      <li>推理侧没有 NPU 专属模块，vllm-ascend 靠 vLLM 的 platform plugin 入口点挂进去。</li>
+    </ul>
+  </div>
+</div>
+
+<div class="cards">
+  <div class="card">
+    <h3><a href="verl-model-init.html">模型初始化与设备放置</a></h3>
+    <ul>
+      <li>主干 ①–⑥ 是训练侧与推理侧<b>共有</b>的六个阶段：定并行组 → 分层 → 建空层 → 读权重并切分 → 包装定量 → 就位。</li>
+      <li>两条泳道对照同一阶段的不同做法。最大的差异在读权重：<b>Megatron 侧每个 TP rank 都读整张张量、只有 tp0 用得上、再 scatter；推理侧每 rank 自读自切、没有 scatter</b>。</li>
+      <li>第四条泳道代入 <b>Qwen3.8-27B</b> 的真实 config.json 算具体形状。</li>
+      <li>这个模型有三个特别之处：hybrid 注意力（64 层 = 16 full + 48 linear）、1 层 MTP、以及 <code>head_dim=256 × 24 头 = 6144 ≠ hidden 5120</code>。</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="anim">分片动画</h2>
+<div class="cards">
+  <div class="card">
+    <h3><a href="verl-sharding-anim.html">并行与分片动画（2D / 3D）</a></h3>
+    <ul>
+      <li>① FSDP 参数分片：<code>("fsdp",)</code> 一维全分片 vs <code>("ddp","fsdp")</code> 二维 HSDP，可调 world_size / fsdp_size。</li>
+      <li>② Ulysses：<code>("dp","sp")</code>，演示 batch 按 dp 切、序列按 sp 切；sp 在内层所以连续 rank 构成一个 Ulysses 组。</li>
+      <li>③ 推理侧 <code>("dp","infer_tp","infer_pp")</code> 三维 mesh，可旋转，可高亮 TP 组 / dp 切片 / 权重同步的 TP leader。</li>
+      <li>④ 权重回收与下发：逐张量 all-gather 填 IPC 字节桶的过程动画。</li>
+      <li>底部是五个训练后端的维度名对照表，包含一个容易踩的差异：token 预算分别按 ulysses / CP / TP 缩放，Automodel 根本不缩放。</li>
+    </ul>
+  </div>
+</div>
+
+<h2 id="pins">版本钉子</h2>
+<p>不在本仓库的子模块都 clone 进 <code>third_party/</code> 并登记为 git submodule（<code>.gitmodules</code> 已更新），指针绑定到具体 commit：</p>
+<table>
+  <tr><th>submodule</th><th>版本</th><th>commit</th><th>钉子来源</th></tr>
+  <tr><td><code>third_party/vllm</code></td><td>v0.32.0</td><td>5df63a7</td><td><code>pyproject.toml</code> vllm extra</td></tr>
+  <tr><td><code>third_party/sglang</code></td><td>v0.5.20</td><td>94602c9</td><td><code>pyproject.toml</code> sglang extra</td></tr>
+  <tr><td><code>third_party/Megatron-LM</code></td><td>core_v0.18.0</td><td>ba7b5eb</td><td><code>Dockerfile.stable.*</code> 的 MCORE_VERSION</td></tr>
+  <tr><td><code>third_party/vllm-ascend</code></td><td>releases/v0.23.0</td><td>2c905d7</td><td rowspan="7"><code>docker/ascend/Dockerfile.ascend_9.1.0_a3</code></td></tr>
+  <tr><td><code>third_party/MindSpeed</code></td><td>core_r0.18.0</td><td>5f44028</td></tr>
+  <tr><td><code>third_party/MegatronAdaptor</code></td><td>core_r0.18.0</td><td>7186d4d</td></tr>
+  <tr><td><code>third_party/MindSpeed-Bridge</code></td><td>master</td><td>f74d52a</td></tr>
+  <tr><td><code>third_party/MindSpeed-Ops</code></td><td>master</td><td>8028b29</td></tr>
+  <tr><td><code>third_party/TransformerEngineNPU</code></td><td>main</td><td>d405be2</td></tr>
+  <tr><td><code>third_party/Megatron-Bridge</code></td><td>v0.5.0</td><td>fcbb603</td></tr>
+</table>
+<div class="box warn">
+  <b>一个无法两全的地方</b>：CUDA 线（<code>pyproject.toml</code>）要 vLLM <code>v0.32.0</code>，NPU 线（Ascend Dockerfile）要 <code>v0.23.0</code>。
+  一个 submodule 路径只能钉一个 commit，所以 <code>third_party/vllm</code> 停在 0.32.0，NPU 的版本差异在
+  <a href="verl-npu.html">NPU 图</a>上单独标了出来，没有复制第二份 checkout。
+  <code>MindSpeed-Bridge</code> / <code>MindSpeed-Ops</code> / <code>TransformerEngineNPU</code> 上游没有打 tag，Dockerfile 也是取默认分支，所以钉的是当时的默认分支 HEAD。
+</div>
+
+<h2 id="caveat">已知坑与死代码</h2>
+<p>读代码时容易被带偏的地方，各图的卡片里都标了，这里汇总：</p>
+<ul>
+  <li><b>没有 register center</b>：MASTER_ADDR / PORT 由一个钉在 PG 0 bundle 0 上的 Ray task 返回；<code>ray_wait_register_center_timeout</code> 被接收但从未使用。</li>
+  <li><b>worker 里的 LOCAL_WORLD_SIZE 恒为 1</b>：WorkerGroup 注入的是 <code>RAY_LOCAL_WORLD_SIZE</code>，要真实值得读那个。</li>
+  <li><b>FusedWorker 全套没有调用方</b>：实际在跑的是被注释标成 deprecated 的 <code>WorkerDict</code> 路径。</li>
+  <li><b><code>DISABLE_WORKER_INIT</code> 被写两次、从未被读</b>，所以角色子 worker 其实跑完了完整的 <code>__init__</code>。</li>
+  <li><b><code>Dispatch.RANK_ZERO</code></b> 注册了枚举但注册表里没有函数，全仓无人使用。</li>
+  <li><b>rollout 侧死代码</b>：<code>HFRollout</code> / <code>NaiveRollout</code> 在 ABCMeta 下无法实例化；<code>rollout/schemas.py</code> 只被测试引用；<code>rollout/tokenizer.py</code> 无人导入。</li>
+  <li><b><code>rollout.mode</code> 只有 <code>async</code> 可达</b>，<code>sync</code> 直接抛错。</li>
+  <li><b>容错几乎没有</b>：没有 <code>max_restarts</code> / 重试 / 部分失败处理，单 rank 异常直接从 <code>ray.get</code> 冒出来。</li>
+  <li><b>待确认</b>：<code>fit()</code> 在最后一步传 <code>prefetch_next_batch=False</code>，sync 模式下生产者/消费者是一步一批、没有缓冲，最后一步 <code>sample</code> 可能无数据可取。读过的代码里没有能排除这一点的逻辑，记作疑问而不是结论。</li>
+</ul>
+
+<div class="box note">
+  <b>关于图里那个「节点索引」面板</b>：它是 Viewer 自带的侧栏组件（「要点与索引」那个开关下面），默认是 <code>hidden</code> 的，不属于本页写的内容，也没有 schema 开关能关掉它。
+  嫌它多余就把侧栏收起来即可；真要从 HTML 里删掉，就得在 archify 产出之后再后处理一遍，那会让它自带的校验收据失效。
+</div>
+
+<div class="box note">
+  行号以写图时的 revision <code>f4becf6e</code> 为准，改代码后可能偏移。图上的源码链接指向本地 checkout；该 revision 没有推到远端，所以链接不可点开。
+</div>
+
+</main>
+</body>
+</html>

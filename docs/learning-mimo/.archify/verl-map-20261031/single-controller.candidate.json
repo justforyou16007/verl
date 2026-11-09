@@ -1,0 +1,657 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "verl single-controller：一次 driver 调用如何变成 N 次远程调用",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-single-controller.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "lanes": [
+    {
+      "id": "bind",
+      "label": "建组时一次性绑定"
+    },
+    {
+      "id": "main",
+      "label": "一次调用的六步"
+    },
+    {
+      "id": "nd",
+      "label": "ND mesh 分派细节"
+    },
+    {
+      "id": "tq",
+      "label": "TransferQueue 桥"
+    },
+    {
+      "id": "coloc",
+      "label": "角色共卡"
+    }
+  ],
+  "phases": [
+    {
+      "id": "pre",
+      "label": "切分",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "fan",
+      "label": "扇出与执行",
+      "fromCol": 2,
+      "toCol": 3,
+      "variant": "emphasis"
+    },
+    {
+      "id": "back",
+      "label": "汇总",
+      "fromCol": 4,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "m0",
+    "m1",
+    "m2",
+    "m3",
+    "m4",
+    "m5"
+  ],
+  "nodes": [
+    {
+      "id": "b0",
+      "lane": "bind",
+      "col": 0,
+      "type": "backend",
+      "label": "⓪ _bind_worker_method",
+      "sublabel": "建组时扫 MAGIC_ATTR",
+      "sources": [
+        {
+          "path": "verl/single_controller/base/worker_group.py",
+          "line": 185,
+          "end_line": 255,
+          "label": "绑定"
+        },
+        {
+          "path": "verl/single_controller/base/decorator.py",
+          "line": 398,
+          "end_line": 444,
+          "label": "@register"
+        }
+      ]
+    },
+    {
+      "id": "b1",
+      "lane": "bind",
+      "col": 1,
+      "type": "backend",
+      "label": "⓪ func_generator",
+      "sublabel": "闭包成 Functor",
+      "sources": [
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 49,
+          "end_line": 67,
+          "label": "func_generator"
+        }
+      ]
+    },
+    {
+      "id": "m0",
+      "lane": "main",
+      "col": 0,
+      "type": "backend",
+      "icon": "start",
+      "label": "① wg.compute_log_prob(batch)",
+      "sublabel": "driver 侧像本地调用",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/ray_trainer.py",
+          "line": 1333,
+          "end_line": 1333,
+          "label": "调用点"
+        }
+      ]
+    },
+    {
+      "id": "m1",
+      "lane": "main",
+      "col": 1,
+      "type": "messagebus",
+      "label": "② dispatch_fn",
+      "sublabel": "按 dp_size 切分并 ray.put",
+      "sources": [
+        {
+          "path": "verl/single_controller/base/decorator.py",
+          "line": 266,
+          "end_line": 279,
+          "label": "lazy dispatch"
+        }
+      ]
+    },
+    {
+      "id": "m2",
+      "lane": "main",
+      "col": 2,
+      "type": "cloud",
+      "label": "③ execute_fn",
+      "sublabel": "每个 rank 一次 .remote()",
+      "sources": [
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 890,
+          "end_line": 918,
+          "label": "execute_all_async"
+        }
+      ]
+    },
+    {
+      "id": "m3",
+      "lane": "main",
+      "col": 3,
+      "type": "external",
+      "label": "④ worker 方法体",
+      "sublabel": "@register 包出来的 inner",
+      "sources": [
+        {
+          "path": "verl/workers/engine_workers.py",
+          "line": 753,
+          "end_line": 759,
+          "label": "compute_log_prob"
+        }
+      ]
+    },
+    {
+      "id": "m4",
+      "lane": "main",
+      "col": 4,
+      "type": "messagebus",
+      "label": "⑤ collect_fn",
+      "sublabel": "丢掉非源 rank 的 None",
+      "sources": [
+        {
+          "path": "verl/single_controller/base/decorator.py",
+          "line": 236,
+          "end_line": 247,
+          "label": "collect_nd_compute"
+        }
+      ]
+    },
+    {
+      "id": "m5",
+      "lane": "main",
+      "col": 5,
+      "type": "backend",
+      "icon": "success",
+      "label": "⑥ 返回给 driver",
+      "sublabel": "按 padding_count 去尾",
+      "sources": [
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 58,
+          "end_line": 63,
+          "label": "去 padding"
+        }
+      ]
+    },
+    {
+      "id": "n0",
+      "lane": "nd",
+      "col": 1,
+      "type": "cloud",
+      "label": "②′ _query_dispatch_info",
+      "sublabel": "ONE_TO_ALL 拿 dp_rank",
+      "sources": [
+        {
+          "path": "verl/single_controller/base/worker.py",
+          "line": 86,
+          "end_line": 100,
+          "label": "注册 mesh 信息"
+        }
+      ]
+    },
+    {
+      "id": "n1",
+      "lane": "nd",
+      "col": 2,
+      "type": "cloud",
+      "label": "②′ 同 dp 组共享 ObjectRef",
+      "sublabel": "TP/PP 对等体不各存一份",
+      "tag": "parallel_put 一次",
+      "sources": [
+        {
+          "path": "verl/single_controller/base/decorator.py",
+          "line": 202,
+          "end_line": 233,
+          "label": "dispatch_nd_compute"
+        }
+      ]
+    },
+    {
+      "id": "t0",
+      "lane": "tq",
+      "col": 3,
+      "type": "database",
+      "label": "④′ tqbridge",
+      "sublabel": "meta → 真张量 → 写回",
+      "sources": [
+        {
+          "path": "verl/utils/transferqueue_utils.py",
+          "line": 347,
+          "end_line": 420,
+          "label": "tqbridge"
+        }
+      ]
+    },
+    {
+      "id": "c0",
+      "lane": "coloc",
+      "col": 2,
+      "type": "cloud",
+      "label": "③′ WorkerDict actor",
+      "sublabel": "一卡一个，带角色前缀",
+      "sources": [
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 1012,
+          "end_line": 1053,
+          "label": "create_colocated_worker_cls"
+        }
+      ]
+    },
+    {
+      "id": "c1",
+      "lane": "coloc",
+      "col": 3,
+      "type": "cloud",
+      "label": "③′ worker_dict[role]",
+      "sublabel": "本地对象，非 Ray actor",
+      "sources": [
+        {
+          "path": "verl/single_controller/ray/base.py",
+          "line": 944,
+          "end_line": 989,
+          "label": "方法转发"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "s-b0b1",
+      "from": "b0",
+      "to": "b1",
+      "label": "读 dispatch/execute",
+      "variant": "dashed"
+    },
+    {
+      "id": "s-b1m1",
+      "from": "b1",
+      "to": "m1",
+      "label": "装上闭包",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "s-m0m1",
+      "from": "m0",
+      "to": "m1",
+      "variant": "emphasis"
+    },
+    {
+      "id": "s-m1n0",
+      "from": "m1",
+      "to": "n0",
+      "label": "首次查缓存",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "s-n0n1",
+      "from": "n0",
+      "to": "n1",
+      "label": "算 dp_size"
+    },
+    {
+      "id": "s-m1m2",
+      "from": "m1",
+      "to": "m2",
+      "variant": "emphasis"
+    },
+    {
+      "id": "s-m2c0",
+      "from": "m2",
+      "to": "c0",
+      "label": "共卡时",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "s-c0c1",
+      "from": "c0",
+      "to": "c1",
+      "label": "剥前缀转发"
+    },
+    {
+      "id": "s-m2m3",
+      "from": "m2",
+      "to": "m3",
+      "variant": "emphasis"
+    },
+    {
+      "id": "s-m3t0",
+      "from": "m3",
+      "to": "t0",
+      "label": "开启 TQ 时",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "s-m3m4",
+      "from": "m3",
+      "to": "m4",
+      "variant": "emphasis"
+    },
+    {
+      "id": "s-m4m5",
+      "from": "m4",
+      "to": "m5",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "slate",
+      "title": "⓪ 触发：绑定到底在哪一刻发生",
+      "items": [
+        "不是 import 时，也不是第一次调用时，而是<b>建 WorkerGroup 的那一刻</b>。",
+        "RayWorkerGroup.__init__ 的最后一句：if ray_cls_with_init is not None: self._bind_worker_method(...)。",
+        "往上一层：trainer._setup() 第 10 步对每个资源池 create_colocated_worker_cls → RayWorkerGroup(...)。",
+        "spawn(prefix_set) 会再触发一次：它为每个角色用 from_detached 新建门面，构造时又绑一遍。",
+        "源码：ray/base.py:505-506；调用方 trainer_base.py:567-578"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "⓪ 为什么要「绑定」这一步",
+      "items": [
+        "问题：被装饰的方法在 <b>worker 进程</b>的类上，而切分 / 汇总逻辑要跑在 <b>driver</b> 上。",
+        "两边是不同进程，装饰器没法在定义时就把 driver 侧的逻辑装好。",
+        "所以 @register 只在函数对象上<b>留一个标记</b>，让它随类定义一起被 driver 看见。",
+        "driver 拿到类之后反查标记，再把三段逻辑编译成闭包挂到自己身上。",
+        "结果：运行期零反射——每次调用都是直接执行已编译好的闭包。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "⓪ 怎么找到那些被标记的方法",
+      "items": [
+        "_bind_worker_method 遍历 dir(user_defined_cls)，跳过不可调用的和 property。",
+        "判据是 hasattr(method, MAGIC_ATTR)，MAGIC_ATTR 就是字符串 \"attrs_3141562937\"。",
+        "关键：它作用在 Ray 的 ActorClass 上也有效——ray.remote(Cls) 返回的 DerivedActorClass <b>继承了用户类</b>。",
+        "所以 dir() 仍能看到那些被装饰的方法，以及挂在它们上的标记。",
+        "源码：worker_group.py:196-255；MAGIC_ATTR 定义 decorator.py:23，写入 :441"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "① driver 调用 · 为什么看起来像本地调用",
+      "items": [
+        "driver 上写的是 self.actor_rollout_wg.compute_log_prob(batch)，没有 .remote()、没有 ray.get。",
+        "因为 setattr 之后，WorkerGroup <b>实例</b>上真的多了一个同名方法。",
+        "它是 func_generator 造出来的 Functor 实例，__call__ 里才有那六步。",
+        "命名小技巧：type(method_name, (Functor,), {}) 把类重命名成方法名，异常栈里看到的是方法名而不是 Functor。",
+        "源码：ray/base.py:49-67；调用点 ray_trainer.py:1333"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "① 六步闭包 · 实际代码",
+      "items": [
+        "args, kwargs = dispatch_fn(self, *args, **kwargs)",
+        "padding_count = kwargs.pop(_padding_size_key, 0)",
+        "output = execute_fn(method_name, *args, **kwargs)",
+        "if blocking: output = ray.get(output)；再 output = collect_fn(self, output)",
+        "最后按 padding_count 把补齐的尾行切掉（DataProto 用 select_idxs，list 直接切片）"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "① blocking=False 时怎么不碰数据",
+      "items": [
+        "不 ray.get，output 保持 ObjectRef 列表。",
+        "collect 看到 ObjectRef 就返回 DataProtoFuture 而不是真张量。",
+        "这个 future 在<b>下一次</b> worker 调用里由 _materialize_futures 远端物化——driver 始终不碰数据。",
+        "用在 train_mini_batch、update_weights 这类「结果马上喂给下一个 worker」的地方。",
+        "源码：protocol.py:1170-1225；物化点 decorator.py:383-395"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② dispatch_fn · 它要解决什么",
+      "items": [
+        "一个 batch 要变成 N 份、发给 N 个 rank，但「切几份」和「谁拿哪份」不是同一件事。",
+        "枚举模式解决的是前者：广播、原样透传、严格 scatter、带 padding 的 chunk。",
+        "ND mesh 模式解决的是后者：按并行拓扑决定谁和谁拿同一份（见 ②′）。",
+        "padding 要跨 dispatch 与 collect 传递，办法是偷偷塞进 kwargs 的 _padding_size_key。",
+        "源码：decorator.py:91-199（各实现）、:308-331（函数表）"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② 控制面三种模式",
+      "items": [
+        "ONE_TO_ALL：广播。每个参数复制 world_size 份，collect 原样返回列表。",
+        "用在 init_model / reset / to / set_loss_fn / load_checkpoint / save_checkpoint / update_weights。",
+        "ALL_TO_ALL（默认）：参数原样透传，<b>真正的切分不在这里</b>（见下一张）。",
+        "DP_COMPUTE：断言每个参数都是长度恰好 world_size 的序列，构成严格 scatter。",
+        "RANK_ZERO：注册了枚举但函数表里没有对应项，取它会 KeyError，全仓无人用——死代码。"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② 为什么 ALL_TO_ALL 的切分在 execute 里",
+      "items": [
+        "dispatch_all_to_all 什么都不做，直接把 args / kwargs 原样返回。",
+        "切分发生在 execute_all_async：它检查「是否所有参数都是长度等于 world_size 的 list」。",
+        "是 → 第 i 个元素给第 i 个 worker；否 → 同一份广播给所有人。",
+        "所以 ALL_TO_ALL 的含义是「调用方自己负责把参数塑形好」。",
+        "源码：decorator.py:130-131；隐式切分 ray/base.py:890-918"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "② 数据面三种模式",
+      "items": [
+        "DP_COMPUTE_PROTO：开了 padding 的 DataProto 先补齐到可整除再 chunk，collect 端 concat。",
+        "DP_COMPUTE_PROTO_WITH_FUNC：args[0] 必须是函数、被广播；其余按 dp 切，函数前置为第一个参数。",
+        "DP_COMPUTE_METRIC：输入切法同上，但 collect <b>不拼接</b>，返回每 rank 的列表（给指标 dict 用）。",
+        "DIRECT_ROLLOUT_METHOD：两个函数都直接抛错，它只是给共卡绑定器看的标记。",
+        "带这个标记、且角色键含 \"rollout\" 的方法会被<b>不加前缀</b>绑到 WorkerDict 上。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "②′ ND mesh · 为什么不能按 world_size 切",
+      "items": [
+        "一个 batch 应该按<b>数据并行度</b>切，而不是按进程数切。",
+        "TP / PP 的对等体跑的是同一份数据的不同切片，必须拿到<b>完全相同</b>的那一份。",
+        "但 driver 不知道引擎内部的并行布局——只有引擎自己知道。",
+        "所以映射关系不是 driver 算的，而是<b>由各个 worker 自己登记上来的</b>。",
+        "这就是为什么它是一个「字典模式」而不是枚举成员。"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "②′ 三次查询怎么串起来",
+      "items": [
+        "worker 侧登记：_register_dispatch_collect_info(mesh_name, dp_rank, is_collect)，同名 mesh 重复登记会 ValueError。",
+        "引擎 worker 用真实并行度登记：mesh_name=\"train\"，dp_rank=engine.get_data_parallel_rank()。",
+        "driver 首次调用时发一次 _query_dispatch_info——它本身就是个 ONE_TO_ALL 方法，所以每 rank 回一个值。",
+        "断言长度等于 world_size 后缓存进 worker_group._dispatch_info[mesh_name]，之后不再查。",
+        "dp_size = max(dp_rank_mapping) + 1。源码：worker.py:86-118、decorator.py:266-279"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "②′ 同 dp 组怎么共享一份数据",
+      "items": [
+        "先把参数 chunk 成 <b>dp_size</b> 份（不是 world_size 份）。",
+        "再 parallel_put 把每份放进对象存储一次，线程池大小 max(1, min(len(args[0]), cpu_count()))，保序。",
+        "然后按 arg[dp_rank_mapping[i]] 给第 i 个全局 rank 分配 ObjectRef。",
+        "于是同一个 dp 组的所有 rank 拿到<b>同一个 ObjectRef</b>——TP / PP 对等体不各存一份。",
+        "driver 自己切 batch 也读这个映射：_get_dp_size(worker_group, role)。源码：decorator.py:202-233"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "③ execute_fn · 只有两种 Execute 模式",
+      "items": [
+        "注册表里只有 Execute.ALL 和 Execute.RANK_ZERO。",
+        "get_predefined_execute_fn 把它们映射成 WorkerGroup 上的<b>方法名字符串</b>：\"execute_all\" / \"execute_rank_zero\"。",
+        "execute_all 是 execute_all_async 的别名，返回 ObjectRef 列表；ray.get 由闭包自己做。",
+        "execute_rank_zero 只打 self._workers[0]，返回单个 ObjectRef。",
+        "仓库内只有 Worker.execute_func_rank_zero 和一个测试用到 RANK_ZERO。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "③ 远程调用怎么落到具体 actor",
+      "items": [
+        "两者都走 _execute_remote_single_worker，这是 fused worker 间接层的入口。",
+        "普通情况：直接 getattr(worker, method_name).remote(...)。",
+        "fused_worker_used 且方法不在 method_names 里：改走 worker._fuw_execute.remote(f\"{sub_cls_name}_fwmn_{method}\", ...)。",
+        "actor 命名规则 f\"{name_prefix}{cia_name}_{pg_idx}:{local_rank}\"，cia_name 用正则从 \"ActorClass(Obj)\" 抠出 \"Obj\"。",
+        "全程<b>不使用 Ray namespace</b>。源码：ray/base.py:806-823"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "③′ 共卡 · 为什么只跑一次 __init__",
+      "items": [
+        "WorkerDict.__init__ 里 super().__init__() <b>只调一次</b>。",
+        "所以整个 actor 只有一份 rank / world_size / MASTER_ADDR，和<b>一次</b> torch.distributed 握手。",
+        "各角色类用 _unwrap_ray_remote 剥掉 Ray 装饰后，在本地实例化成<b>普通对象</b>塞进 self.worker_dict。",
+        "也就是说角色之间不是嵌套 actor，而是同一个进程里的几个对象。",
+        "共享一张卡靠小数 GPU：num_gpus = 1 / max_colocate_count。"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "③′ 方法名怎么加前缀又剥掉",
+      "items": [
+        "绑定时：为每个带标记的方法造转发闭包，<b>把原 MAGIC_ATTR 复制到转发函数上</b>。",
+        "复制标记是关键——外层 _bind_worker_method 才能看到同样的 dispatch 配置。",
+        "命名成 f\"{role}_{method}\" setattr 到 WorkerDict 类上，如 critic_update_critic。",
+        "driver 侧 spawn(prefix_set) 用 from_detached 对<b>同一批 handle</b> 建门面，再把前缀剥掉。",
+        "代码警告：各角色要用不同并行度就别用 create_colocated_worker_cls，改传分开的资源池。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "④ worker 方法体 · 真正跑的是哪一层",
+      "items": [
+        "被调到的不是原函数，而是 @register 包出来的 inner / async_inner。",
+        "链路：inner → _materialize_futures（物化参数里的 future）→ tqbridge → 真正的方法体。",
+        "Worker 构造时拿到的是环境变量：WORLD_SIZE、RANK（必需）、MASTER_ADDR、MASTER_PORT（必需）。",
+        "_configure_with_store 把它们写成实例属性，<b>并写回 os.environ</b>。",
+        "torch.distributed <b>不</b>在 Worker 基类初始化，由子类调 initialize_global_process_group_ray。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "④ 一个会找错的环境变量",
+      "items": [
+        "WorkerGroup 注入的是 <b>RAY_LOCAL_WORLD_SIZE</b>，不是 LOCAL_WORLD_SIZE。",
+        "所以 worker 里 LOCAL_WORLD_SIZE 恒为 1、LOCAL_RANK 恒为 0。",
+        "例外：设了 RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES 时会从 accelerator_ids 推出真实 local_rank。",
+        "需要真实值的地方直接读 RAY_LOCAL_WORLD_SIZE（vllm_rollout.py:66、sglang_rollout.py:147）。",
+        "verl/utils/distributed.py:82 的注释就写着「in current ray environment, LOCAL_RANK is always zero」。"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "④′ tqbridge · 张量怎么不经过 driver",
+      "items": [
+        "@register 在包 inner 之前先包一层 tqbridge，所以每个 worker 方法都自带它。",
+        "进入时 _find_meta 找出 KVBatchMeta，再把真实张量从 TQ 拉成 TensorDict。",
+        "meta.extra_info 被当作非张量项合并进去——这就是 temperature / mini_batch_size 这类 kwargs 的通道。",
+        "退出时若返回 batch size 匹配的 TensorDict，就把张量字段<b>写回 TQ</b>，返回带原 tags 的新 meta。",
+        "所以 compute_log_prob 的返回值只被断言长度，结果要再 kv_batch_get 取。源码：transferqueue_utils.py:347-420"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑤ collect_fn · 为什么必须丢掉 None",
+      "items": [
+        "TP / PP 下只有一个 rank 持有完整输出（例如最后一个 PP stage 的 TP rank 0）。",
+        "其余 rank 的方法体直接返回 None——它们没有可拼的东西。",
+        "所以 worker 登记时除了 dp_rank 还要登记 is_collect=engine.is_mp_src_rank_with_outputs()。",
+        "collect 时先用 _query_collect_info 拿到掩码，按掩码过滤，再断言可拼接后 concat。",
+        "不过滤就会拿一堆 None 去 concat。源码：decorator.py:236-247、:282-297"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "⑥ 返回 · padding 怎么被还原",
+      "items": [
+        "DP_COMPUTE_PROTO 在切分时若补齐过，会把 padding_size 塞进 kwargs。",
+        "闭包第二步就把它 pop 出来存成 padding_count，不会传给 worker。",
+        "最后一步按 padding_count 把尾部补齐行切掉，调用方看不到补齐的痕迹。",
+        "padding 本身：取第 0 行或最后一行重复后拼接，原地改写 batch 与 non_tensor_batch。",
+        "注意默认 padding_candidate=\"\" 落在「取最后一行」那一支。源码：protocol.py:846-859"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "DataProto · 三个容器与关键操作",
+      "items": [
+        "batch（TensorDict，强制恰好一个 batch 维）、non_tensor_batch（str → np.ndarray）、meta_info。",
+        "chunk：先 TensorDict.chunk，再按实际块大小用 np.cumsum 切点切 numpy 部分，保证两边对齐。",
+        "concat：meta_info 里 \"metrics\" 键会跨 worker <b>累积</b>，其它重叠键必须相等否则断言失败。",
+        "reorder 是<b>原地</b>置换；meta_info 在 chunk 时是<b>按引用</b>拷进每个块的。",
+        "源码：protocol.py:317-332、:861-900、:913-958、:960-966"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "DataProto · 序列化与零拷贝的真相",
+      "items": [
+        "没有注册自定义 Ray serializer，走 cloudpickle，由 __getstate__ / __setstate__ 钩住。",
+        "默认路径：先 contiguous().consolidate() 把所有张量打进一块连续存储，再 torch.save 到 BytesIO。",
+        "另一条路由 VERL_DATAPROTO_SERIALIZATION_METHOD=\"numpy\" 开启，产出<b>裸 numpy 缓冲</b>，Ray 可放共享内存零拷贝。",
+        "但真正显式 ray.put 的只有 ②′ 那条路；其它地方对象直接进 .remote()，由 Ray 自己决定内联还是存储。",
+        "全仓没有 register_serializer 调用，不要声称更多。源码：protocol.py:377-421、:241-293"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "容错 · 为什么几乎没有",
+      "items": [
+        "全仓 grep 不到 max_restarts / max_task_retries / RayActorError / ActorDiedError。",
+        "actor 以 Ray 默认（0 次重启）创建，死了就死了，下一次 ray.get 直接抛。",
+        "有个存活巡检线程，但策略是 signal.raise_signal(SIGABRT) 把 driver 整体打掉，而且只有测试在调。",
+        "detached actor 那套在生产里<b>不是</b>容错用的——它是 spawn 共卡门面的重连技巧。",
+        "没有检查点级恢复、单次调用超时、熔断、部分失败处理。源码：ray/base.py:102-120、:511-530"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "死代码与易错点速查",
+      "items": [
+        "没有 register center：MASTER_ADDR / PORT 由钉在 PG 0 bundle 0 上的 Ray <b>task</b> 返回。",
+        "ray_wait_register_center_timeout 被接收、存起来，然后再也没被读过。",
+        "FusedWorker 全套（create_colocated_worker_cls_fused / fuse / spawn_fused）实现完整但无调用方。",
+        "DISABLE_WORKER_INIT 被写两次、从未被读，角色子 worker 其实跑完了完整 __init__。",
+        "额外资源只在 len(_additional_resource) > 1 时生效，单个会被静默丢掉。"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,543 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "verl 推理侧：副本、路由与两种引擎",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-rollout.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "components": [
+    {
+      "id": "trainer",
+      "type": "external",
+      "label": "① AgentLoop",
+      "sublabel": "生成请求发起方",
+      "pos": [
+        40,
+        60
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/agent_loop_tq.py",
+          "line": 182,
+          "end_line": 232,
+          "label": "写轨迹"
+        }
+      ]
+    },
+    {
+      "id": "client",
+      "type": "backend",
+      "label": "② LLMServerClient",
+      "sublabel": "generate(prompt_ids)",
+      "pos": [
+        250,
+        60
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/rollout/llm_server.py",
+          "line": 98,
+          "end_line": 169,
+          "label": "generate"
+        }
+      ]
+    },
+    {
+      "id": "balancer",
+      "type": "cloud",
+      "label": "③ 全局负载均衡器",
+      "sublabel": "粘滞会话 + 最小在飞数",
+      "pos": [
+        470,
+        60
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "tag": "LRU 缓存 10000",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/router.py",
+          "line": 170,
+          "end_line": 204,
+          "label": "acquire_server"
+        }
+      ]
+    },
+    {
+      "id": "vsrv",
+      "type": "external",
+      "label": "⑨ vLLMHttpServer",
+      "sublabel": "AsyncLLM + OpenAI FastAPI",
+      "pos": [
+        700,
+        40
+      ],
+      "size": [
+        185,
+        74
+      ],
+      "tag": "Ray actor",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/vllm_rollout/vllm_async_server.py",
+          "line": 513,
+          "end_line": 565,
+          "label": "run_server"
+        }
+      ]
+    },
+    {
+      "id": "vexec",
+      "type": "external",
+      "label": "⑩ MultiprocExecutor",
+      "sublabel": "TP worker 子进程",
+      "pos": [
+        945,
+        40
+      ],
+      "size": [
+        175,
+        74
+      ],
+      "tag": "backend = mp",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/vllm_rollout/vllm_async_server.py",
+          "line": 350,
+          "end_line": 350,
+          "label": "executor 后端"
+        }
+      ]
+    },
+    {
+      "id": "ssrv",
+      "type": "external",
+      "label": "⑪ SGLangHttpServer",
+      "sublabel": "tokenizer_manager + uvicorn",
+      "pos": [
+        700,
+        170
+      ],
+      "size": [
+        185,
+        74
+      ],
+      "tag": "Ray actor",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/sglang_rollout/async_sglang_server.py",
+          "line": 437,
+          "end_line": 479,
+          "label": "launch_server"
+        }
+      ]
+    },
+    {
+      "id": "sched",
+      "type": "external",
+      "label": "⑫ Scheduler 子进程",
+      "sublabel": "ZMQ 连接，含 detokenizer",
+      "pos": [
+        945,
+        170
+      ],
+      "size": [
+        175,
+        74
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/rollout/sglang_rollout/async_sglang_server.py",
+          "line": 438,
+          "end_line": 443,
+          "label": "_launch_subprocesses"
+        }
+      ]
+    },
+    {
+      "id": "twg",
+      "type": "cloud",
+      "label": "⑤ 训练 WorkerGroup",
+      "sublabel": "FSDP / Megatron 的那批 actor",
+      "pos": [
+        40,
+        320
+      ],
+      "size": [
+        150,
+        74
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/engine_workers.py",
+          "line": 694,
+          "end_line": 714,
+          "label": "rollout mesh"
+        }
+      ]
+    },
+    {
+      "id": "mgr",
+      "type": "backend",
+      "label": "④ LLMServerManager",
+      "sublabel": "算副本数并建均衡器",
+      "pos": [
+        250,
+        320
+      ],
+      "size": [
+        160,
+        74
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/rollout/llm_server.py",
+          "line": 442,
+          "end_line": 522,
+          "label": "_initialize_llm_servers"
+        }
+      ]
+    },
+    {
+      "id": "replica",
+      "type": "cloud",
+      "label": "⑥ RolloutReplica",
+      "sublabel": "一副本 = 一个 TP×DP×PP 组",
+      "pos": [
+        470,
+        320
+      ],
+      "size": [
+        170,
+        74
+      ],
+      "tag": "每节点一个 server actor",
+      "sources": [
+        {
+          "path": "verl/workers/rollout/replica.py",
+          "line": 93,
+          "end_line": 129,
+          "label": "几何"
+        },
+        {
+          "path": "verl/workers/rollout/replica.py",
+          "line": 131,
+          "end_line": 236,
+          "label": "三种 init"
+        }
+      ]
+    },
+    {
+      "id": "adapter",
+      "type": "backend",
+      "label": "⑦ ServerAdapter",
+      "sublabel": "resume / update_weights / release",
+      "pos": [
+        700,
+        320
+      ],
+      "size": [
+        185,
+        74
+      ],
+      "sources": [
+        {
+          "path": "verl/workers/rollout/base.py",
+          "line": 29,
+          "end_line": 110,
+          "label": "BaseRollout + 注册表"
+        }
+      ]
+    },
+    {
+      "id": "ckptw",
+      "type": "backend",
+      "label": "⑧ CheckpointEngineWorker",
+      "sublabel": "非 hybrid 时的 rollout worker",
+      "pos": [
+        945,
+        320
+      ],
+      "size": [
+        175,
+        74
+      ],
+      "sources": [
+        {
+          "path": "verl/checkpoint_engine/base.py",
+          "line": 342,
+          "end_line": 349,
+          "label": "构造 rollout"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "推理服务进程（每节点一个 Ray actor）",
+      "wraps": [
+        "vsrv",
+        "vexec",
+        "ssrv",
+        "sched"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "c1",
+      "from": "trainer",
+      "to": "client",
+      "label": "generate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "c2",
+      "from": "client",
+      "to": "balancer",
+      "label": "acquire_server"
+    },
+    {
+      "id": "c3",
+      "from": "balancer",
+      "to": "vsrv",
+      "label": "Ray RPC",
+      "variant": "emphasis"
+    },
+    {
+      "id": "c4",
+      "from": "balancer",
+      "to": "ssrv",
+      "label": "同一接口",
+      "variant": "dashed"
+    },
+    {
+      "id": "c5",
+      "from": "vsrv",
+      "to": "vexec",
+      "label": "fork TP 进程"
+    },
+    {
+      "id": "c6",
+      "from": "ssrv",
+      "to": "sched",
+      "label": "ZMQ"
+    },
+    {
+      "id": "c7",
+      "from": "mgr",
+      "to": "replica",
+      "label": "建副本"
+    },
+    {
+      "id": "c8",
+      "from": "mgr",
+      "to": "balancer",
+      "label": "注册地址",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "c9",
+      "from": "twg",
+      "to": "mgr",
+      "label": "init_hybrid"
+    },
+    {
+      "id": "c10",
+      "from": "replica",
+      "to": "adapter",
+      "label": "控制面扇出"
+    },
+    {
+      "id": "c11",
+      "from": "adapter",
+      "to": "ckptw",
+      "label": "被持有",
+      "variant": "dashed"
+    },
+    {
+      "id": "c12",
+      "from": "adapter",
+      "to": "ssrv",
+      "label": "权重下发",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "① AgentLoop — 请求的发起方",
+      "items": [
+        "<b>触发</b>：被 trainer 的 generate_sequences 分发唤起后就一直跑，在自己的 Ray actor 进程里。",
+        "<b>为什么它是驱动者</b>：多轮与工具调用的循环逻辑属于任务层，不属于推理引擎，也不该塞进 trainer 的控制流。",
+        "<b>一轮的形状</b>：渲染消息 → 调 LLMServerClient.generate 拿 token → 解析工具调用 → 执行工具 → 结果作为新的环境消息接回去 → 下一轮。",
+        "<b>怎么交付</b>：await tq.async_kv_batch_put(...)，对 trainer 是 fire-and-forget；manager 只 ray.get <b>分发</b>这一步。",
+        "默认 agent loop 由 rollout.agent.default_agent_loop 注入（数据集没带 agent_name 时）；整个管理器也可用 rollout.agent.agent_loop_manager_class 替换。源码：agent_loop_tq.py:182-232、:248-262、:84-86"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "② LLMServerClient.generate — 不走 HTTP",
+      "items": [
+        "<b>触发</b>：agent loop 每一轮都调一次。",
+        "<b>为什么不走 HTTP</b>：训练回路要的是 token 进 token 出，HTTP 那层的序列化与文本化是多余开销。",
+        "<b>五步</b>：_acquire_server（向均衡器要副本）→ 按后端微调参数 → server.generate.remote(...) → finally 里 fire-and-forget 地 _release_server。",
+        "<b>后端差异</b>：audio_data / mm_processor_kwargs 折进 kwargs；SGLang 时把 video_data 里的原始帧<b>替换</b>成预先算好的 mm_processor_output；priority 只转发给 vLLM。",
+        "请求 id 默认每轮新建 uuid4().hex，只有开了 rollout.full_determinism 才让调用方的 id 原样透传（粘滞路由要用）。源码：llm_server.py:98-169、:70-96"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "③ 全局负载均衡器 — 粘滞 + 最小在飞",
+      "items": [
+        "<b>触发</b>：每次 generate 的开头与结尾。",
+        "<b>为什么要粘滞</b>：同一会话的后续轮次回到同一副本，前缀缓存才命中得上。",
+        "<b>怎么选</b>：先查粘滞缓存（指向已摘除副本的条目作废）→ 池子空就抛 RuntimeError → full_determinism 时 hash(request_id) % len(servers) → 否则取在飞数最小的那批里 random.choice → 记粘滞条目并把在飞数 +1。",
+        "<b>实现细节</b>：它是个普通 Python 类，<b>在实例化时才被 ray.remote(...) 包起来</b>——这样写是为了能被子类化。粘滞缓存是 maxsize=10000 的 LRUCache。",
+        "server_id 就是 HTTP 地址字符串、值是 actor handle；地址只当键用。换挡时调 clear_sticky_cache；可用 router_config_path 指 YAML 换成自定义均衡器。源码：router.py:133-298、:325-433"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "④ LLMServerManager — 副本数怎么算出来",
+      "items": [
+        "<b>触发</b>：_setup 第 16 步（hybrid）或 separate_async 的第二套管理器。",
+        "<b>为什么要算</b>：副本是按「训练世界能切出几份推理世界」来定的，不是配置里直接给的。",
+        "<b>三行算式</b>：rollout_world_size = tp × dp × pp（PD 分离会放大它）→ world_size = worker_group.world_size 或 n_gpus_per_node × nnodes → <b>num_replicas = world_size // rollout_world_size</b>。",
+        "<b>init 方式三选一</b>：有 worker_group 且非 trtllm → init_hybrid；有 worker_group 且是 trtllm → init_hybrid_colocated；没有 → init_standalone。",
+        "create_empty 是另一个入口：不建副本、均衡器为空——给「生成完全由 standalone 资源承担」的 trainer 用。源码：llm_server.py:442-522、:425-440"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "⑤ 训练 WorkerGroup — hybrid 副本的来源",
+      "items": [
+        "<b>触发</b>：init_hybrid(worker_group) 时被切片。",
+        "<b>为什么推理能和训练同卡</b>：init_hybrid <b>直接复用训练的那批 actor</b>——workers[world_size×rank : world_size×(rank+1)]，不新建进程。",
+        "<b>怎么对上并行布局</b>：engine_workers 建 rollout_device_mesh，维度名 [\"dp\", \"infer_tp\", \"infer_pp\"]，其中 <b>infer_tp 把推理自己的 DP 折进了 TP 轴</b>。",
+        "这就是 HYBRID 模式：共享 GPU，每步靠 sleep / wake 加权重同步切换上下文。",
+        "源码：replica.py:131-141、engine_workers.py:694-714"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑥ RolloutReplica — 一个副本 = 一个 TP×DP×PP 组",
+      "items": [
+        "<b>触发</b>：LLMServerManager 为每个副本 rank 构造一个。",
+        "<b>几何四行</b>：world_size = tp × dp × pp → gpus_per_replica_node = min(每节点卡数, world_size) → 断言整除 → nnodes = world_size // gpus_per_replica_node。",
+        "<b>所以</b>：一个副本就是一个逻辑推理服务，可能跨节点，<b>每节点一个 server actor</b>，而 node-rank-0 那个才是对外句柄 _server_handle。",
+        "<b>控制面</b>全是对 self.servers 的 asyncio.gather 扇出：wake_up / sleep / abort_all_requests / resume_generation / clear_kv_cache / release_kv_cache / resume_kv_cache / start_profile / stop_profile。",
+        "<b>max_concurrency</b> = ray_actor_max_concurrency 或 max(2, max_num_seqs + 16)：这是 Ray actor 的并发度，所以<b>超额请求排在 Ray 这一层而不是引擎内部</b>。源码：replica.py:93-129、:266-326"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑥′ 三种 RolloutMode 与反查 server",
+      "items": [
+        "<b>HYBRID</b>：与训练同一批 worker，共享 GPU，每步 sleep / wake + 权重同步（on-policy）。",
+        "<b>COLOCATED</b>：同一个 placement group 但<b>独立进程</b>，共享 GPU 但切换时<b>不同步权重</b>——给 GRM / LLM-as-judge 用。",
+        "<b>STANDALONE</b>：独占 GPU（off-policy）。vLLM 下 wake_up / sleep <b>直接是空操作</b>，SGLang 下只动 KV cache。",
+        "<b>训练 rank 怎么找到自己的 server</b>：replica_rank = rank // rollout_world_size，rollout_rank = rank % rollout_world_size，node_rank = rollout_rank // RAY_LOCAL_WORLD_SIZE，然后 ray.get_actor(f\"vllm_server_{replica_rank}_{node_rank}\")。",
+        "谁持有句柄：vLLM 是 rollout_rank == 0，SGLang 是 device_mesh[\"infer_tp\"].get_local_rank() == 0。源码：replica.py:54-67、vllm_rollout.py:65-167、sglang_rollout.py:146-247"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑦ ServerAdapter — 后端怎么选出来",
+      "items": [
+        "<b>触发</b>：hybrid 时由 engine_workers 构造；colocated / standalone 时由 CheckpointEngineWorker.__init__ 构造。",
+        "<b>为什么用字符串注册表</b>：避免在非目标后端的机器上 import 失败——值是 FQN 字符串，用 importlib 懒加载。",
+        "<b>怎么分派</b>：_ROLLOUT_REGISTRY 以 (name, mode) 为键：(\"vllm\",\"async\") / (\"sglang\",\"async\") / (\"trtllm\",\"async\")。get_rollout_class 先断言这个 tuple 存在。",
+        "<b>mode 实际只有 async 可达</b>：rollout.mode == \"sync\" 直接 raise，其它值发 DeprecationWarning。",
+        "接口只有四个：resume(tags)、update_weights(weights, wire_format)、release()、generate_sequences()——最后一个在 vLLM 下直接 NotImplementedError（SPMD 模式已在 PR #4411 退役）。源码：base.py:29-110"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑧ CheckpointEngineWorker — 非 hybrid 的 worker 类",
+      "items": [
+        "<b>触发</b>：init_colocated / init_standalone 建 RayWorkerGroup 时，worker 类就是 ray.remote(CheckpointEngineWorker)。",
+        "<b>为什么不是训练 worker</b>：这些进程只做推理与权重接收，不需要优化器、不需要训练引擎。",
+        "<b>怎么建</b>：init_colocated 用 bin_pack=False、name_prefix=f\"rollout_colocate_{rank}\"；init_standalone 没给资源池就自建 {f\"rollout_pool_{rank}\": [gpus_per_replica_node] × nnodes}，max_colocate_count=2。",
+        "它构造 ServerAdapter 时 device_mesh 传 None——SGLang 适配器自己在 CPU 上建一个同形状的 mesh。",
+        "源码：replica.py:160-249、checkpoint_engine/base.py:342-349"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑨⑪ 两个后端的 server actor",
+      "items": [
+        "<b>触发</b>：launch_servers()，每个 node_rank 建一个 Ray actor。",
+        "<b>为什么要问 node_id</b>：server actor 必须和它管的那批 worker 同机，所以先对每个 worker 做 __ray_call__ 问出 node_id 和可见设备，再用 NodeAffinitySchedulingStrategy(soft=False) 钉过去。",
+        "<b>vLLM 的六步</b>：断言 len(workers) == world_size → 问 node 信息 → 建 actor（名 f\"vllm_server_{replica_rank}_{node_rank}\"）→ 从 servers[0] 问 master 地址 → gather 所有 launch_server → 取 servers[0] 地址当 _server_address。",
+        "<b>SGLang 额外两件事</b>：只有设了 RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES 时才算 base_gpu_id；对该节点的可见设备列表去重并排序。get_master_address 只在 nnodes > 1 时问。",
+        "两边起的 HTTP app 都是<b>引擎自带的</b>；run_uvicorn 总是 bind port=0 由系统分端口。源码：vllm_async_server.py:1575-1655、async_sglang_server.py:852-948"
+      ]
+    },
+    {
+      "dot": "orange",
+      "title": "⑩⑫ 引擎内部 — 进程结构速览",
+      "items": [
+        "<b>vLLM</b>：server actor 进程持有 AsyncLLM 前端 → ZMQ + msgpack → EngineCoreProc（独立 OS 进程）→ MultiprocExecutor spawn 每个 TP rank 一个 worker 子进程。",
+        "<b>executor 后端硬编码成 mp</b>，不是协同 RL 常见的 external_launcher；非 0 号节点跑 run_headless，返回即 os._exit(1)。",
+        "<b>SGLang</b>：verl 不调 launch_server，而是直接用 Engine._launch_subprocesses 拉起 TokenizerManager / Scheduler / DetokenizerManager，再自己跑 uvicorn。",
+        "SGLang 的 IPC 全是 ZMQ，端点在任何 fork <b>之前</b>就分配好；<b>非 0 号 scheduler 完全没有 socket</b>，请求靠 torch.distributed 广播。",
+        "细节见「vLLM / SGLang 内部」页面。源码：vllm_async_server.py:290-588、async_sglang_server.py:277-479"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "附：部分 rollout 怎么对上层透明",
+      "items": [
+        "colocate_async / separate_async 用的客户端是 FullyAsyncLLMServerClient。",
+        "<b>它把 generate 包在续跑循环里</b>：先钉住累计 max_tokens 预算，循环调 super().generate(prompt_ids + 已累积 tokens, ...)。",
+        "合并 token_ids / log_probs / routed_experts / num_preempted / response_topk_*，并记录 min_global_steps 与 max_global_steps——陈旧度就是这么来的。",
+        "续跑条件：stop_reason ∈ (\"aborted\", \"abort\") 时 asyncio.sleep(1) 后重试；每轮从预算里扣掉已生成长度。",
+        "_acquire_server 在 only_hybrid=True 且均衡器为空时也每秒重试——对应训练阶段 hybrid 副本被摘掉的那段时间。源码：llm_server.py:172-369"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：已经死掉但还在仓库里的东西",
+      "items": [
+        "<b>HFRollout / NaiveRollout</b>：只实现了 generate_sequences，没实现 resume / update_weights / release，且 super().__init__() 不带参——在 ABCMeta 下<b>根本无法实例化</b>，也不在注册表里。",
+        "<b>rollout/schemas.py</b>（713 行）：verl/ 里没有任何生产代码 import 它，只有一个多模态测试引用。它是已退役的「引擎内 SGLang 多轮 rollout」的遗留物，其中的 loss_mask <b>不是</b>今天实际用的掩码。",
+        "<b>rollout/tokenizer.py</b> 的 HybridEngineBaseTokenizer：无人导入，实际用的是 verl/utils/tokenizer/*。",
+        "<b>rollout.mode</b> 只有 async 可达，sync 直接抛错。",
+        "<b>trtllm</b> 后端存在但未深入：权重走 update_weights_from_ipc_handles 而不是 ZMQ 分桶，且是唯一走 init_hybrid_colocated 的后端。"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：读图提示",
+      "items": [
+        "编号 ①–⑫ 按流程顺序排，与图上节点一一对应。",
+        "①–③ 是请求路径，④–⑧ 是装配路径，⑨–⑫ 是引擎进程。",
+        "虚线的「同一接口」表示两个后端共用 client 与均衡器这一层，差异只在 server actor 之下。",
+        "权重同步的完整时序见「权重同步」页面；引擎内部见「vLLM / SGLang 内部」页面。",
+        "行号对应 revision f4becf6e。"
+      ]
+    }
+  ]
+}

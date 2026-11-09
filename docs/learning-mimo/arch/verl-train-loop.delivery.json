@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "9e319977-bcc7-4264-9c0e-a73d31a7f8b0",
+  "status": "current",
+  "command": "deliver",
+  "type": "workflow",
+  "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/train-loop.candidate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-train-loop.html",
+  "specification": {
+    "sha256": "e68d24a0fa6a7e9e1d93b83f0fe433cd4b0b2f7ccaa125b4e1cdb6706adde40e",
+    "bytes": 27787
+  },
+  "artifact": {
+    "sha256": "34686a4b8ce25a32f7d67f8858edbd9126cd0d706d07fe9480a061b4018d0c57",
+    "bytes": 886164
+  }
+}

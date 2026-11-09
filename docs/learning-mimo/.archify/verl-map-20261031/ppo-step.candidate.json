@@ -1,0 +1,504 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "verl 训练步 _step_once 的九个阶段",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-ppo-step.html",
+    "viewBox": [
+      1085,
+      688
+    ],
+    "column_fit": "spread",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "participants": [
+    {
+      "id": "driver",
+      "type": "backend",
+      "label": "Driver",
+      "sublabel": "PPOTrainer._step_once",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 823,
+          "end_line": 873,
+          "label": "_step_once"
+        }
+      ]
+    },
+    {
+      "id": "buf",
+      "type": "messagebus",
+      "label": "ReplayBuffer",
+      "sublabel": "采样器",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/replay_buffer.py",
+          "line": 550,
+          "end_line": 570,
+          "label": "sample"
+        }
+      ]
+    },
+    {
+      "id": "tq",
+      "type": "database",
+      "label": "TransferQueue",
+      "sublabel": "张量数据面",
+      "sources": [
+        {
+          "path": "verl/utils/transferqueue_utils.py",
+          "line": 347,
+          "end_line": 420,
+          "label": "tqbridge"
+        }
+      ]
+    },
+    {
+      "id": "rm",
+      "type": "security",
+      "label": "RewardLoop",
+      "sublabel": "同卡奖励模型",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1794,
+          "end_line": 1846,
+          "label": "_compute_reward_colocate"
+        }
+      ]
+    },
+    {
+      "id": "actor",
+      "type": "cloud",
+      "label": "actor_rollout_wg",
+      "sublabel": "WorkerDict 组",
+      "sources": [
+        {
+          "path": "verl/workers/engine_workers.py",
+          "line": 753,
+          "end_line": 759,
+          "label": "compute_log_prob"
+        }
+      ]
+    },
+    {
+      "id": "ref",
+      "type": "cloud",
+      "label": "ref_policy_wg",
+      "sublabel": "参考策略",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1996,
+          "end_line": 2020,
+          "label": "_compute_ref_log_prob"
+        }
+      ]
+    },
+    {
+      "id": "critic",
+      "type": "cloud",
+      "label": "critic_wg",
+      "sublabel": "价值网络",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 2022,
+          "end_line": 2042,
+          "label": "_compute_values"
+        }
+      ]
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 296,
+      "label": "①–⑤ 取样与奖励"
+    },
+    {
+      "from": 298,
+      "to": 408,
+      "label": "⑥–⑨ logprob 与 values"
+    },
+    {
+      "from": 410,
+      "to": 520,
+      "label": "⑩–⑬ 优势与两次更新"
+    },
+    {
+      "from": 522,
+      "to": 590,
+      "label": "⑭⑮ 同步与清理"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m-sample",
+      "from": "driver",
+      "to": "buf",
+      "y": 170,
+      "label": "① replay_buffer.sample",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m-poll",
+      "from": "buf",
+      "to": "tq",
+      "y": 198,
+      "label": "② kv_list 选组",
+      "variant": "dashed"
+    },
+    {
+      "id": "m-meta",
+      "from": "tq",
+      "to": "driver",
+      "y": 226,
+      "label": "③ KVBatchMeta(keys, tags)",
+      "variant": "return"
+    },
+    {
+      "id": "m-rm",
+      "from": "driver",
+      "to": "rm",
+      "y": 254,
+      "label": "④ compute_rm_score（条件）",
+      "variant": "security"
+    },
+    {
+      "id": "m-rmput",
+      "from": "rm",
+      "to": "tq",
+      "y": 282,
+      "label": "⑤ 写回 rm_scores",
+      "variant": "dashed"
+    },
+    {
+      "id": "m-logprob",
+      "from": "driver",
+      "to": "actor",
+      "y": 310,
+      "label": "⑥ compute_log_prob",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m-lpput",
+      "from": "actor",
+      "to": "tq",
+      "y": 338,
+      "label": "⑦ put old_log_probs",
+      "variant": "dashed"
+    },
+    {
+      "id": "m-ref",
+      "from": "driver",
+      "to": "ref",
+      "y": 366,
+      "label": "⑧ compute_ref_log_prob（条件）",
+      "variant": "default"
+    },
+    {
+      "id": "m-values",
+      "from": "driver",
+      "to": "critic",
+      "y": 394,
+      "label": "⑨ infer_batch（条件）",
+      "variant": "default"
+    },
+    {
+      "id": "m-advget",
+      "from": "tq",
+      "to": "driver",
+      "y": 422,
+      "label": "⑩ 取优势输入",
+      "variant": "return"
+    },
+    {
+      "id": "m-advput",
+      "from": "driver",
+      "to": "tq",
+      "y": 450,
+      "label": "⑪ put advantages / returns",
+      "variant": "dashed"
+    },
+    {
+      "id": "m-critic",
+      "from": "driver",
+      "to": "critic",
+      "y": 478,
+      "label": "⑫ train_mini_batch（条件）",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m-actor",
+      "from": "driver",
+      "to": "actor",
+      "y": 506,
+      "label": "⑬ update_actor",
+      "variant": "emphasis"
+    },
+    {
+      "id": "m-sync",
+      "from": "driver",
+      "to": "actor",
+      "y": 534,
+      "label": "⑭ on_step_end → update_weights",
+      "variant": "security"
+    },
+    {
+      "id": "m-clear",
+      "from": "driver",
+      "to": "tq",
+      "y": 562,
+      "label": "⑮ kv_clear(batch.keys)",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "driver",
+      "from": 164,
+      "to": 568,
+      "type": "backend"
+    },
+    {
+      "participant": "buf",
+      "from": 166,
+      "to": 204,
+      "type": "messagebus"
+    },
+    {
+      "participant": "rm",
+      "from": 249,
+      "to": 288,
+      "type": "security"
+    },
+    {
+      "participant": "actor",
+      "from": 305,
+      "to": 344,
+      "type": "cloud"
+    },
+    {
+      "participant": "ref",
+      "from": 361,
+      "to": 390,
+      "type": "cloud"
+    },
+    {
+      "participant": "critic",
+      "from": 389,
+      "to": 418,
+      "type": "cloud"
+    },
+    {
+      "participant": "critic",
+      "from": 473,
+      "to": 502,
+      "type": "cloud"
+    },
+    {
+      "participant": "actor",
+      "from": 501,
+      "to": 550,
+      "type": "cloud"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "① replay_buffer.sample — 它不是「生成」",
+      "items": [
+        "<b>触发</b>：_step_once 第一阶段，计时标签 gen；前面还有 on_sample_begin 钩子。",
+        "<b>为什么叫 gen 却不生成</b>：生成在另一个进程持续跑，这里只是<b>从 TQ 里挑出已经生成完的轨迹组</b>。",
+        "<b>怎么挑</b>：轮询 tq.kv_list 拿标签，筛 is_prompt 且 status ∈ {finished, failure}，按 uid 成组后整组取用。",
+        "sync 用 ReplayBuffer，异步用 ReplayBufferAsync；也可由 trainer.v1.sampler.custom_sampler 换成自定义类。",
+        "源码：trainer_base.py:826-835、replay_buffer.py:550-570"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "② 选组时的陈旧度与 DAPO 过滤",
+      "items": [
+        "<b>触发</b>：sample 内部的选组逻辑。",
+        "<b>为什么要控陈旧度</b>：异步模式下轨迹可能是好几步之前的策略产出的，太旧会伤害 on-policy 假设。",
+        "<b>怎么控</b>：max_off_policy_threshold 为 None 时完全关闭；strategy=drop 淘汰跨度超阈值的组，strategy=wait 则在有在飞 prompt 达阈值时<b>阻塞采样</b>。两者对 sync 都是空操作。",
+        "<b>DAPO 组过滤</b>：_classify_group 判定「组内所有非基础设施指标都相同」就滤掉（全对或全错的组没有梯度信号）；要求奖励走流式路径，且强制 gen_batch_size=1。",
+        "sync 下的 DAPO 是独立控制流：投机性补额度 → draining 等 inflight 清零 → 选组 → 丢弃多余。源码：replay_buffer.py:172-184、:269-282、:571-639"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "③ 返回 KVBatchMeta — 张量留在 TQ 里",
+      "items": [
+        "<b>触发</b>：选组完成，sample 返回。",
+        "<b>为什么只回元数据</b>：V1 的设计是 driver 不物化张量，否则所有数据都要过 driver 这个单点。",
+        "<b>怎么表示</b>：KVBatchMeta 带 keys 列表、tags 列表、partition_id，可选 fields，以及当 kwargs 通道用的 extra_info。",
+        "轨迹键的形状是 {uid}_{session_id}_{index}：uid 是 prompt 的 uuid4，session_id 是 GRPO 组内编号，index 是该 session 内的输出序号。",
+        "源码：transfer_queue/metadata.py:880-900"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "④ compute_rm_score — 整段跳过还是整段执行",
+      "items": [
+        "<b>触发</b>：计时标签 reward。<b>条件是 reward_loop_manager.reward_loop_worker_handles is None</b>。",
+        "<b>为什么这个 None 决定一切</b>：handles 非 None 意味着奖励已经在 agent loop 内与生成<b>并发</b>算完了，trainer 这一阶段无事可做。",
+        "<b>判定逻辑</b>：not reward_model.enable 或 reward_model.enable_resource_pool 时返回 handles；否则（同卡 RM）返回 None。",
+        "<b>同卡 RM 这条路怎么做</b>：从 TQ 取 prompts / responses / raw_prompt 拼成带 padding 的 DataProto，调 compute_rm_score（内部自己 wake / sleep 这个 RM）。",
+        "两处硬约束：separate_async 禁止同卡 RM（standalone 副本永不睡眠）；DAPO 组过滤也禁止，因为过滤指标必须在采样时就存在。源码：reward_loop.py:312-322、trainer_base.py:1794-1846"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑤ 写回 rm_scores",
+      "items": [
+        "<b>触发</b>：同卡 RM 算完之后。",
+        "<b>为什么要写回而不是直接用</b>：后面的 _compute_advantage 是从 TQ 读字段的，不接受 driver 手里的张量。",
+        "<b>怎么写</b>：nested 形式的 rm_scores，外加 rm_output.meta_info[\"reward_extra_keys\"] 里列出的每个额外键。",
+        "函数奖励那条路则是由 AgentLoopOutput.as_dict() 顺带写进去的：rm_scores 是个零向量，只在最后一个位置放 reward_score。",
+        "源码：trainer_base.py:1837-1844、agent_loop.py:117-170"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "⑥ compute_log_prob — 前置是 _balance_batch",
+      "items": [
+        "<b>触发</b>：计时标签 old_log_prob，前面先无条件跑 _balance_batch。",
+        "<b>为什么要先均衡</b>：长短序列混在一个 batch 里会让各 dp rank 负载差很多，最慢的那个决定整步耗时。",
+        "<b>怎么均衡</b>：先 upsample 到 lcm(dp_size, actor 全局 mini_batch, critic 全局 mini_batch) 的倍数（补出的行打 is_padding 标签），再 get_seqlen_balanced_partitions 分桶、batch.reorder <b>原地</b>重排。",
+        "<b>为什么要算 old_log_prob</b>：PPO 的重要性采样比值要用它做分母——它是 π_old 的 token 级对数概率。",
+        "dp_size 从 actor_rollout_wg._dispatch_info 或现查 _query_dispatch_info(\"actor\") 取，值是 max(mapping)+1。源码：trainer_base.py:1895-1925、:1927-1994"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "⑦ 一条会短路整步的旁路：bypass_mode",
+      "items": [
+        "<b>触发</b>：_compute_old_log_prob 开头，优先于正常路径。",
+        "<b>为什么能短路</b>：推理引擎在生成时已经给出了 logprob；如果相信它就等于 π_old，就不必再跑一次完整前向。",
+        "<b>怎么做</b>：algorithm.rollout_correction.bypass_mode 为真时，直接把 TQ 里的 rollout_log_probs 复制成 old_log_probs 然后返回。",
+        "代价：训练引擎与推理引擎的数值不完全一致（kernel、精度、批次组成都可能不同），所以这是个精度换速度的开关。",
+        "它同时也关掉 compute_rollout_correction_and_add_to_batch。源码：trainer_base.py:1933-1941、:2170-2177"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "⑧ put old_log_probs — 以及熵指标",
+      "items": [
+        "<b>触发</b>：worker 侧 tqbridge 在方法返回时自动写回。",
+        "<b>为什么 driver 还要再读一次</b>：worker 的返回值只被断言长度，真正结果在 TQ 里；driver 用 kv_batch_get 取 log_probs / response_mask（可选 entropy）。",
+        "<b>怎么用熵</b>：用 agg_loss 按 loss_agg_mode 归并；prompt-mean 模式额外算 compute_prompt_loss_weights 并多发一个 actor/entropy_token_mean。",
+        "开了 rollout.calculate_log_probs 时还取 responses 和 rollout_log_probs，用于对比训练与推理的 logprob 偏差（calculate_debug_metrics）。",
+        "源码：trainer_base.py:1956-1992"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "⑨ ref 与 values — 两个条件阶段",
+      "items": [
+        "<b>ref 的触发条件</b>：use_reference_policy = algorithm.use_kl_in_reward 或 actor.use_kl_loss。只要有一个要用 KL 就得算。",
+        "<b>ref 的三种分派</b>：ref_in_actor 时调 actor 的 compute_log_prob 并带 no_lora_adapter=True（临时禁 adapter）；共卡在 ActorRolloutRef 时取同一组 worker 但用 \"ref\" mesh；独立 Role.RefPolicy 时调 ref_policy_wg。",
+        "<b>values 的触发条件</b>：use_critic = 显式 critic.enable，否则仅当 adv_estimator == gae 时为真（其它估计器会 warn 后置 False）。",
+        "<b>values 的一个实现细节</b>：critic_wg.infer_batch 返回带 future 的对象，要 ray.get(output.futures) 才拿到；代码里留了 TODO 说 DataProtoFuture 还不支持 KVBatchMeta。",
+        "取回后要把 values 按 response 切片再写回 TQ（只保留响应段）。源码：trainer_base.py:1996-2042"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑩ 取优势输入 — 这一步读得最多",
+      "items": [
+        "<b>触发</b>：计时标签 adv，前面所有字段都已就位。",
+        "<b>为什么要一次取这么多</b>：优势计算要同时看奖励、三种 logprob、价值和掩码，还有各种惩罚通道需要的额外字段。",
+        "<b>取什么</b>：uid、response_mask、rm_scores、rollout_log_probs、old_log_probs、ref_log_prob、values，按配置再加 tool_call_error_mask / repetition_mask / turn_index。",
+        "另外还有多处针对 extra_fields 的定向取用（score centering、webdev 评分、基础设施指标等）。",
+        "jagged 与 padded 的互转由 to_padded_tensor / response_from_nested / response_to_nested 负责。源码：trainer_base.py:2083-2092"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑪ 优势计算 — 14 个估计器与三条惩罚通道",
+      "items": [
+        "<b>注册表</b>：ADV_ESTIMATOR_REGISTRY + @register_adv_est(name)，14 个：gae、grpo、grpo_vectorized、gdpo、grpo_passk、reinforce_plus_plus(_baseline)、rloo、rloo_vectorized、opo、remax、gpg、optimal_token_baseline、tir_optimal_token_baseline。",
+        "<b>V1 只特殊处理 GRPO</b>：先找每个 {uid}_{session_id} 里 index 最大的那行（session 末行），只对这些行算优势，再把标量优势按首个有效响应 token 位置 <b>scatter 回整组每一行</b>。其它估计器原样委托给 v0 的 compute_advantage。",
+        "<b>KL 入奖励</b>：apply_kl_penalty 算 kld = kl_penalty(old_log_probs, ref_log_prob) × response_mask，再 token_level_rewards = token_level_scores − beta × kld，顺带更新自适应 KL 控制器。关掉时两者直接相等。",
+        "<b>KL 入损失</b>是在 <b>worker 侧</b>生效的，trainer 的唯一作用是让 use_reference_policy 为真以便 ref_log_prob 存在。",
+        "三条惩罚通道（工具报错 / 重复 / deep_failure_mask）各有 monitor / mask / adv_reduction / adv_set / adv_signed 策略集；adv_signed 还要过 rebalance_dense。源码：trainer_base.py:2073-2387、core_algos.py:113-150"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "⑫ put advantages / returns",
+      "items": [
+        "<b>触发</b>：优势算完。",
+        "<b>为什么写回这么多字段</b>：worker 侧算损失时要的全部中间量都得过 TQ，driver 不能直接传张量。",
+        "<b>必写</b>：advantages、returns。",
+        "<b>按条件追加</b>：use_kl_in_reward 时写 token_level_rewards；惩罚通道改过掩码时写 response_mask；rollout 校正时写 rollout_is_weights；loss_agg_mode == \"prompt-mean\" 时写 prompt_loss_weights。",
+        "源码：trainer_base.py:2352-2385"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑬ update_critic 与 update_actor",
+      "items": [
+        "<b>critic 的触发</b>：use_critic 为真。extra_info 带 global_batch_size、mini_batch_size（= critic.ppo_mini_batch_size × rollout.n）、epochs、seed、dataloader_kwargs、temperature。",
+        "<b>actor 的触发条件</b>：config.trainer.critic_warmup <= global_steps——warmup 期间只更新 critic，actor 不动。",
+        "<b>一条容易撞的断言</b>：loss_agg_mode == \"prompt-mean\" 时要求 len(batch) == ppo_mini_batch_size × rollout.n，即一步只能一个 mini-batch。",
+        "<b>13 种 policy loss</b>：vanilla（默认）、dppo_tv、dppo_kl、gspo、sapo、gpg、clip_cov、kl_cov、geo_mean、dro、cispo、bypass_mode，由 config.policy_loss.loss_mode 在 worker 侧选用。",
+        "两者都返回 DataProtoFuture，.get() 时才阻塞；指标前缀重命名为 critic/* 与 actor/*，mfu 改成 perf/mfu/*。源码：trainer_base.py:2389-2457、losses.py:119-121"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑭ on_step_end → update_weights",
+      "items": [
+        "<b>触发</b>：parameter_sync_step 次 _step_once 全部跑完之后，由 fit() 调用（不在 _step_once 内）。",
+        "<b>为什么不是每次 _step_once 都同步</b>：这正是 Decoupled PPO——一次权重同步配 N 次优化器更新，摊薄同步开销。",
+        "<b>三种模式怎么分叉</b>：sync 唤醒副本并推权重（backend 强制 naive）；colocate_async 推完再 resume 让被 abort 的轨迹续跑；separate_async 由 standalone 管理器跨节点同步并可能借卡。",
+        "完整时序（逐张量 all-gather、IPC 字节桶、barrier 后重建 KV）见「权重同步」页面。",
+        "源码：trainer_sync.py:35-38、trainer_colocate_async.py:37-42、trainer_separate_async.py:340-407"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "⑮ kv_clear — 这一步最后一个数据面动作",
+      "items": [
+        "<b>触发</b>：算完指标、写完日志之后。",
+        "<b>为什么不能更早</b>：算指标还要从 TQ 读 prompts / responses / advantages / rm_scores 等字段，清早了就读不到。",
+        "<b>怎么做</b>：tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)，清掉本步轨迹的键。",
+        "校验路径也有自己的 kv_clear，清 \"val\" 分区。",
+        "源码：trainer_base.py:772、:1420"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：数据面为什么返回值常被忽略",
+      "items": [
+        "driver 传出去的是 KVBatchMeta（keys + tags），不是张量。",
+        "worker 侧 @register 链里的 tqbridge 自动把 meta 换成真实 TensorDict：_find_meta 找出 meta，再把张量从 TQ 拉成 TensorDict，并把 extra_info 作为非张量项合并进去。",
+        "退出时若返回 batch size 匹配的 TensorDict，就把张量字段<b>写回 TQ</b>，返回带原 tags 的新 meta；不该收集的 rank 返回空 meta。",
+        "所以 compute_log_prob 之类的返回值只被断言长度，结果要再 kv_batch_get 取。",
+        "源码：decorator.py:425（挂 tqbridge）、transferqueue_utils.py:347-420、:160-177、:205-220"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：九个计时标签与读图提示",
+      "items": [
+        "计时标签依次是 gen / reward / old_log_prob / ref / values / adv / update_critic / update_actor，它们就是 timing_s/* 指标名，排查性能时直接对照。",
+        "编号 ①–⑮ 是消息顺序，比九个阶段更细——②③ 属于 gen，⑤ 属于 reward，⑦⑧ 属于 old_log_prob。",
+        "<b>每个阶段都是一次阻塞的 worker 往返，阶段之间没有重叠</b>；唯一的并发来源是生成与训练的生产者 / 消费者关系。",
+        "本图画的是同卡 RM 那条路（所以 ④⑤ 存在）；函数奖励时它们整段不执行。",
+        "行号对应 revision f4becf6e。"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,738 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "verl 训练主循环与三种 trainer_mode 的 GPU 交接",
+    "locale": "zh-CN",
+    "output": "docs/learning-mimo/arch/verl-train-loop.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/justforyou16007/verl.git",
+      "provider": "github",
+      "link_mode": "local-only",
+      "revision": "f4becf6ec8333bf44e9e130b16b949a44f94a37d"
+    }
+  },
+  "lanes": [
+    {
+      "id": "loop",
+      "label": "fit() 主循环"
+    },
+    {
+      "id": "gen",
+      "label": "生成侧（持续运行）"
+    },
+    {
+      "id": "sy",
+      "label": "模式 sync"
+    },
+    {
+      "id": "co",
+      "label": "模式 colocate_async"
+    },
+    {
+      "id": "sp",
+      "label": "模式 separate_async"
+    },
+    {
+      "id": "side",
+      "label": "检查点与校验"
+    }
+  ],
+  "phases": [
+    {
+      "id": "pre",
+      "label": "进入循环",
+      "fromCol": 0,
+      "toCol": 1
+    },
+    {
+      "id": "core",
+      "label": "一个 global step",
+      "fromCol": 2,
+      "toCol": 4,
+      "variant": "emphasis"
+    },
+    {
+      "id": "post",
+      "label": "收尾",
+      "fromCol": 5,
+      "toCol": 5
+    }
+  ],
+  "mainPath": [
+    "f0",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5"
+  ],
+  "nodes": [
+    {
+      "id": "f0",
+      "lane": "loop",
+      "col": 0,
+      "type": "backend",
+      "icon": "start",
+      "label": "② fit() 前置",
+      "sublabel": "Tracking / SkipManager / 训前校验",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 673,
+          "end_line": 726,
+          "label": "fit 开头"
+        }
+      ]
+    },
+    {
+      "id": "f1",
+      "lane": "loop",
+      "col": 1,
+      "type": "messagebus",
+      "label": "③ on_step_begin + prepare_step",
+      "sublabel": "提交下一批 prompt",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 734,
+          "end_line": 738,
+          "label": "步首"
+        },
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1789,
+          "end_line": 1792,
+          "label": "prepare_step"
+        }
+      ]
+    },
+    {
+      "id": "f2",
+      "lane": "loop",
+      "col": 2,
+      "type": "backend",
+      "label": "⑦ step()",
+      "sublabel": "循环 parameter_sync_step 次 _step_once",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 794,
+          "end_line": 821,
+          "label": "step()"
+        }
+      ]
+    },
+    {
+      "id": "f3",
+      "lane": "loop",
+      "col": 3,
+      "type": "database",
+      "label": "⑪ 存检查点",
+      "sublabel": "save_freq 命中或最后一步",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 742,
+          "end_line": 746,
+          "label": "保存触发"
+        }
+      ]
+    },
+    {
+      "id": "f4",
+      "lane": "loop",
+      "col": 4,
+      "type": "security",
+      "label": "⑬ on_step_end",
+      "sublabel": "权重同步，三模式在此分叉",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 748,
+          "end_line": 749,
+          "label": "步尾钩子"
+        }
+      ]
+    },
+    {
+      "id": "f5",
+      "lane": "loop",
+      "col": 5,
+      "type": "backend",
+      "icon": "success",
+      "label": "⑰ 指标与清理",
+      "sublabel": "metrics → log → kv_clear → 下一步",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 752,
+          "end_line": 788,
+          "label": "步尾收束"
+        }
+      ]
+    },
+    {
+      "id": "submit",
+      "lane": "gen",
+      "col": 1,
+      "type": "messagebus",
+      "label": "④ _add_batch_to_generate",
+      "sublabel": "uuid4 做 key，写 pending 标签",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1760,
+          "end_line": 1776,
+          "label": "提交 prompt"
+        }
+      ]
+    },
+    {
+      "id": "agentloop",
+      "lane": "gen",
+      "col": 2,
+      "type": "cloud",
+      "label": "⑤ AgentLoop worker",
+      "sublabel": "持续生成并写轨迹到 TQ",
+      "tag": "不受 trainer 控制流阻塞",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/agent_loop_tq.py",
+          "line": 182,
+          "end_line": 232,
+          "label": "写轨迹"
+        }
+      ]
+    },
+    {
+      "id": "warm",
+      "lane": "gen",
+      "col": 0,
+      "type": "cloud",
+      "label": "① 预热批次",
+      "sublabel": "异步模式 on_train_begin 预填",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 885,
+          "end_line": 912,
+          "label": "_add_async_warmup_batches"
+        }
+      ]
+    },
+    {
+      "id": "sy_sleep",
+      "lane": "sy",
+      "col": 2,
+      "type": "external",
+      "label": "⑧ sleep_replicas",
+      "sublabel": "on_sample_end 让副本睡眠腾显存",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_sync.py",
+          "line": 40,
+          "end_line": 44,
+          "label": "on_sample_end"
+        }
+      ]
+    },
+    {
+      "id": "sy_upd",
+      "lane": "sy",
+      "col": 4,
+      "type": "external",
+      "label": "⑭ update_weights",
+      "sublabel": "唤醒副本并推权重（naive）",
+      "tag": "训练与推理严格轮流",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_sync.py",
+          "line": 35,
+          "end_line": 38,
+          "label": "on_step_end"
+        }
+      ]
+    },
+    {
+      "id": "co_abort",
+      "lane": "co",
+      "col": 2,
+      "type": "external",
+      "label": "⑨ abort → sleep",
+      "sublabel": "保存未完成请求（部分 rollout）",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_colocate_async.py",
+          "line": 44,
+          "end_line": 50,
+          "label": "on_sample_end"
+        }
+      ]
+    },
+    {
+      "id": "co_upd",
+      "lane": "co",
+      "col": 4,
+      "type": "external",
+      "label": "⑮ update → resume",
+      "sublabel": "被中断的轨迹在新权重上续跑",
+      "tag": "一条轨迹可跨多个权重版本",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_colocate_async.py",
+          "line": 37,
+          "end_line": 42,
+          "label": "on_step_end"
+        }
+      ]
+    },
+    {
+      "id": "sp_begin",
+      "lane": "sp",
+      "col": 1,
+      "type": "external",
+      "label": "⑥ 换挡判断",
+      "sublabel": "ROLLOUT 态则按阈值决定收回",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_separate_async.py",
+          "line": 252,
+          "end_line": 267,
+          "label": "on_step_begin"
+        }
+      ]
+    },
+    {
+      "id": "sp_wait",
+      "lane": "sp",
+      "col": 2,
+      "type": "external",
+      "label": "⑩ 等样本并切回 trainer",
+      "sublabel": "remove → abort → sleep 混合副本",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_separate_async.py",
+          "line": 287,
+          "end_line": 302,
+          "label": "_wait_for_sampleable_and_switch"
+        },
+        {
+          "path": "verl/trainer/ppo/v1/trainer_separate_async.py",
+          "line": 427,
+          "end_line": 434,
+          "label": "switch_to_trainer"
+        }
+      ]
+    },
+    {
+      "id": "sp_upd",
+      "lane": "sp",
+      "col": 4,
+      "type": "external",
+      "label": "⑯ standalone 同步 + 借卡",
+      "sublabel": "按收益与换挡成本比较后决定",
+      "tag": "独占副本永不睡眠",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_separate_async.py",
+          "line": 340,
+          "end_line": 407,
+          "label": "on_step_end 决策"
+        }
+      ]
+    },
+    {
+      "id": "save",
+      "lane": "side",
+      "col": 3,
+      "type": "database",
+      "label": "⑫ _save_checkpoint",
+      "sublabel": "actor / critic / data.pt / TQ 快照",
+      "tag": "在 on_step_end 之前",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1209,
+          "end_line": 1290,
+          "label": "_save_checkpoint"
+        }
+      ]
+    },
+    {
+      "id": "val",
+      "lane": "side",
+      "col": 5,
+      "type": "security",
+      "label": "⑱ _validate",
+      "sublabel": "test_freq 命中；对的是更新后权重",
+      "sources": [
+        {
+          "path": "verl/trainer/ppo/v1/trainer_base.py",
+          "line": 1292,
+          "end_line": 1467,
+          "label": "_validate"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-warm",
+      "from": "warm",
+      "to": "f0",
+      "label": "预填",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-f0-f1",
+      "from": "f0",
+      "to": "f1",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-f1-submit",
+      "from": "f1",
+      "to": "submit",
+      "label": "提交",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e-submit-agent",
+      "from": "submit",
+      "to": "agentloop",
+      "label": "generate",
+      "variant": "dashed",
+      "role": "async"
+    },
+    {
+      "id": "e-f1-f2",
+      "from": "f1",
+      "to": "f2",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-agent-f2",
+      "from": "agentloop",
+      "to": "f2",
+      "label": "经 TQ 消费",
+      "variant": "dashed",
+      "role": "return"
+    },
+    {
+      "id": "e-f2-f3",
+      "from": "f2",
+      "to": "f3",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-f3-save",
+      "from": "f3",
+      "to": "save",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e-f3-f4",
+      "from": "f3",
+      "to": "f4",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-f4-f5",
+      "from": "f4",
+      "to": "f5",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e-f5-val",
+      "from": "f5",
+      "to": "val",
+      "variant": "default",
+      "role": "branch"
+    },
+    {
+      "id": "e-f4-sy",
+      "from": "f4",
+      "to": "sy_upd",
+      "label": "sync",
+      "variant": "security",
+      "role": "branch"
+    },
+    {
+      "id": "e-f4-co",
+      "from": "f4",
+      "to": "co_upd",
+      "label": "coloc",
+      "variant": "security",
+      "role": "branch"
+    },
+    {
+      "id": "e-f4-sp",
+      "from": "f4",
+      "to": "sp_upd",
+      "label": "sep",
+      "variant": "security",
+      "role": "branch"
+    },
+    {
+      "id": "e-sy-chain",
+      "from": "sy_sleep",
+      "to": "sy_upd",
+      "label": "同一步内",
+      "variant": "dashed"
+    },
+    {
+      "id": "e-co-chain",
+      "from": "co_abort",
+      "to": "co_upd",
+      "label": "同一步内",
+      "variant": "dashed"
+    },
+    {
+      "id": "e-sp-chain",
+      "from": "sp_wait",
+      "to": "sp_upd",
+      "label": "同一步内",
+      "variant": "dashed"
+    },
+    {
+      "id": "e-f1-spbegin",
+      "from": "f1",
+      "to": "sp_begin",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "e-spbegin-spwait",
+      "from": "sp_begin",
+      "to": "sp_wait",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "① 预热批次 — 只有异步模式才有",
+      "items": [
+        "<b>触发</b>：on_train_begin，在主循环第一次迭代之前。sync 模式这个钩子是空操作。",
+        "<b>为什么要预填</b>：异步模式的生成在另一个进程持续跑，如果开局队列是空的，第一个 step 会干等生成。",
+        "<b>怎么算填多少</b>：floor(num_warmup_batches × train_batch_size / gen_batch_size) × gen_batch_size 个 prompt。",
+        "<b>断点续训的坑已经处理</b>：填充量会<b>减去 _restored_tq_prompt_count</b>，否则恢复出来的在飞 prompt 会被重复填一遍。",
+        "config.skip.rollout_tq.enable 时整段跳过。源码：trainer_base.py:885-912、trainer_colocate_async.py:34-35、trainer_separate_async.py:244-245"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "② fit() 前置 — 日志、训前校验、起始步号",
+      "items": [
+        "<b>触发</b>：TaskRunnerV1 调 trainer.fit(agent_loop_manager)，紧接 init() 之后。",
+        "<b>为什么这些东西不在 init 里建</b>：Tracking 要写实验记录，建早了会在 init 失败时留下空实验；SkipManager 需要知道起始步号。",
+        "<b>怎么做</b>：SkipManager.init → Tracking → ValidationGenerationsLogger → DapoFilteredRewardTableLogger。",
+        "trainer.val_before_train 默认 True：先跑一次 _validate 并<b>断言返回非空</b>；trainer.val_only 为真时打完指标直接 return。",
+        "global_steps 先 +1 再进循环，所以第一个 step 编号是 1 而不是 0。源码：trainer_base.py:673-726"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "③ on_step_begin + prepare_step — 提交下一批",
+      "items": [
+        "<b>触发</b>：每个 global step 的开头，在 step() 之前。",
+        "<b>为什么先提交再训练</b>：生成是生产者、训练是消费者；先把下一批 prompt 丢出去，训练这一步的时间就被用来生成下一批。",
+        "<b>怎么做</b>：prepare_step 基类只有一句 if prefetch_next_batch: _add_batch_to_generate()。",
+        "最后一步传 prefetch_next_batch=False，不再提交新 prompt。",
+        "separate_async 在这里还要做换挡判断（见 ⑥）。源码：trainer_base.py:734-738、:1789-1792"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "④ _add_batch_to_generate — prompt 怎么登记",
+      "items": [
+        "<b>触发</b>：prepare_step 调用，每 global step 一次。",
+        "<b>为什么每行要新 uuid</b>：轨迹键是 {uid}_{session_id}_{index}，uid 必须全局唯一才不会撞上历史轨迹。",
+        "<b>怎么做</b>：_next_train_batch → 逐行 _fetch_one_gen_batch（分配 uuid4 作 uid）→ _submit_batch_to_rollout。",
+        "<b>sync 与异步在这里分叉</b>：异步模式把 prompt 的<b>字段也写进 TQ</b>（为了断点能恢复在飞生成），sync 只写标签 {is_prompt, status:\"pending\", global_steps}。",
+        "然后 agent_loop_manager.generate_sequences(batch)——只 ray.get 分发动作，<b>不等生成结果</b>。源码：trainer_base.py:1760-1787"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑤ AgentLoop worker — 为什么它是独立一行",
+      "items": [
+        "<b>触发</b>：被 generate_sequences 分发唤起之后就<b>一直跑</b>，不受 trainer 控制流阻塞。",
+        "<b>为什么这样设计</b>：V1 把生成与训练解耦成生产者 / 消费者，trainer 只在提交和消费两个点接触它。",
+        "<b>怎么交接数据</b>：await tq.async_kv_batch_put(keys, fields, tags, partition_id)，对 trainer 是 fire-and-forget。",
+        "prompt 标签的状态机：pending（trainer 提交）→ running（worker 领取）→ finished | failure。",
+        "轨迹标签带 prompt_len / response_len / seq_len / global_steps / min_global_steps / max_global_steps——后两个就是陈旧度的来源。源码：agent_loop_tq.py:182-232、:115、:145-153"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑥ separate_async 换挡判断 — 要不要把卡收回来",
+      "items": [
+        "<b>触发</b>：on_step_begin，以及 prepare_step 里的 _wait_for_sampleable_and_switch。",
+        "<b>为什么要判断</b>：训练卡被借给推理之后，收回来要付两次换挡成本；样本够用时就不该急着收。",
+        "<b>怎么判</b>：当前是 ROLLOUT 态时，enable_switch 关着就立刻 _timed_switch_to_trainer()；开着则算 _step_threshold()，只有 get_sampleable_count() 达到阈值才切。",
+        "prepare_step 里的那条路会<b>阻塞</b>在 replay_buffer.wait_for_sampleable 上，计时标签是 switch_wait。",
+        "校验会强制先切到 ROLLOUT（on_validate_begin），而且没人覆写 on_validate_end，所以会停在 ROLLOUT 直到下一次 on_step_begin。源码：trainer_separate_async.py:252-267、:287-302、:247-250"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑦ step() — 一个 global step 不等于一次更新",
+      "items": [
+        "<b>触发</b>：prepare_step 之后，是这一步最主要的工作。",
+        "<b>为什么要内层循环</b>：这就是 Decoupled PPO——<b>一次权重同步配 N 次优化器更新</b>，摊薄同步开销。",
+        "<b>怎么做</b>：断言 train_batch_size % parameter_sync_step == 0，sample_batch_size = train_batch_size / parameter_sync_step，然后循环 parameter_sync_step 次 _step_once。",
+        "prepare_step 在循环<b>外</b>只调一次；MetricsAggregator 按 key 规则归并多轮指标（sum / last / max / min / time_sum / weighted_avg）并重算派生项。",
+        "返回 KVBatchMeta(partition_id, 合并 keys, 合并 tags)，供步尾算指标和清理。_step_once 内部九阶段见「训练步九阶段」页面。源码：trainer_base.py:794-821"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑧ sync：on_sample_end → sleep_replicas",
+      "items": [
+        "<b>触发</b>：_step_once 里采样结束时（on_sample_end 钩子）。",
+        "<b>为什么此刻睡</b>：样本已经拿到，接下来是纯训练计算，推理副本占着的权重与 KV 显存可以全部让出来。",
+        "<b>怎么做</b>：checkpoint_manager.sleep_replicas()，顺带停掉 rollout 侧的 profiling。",
+        "<b>sync 的特征</b>：不中断在飞请求（没有部分 rollout），采样器也不做陈旧度控制——max_off_policy_strategy 对 sync 是空操作。",
+        "所以重叠窗口基本没有：生成只在 replay_buffer.sample 轮询期间推进。源码：trainer_sync.py:40-44、replay_buffer.py:101-121"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑨ colocate_async：先 abort 再 sleep",
+      "items": [
+        "<b>触发</b>：同样是 on_sample_end，但多一步。",
+        "<b>为什么要先 abort</b>：同卡模式必须让出显存，但直接睡会丢掉半成品轨迹；abort 把未完成请求<b>保存</b>下来，这就是「部分 rollout」。",
+        "<b>怎么做</b>：abort_replicas() → sleep_replicas()，顺序不能换。",
+        "配套的客户端是 FullyAsyncLLMServerClient：它把 generate 包在续跑循环里，遇到 stop_reason 为 aborted / abort 就 sleep(1) 重试并合并已生成的 token，所以<b>部分 rollout 对 agent loop 是透明的</b>。",
+        "代价：一条轨迹可能横跨多个权重版本，用 min_global_steps / max_global_steps 记录陈旧度。源码：trainer_colocate_async.py:44-50、llm_server.py:172-369"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑩ separate_async：等样本并切回 trainer",
+      "items": [
+        "<b>触发</b>：prepare_step → _wait_for_sampleable_and_switch，在 step() 之前。",
+        "<b>为什么它不 sleep 也不 abort</b>：standalone 副本有自己的卡，<b>永不睡眠</b>——这也是它硬性禁止同卡 reward model 的原因。",
+        "<b>怎么把借出的训练卡收回</b>：switch_to_trainer() = remove_replicas_from_balancer() → abort_replicas(reject_request=True) → sleep_replicas()，只作用于 hybrid 副本。",
+        "先从均衡器摘掉再 abort，顺序保证摘除期间不再有新请求打进来。",
+        "源码：trainer_separate_async.py:287-302、:427-434、:436-453"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑪ 存检查点的触发点 — 注意它在 on_step_end 之前",
+      "items": [
+        "<b>触发</b>：trainer.save_freq > 0 且（是最后一步 或 global_steps % save_freq == 0），计时标签 save_checkpoint。",
+        "<b>为什么位置重要</b>：它在 step 计时器<b>内部</b>、on_step_end <b>之前</b>，所以存的是「已更新但还没同步给推理副本」的权重。",
+        "<b>怎么做</b>：见 ⑫。",
+        "对照：校验在 on_step_end <b>之后</b>，所以评的是已同步的新权重。两者差一个同步动作。",
+        "源码：trainer_base.py:742-746"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑫ _save_checkpoint — 存了哪些东西",
+      "items": [
+        "<b>触发</b>：上一张卡的条件命中时。",
+        "<b>为什么要存 TQ</b>：异步模式有在飞的 prompt，只存模型会在重启后丢掉它们。",
+        "<b>怎么做</b>：actor 检查点 → critic（若有）→ train_dataloader.state_dict() 存成 data.pt → <b>非 sync 模式</b>再 tq.save_checkpoint(.../transfer_queue, metadata={global_steps})。",
+        "路径 {default_local_dir}/global_step_{N}；远端是 {default_hdfs_dir}/global_step_N/actor 或 None。",
+        "async_save 为真时不写 latest_checkpointed_iteration.txt，直接回调后返回；否则先写 tracker 文件再回调。源码：trainer_base.py:1209-1290"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑬ on_step_end — 三种模式在这里分叉",
+      "items": [
+        "<b>触发</b>：存检查点之后、算指标之前。",
+        "<b>为什么权重同步放这里</b>：actor 已经更新完，而下一步的生成需要新权重；放在算指标之前能让同步耗时计入 step 计时。",
+        "<b>怎么分叉</b>：sync 只 update_weights；colocate_async 还要 resume_generation_replicas；separate_async 走 standalone 管理器并可能借卡。",
+        "紧接着 metrics.update(self._consume_sync_metrics())，把同步阶段的指标取回来。",
+        "源码：trainer_base.py:748-749"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑭ sync 的权重同步",
+      "items": [
+        "<b>触发</b>：on_step_end。",
+        "<b>为什么能用最简单的后端</b>：训练与推理在同一批 worker 进程里，权重不用跨进程搬。",
+        "<b>怎么做</b>：marked_timer(\"update_weights\") 里调 checkpoint_manager.update_weights(global_steps)；backend 被<b>强制成 naive</b>，即进程内从模型引擎直取。",
+        "这一步同时负责唤醒副本——sleep 过的副本在这里被 wake 回来。",
+        "完整时序见「权重同步」页面。源码：trainer_sync.py:35-38"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑮ colocate_async：推完权重再 resume",
+      "items": [
+        "<b>触发</b>：on_step_end。",
+        "<b>为什么多一步 resume</b>：⑨ 里 abort 保存的半成品轨迹要继续跑，而且必须<b>在新权重就位之后</b>再 resume。",
+        "<b>怎么做</b>：update_weights(global_steps) → resume_generation_replicas()，顺序不能换。",
+        "后果：被中断的轨迹在新权重上续写，所以同一条轨迹的前后段来自不同策略版本。",
+        "这就是 min_global_steps / max_global_steps 两个标签存在的理由，陈旧度指标也由此算出。源码：trainer_colocate_async.py:37-42、trainer_base.py:2613-2640"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑯ separate_async：standalone 同步 + 借卡决策",
+      "items": [
+        "<b>触发</b>：on_step_end，总是先同步 standalone 副本。",
+        "<b>为什么要算收益</b>：把训练卡借给推理能更快攒够样本，但两次换挡本身有成本；只有净收益为正才值得。",
+        "<b>怎么算</b>：decision_threshold = min(max(round(ratio × train_batch_size), mini_batch_size), train_batch_size)；remaining = max(0, threshold − get_sampleable_count(gs+1))；benefit = remaining × per_sample_time × (1 − 1/scaling_factor)；cost = 两次换挡成本均值；benefit > cost 才借。",
+        "决定借出时顺序是：先 add_replicas_to_balancer() + clear_sticky_cache()，<b>再</b>做权重同步，最后 switch_to_rollout(already_registered=True)。",
+        "阈值还会自适应：连续若干步空闲 / 紧张后按 switch_threshold_step_up / down 调整，下限 1/parameter_sync_step。源码：trainer_separate_async.py:340-407、:316-331、:417-425"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑰ 指标、日志与清理 — 一步的收尾",
+      "items": [
+        "<b>触发</b>：on_step_end 之后。",
+        "<b>为什么 kv_clear 放最后</b>：算指标还要从 TQ 读 prompts / responses / advantages 等字段，清早了就读不到了。",
+        "<b>怎么做</b>：_compute_metrics → 可选 _log_rollout_data 落盘 → tq.kv_clear(keys, partition_id) → logger.log → global_steps += 1。",
+        "<b>最后一步走 is_last_step 分支提前 return</b>，因此不会触发 on_train_end——只有按 epoch / 步数条件正常退出循环才会。",
+        "源码：trainer_base.py:752-788"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "⑱ _validate — 评的是已同步的新权重",
+      "items": [
+        "<b>触发</b>：trainer.test_freq > 0 且（是最后一步 或 global_steps % test_freq == 0），在 on_step_end <b>之后</b>。",
+        "<b>为什么同卡 RM 要在这里也做一次显存交接</b>：校验也要算奖励，而同卡 RM 和推理副本抢同一块显存。",
+        "<b>怎么做</b>：每行分配 uuid → kv_batch_put 到 \"val\" 分区（<b>只写标签不写字段</b>）→ generate_sequences → replay_buffer.sample(partition_id=\"val\")。",
+        "\"val\" 分区的淘汰机制被关掉，所以每个 finished | failure 组都可采样。",
+        "同卡 RM 时这里会显式 sleep_replicas() → _compute_reward_colocate() → update_weights()。源码：trainer_base.py:1292-1467、:1342-1345"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：三种模式到底差在哪",
+      "items": [
+        "<b>sync</b>：严格轮流占卡，无部分 rollout，无陈旧度控制，parameter_sync_step 默认 1，重叠窗口基本为零。",
+        "<b>colocate_async</b>：同卡但允许中断续跑，开局预填流水线，轨迹可跨权重版本。",
+        "<b>separate_async</b>：推理独占卡 + 训练卡按收益借出；两套服务管理器（hybrid 在训练卡 / standalone 独占）、两套检查点引擎（naive / nccl·nixl）。",
+        "separate_async 的 Decoupled PPO：trigger 0 先 save_model_to_cpu(0)（当前权重就是 π_old）；trigger ≥ 1 则 save(k) → restore(0) → 算 → restore(k) → clear(k)。这就是要换 DetachActorWorker 的原因。",
+        "源码：trainer_separate_async.py:201-225"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "附：读图提示与一个未解的疑问",
+      "items": [
+        "编号 ①–⑱ 按流程顺序排，与图上节点一一对应；⑧⑨⑩ 和 ⑭⑮⑯ 是同一钩子在三种模式下的不同动作。",
+        "泳道内横向箭头只表示「属于同一个 step」，不表示两个动作之间有数据流。",
+        "生成侧那一行在另一个进程持续运行，和主干只通过 TransferQueue 相连。",
+        "<b>未解疑问</b>：fit() 最后一步传 prefetch_next_batch=False，而 sync 是一步一批没有缓冲，最后一步的 sample 可能无数据可取。读过的代码里没有能排除这一点的逻辑，记作疑问而非结论。",
+        "行号对应 revision f4becf6e。"
+      ]
+    }
+  ]
+}

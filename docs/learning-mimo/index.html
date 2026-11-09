@@ -14,6 +14,7 @@
     <li><a href="#map">全景图</a></li>
     <li><a href="#progress">进度</a></li>
     <li><a href="#lessons">各课要点</a></li>
+    <li><a href="#maps">流程细节地图</a></li>
     <li><a href="#qa">问答索引</a></li>
     <li><a href="#todo">待学内容</a></li>
     <li><a href="#changelog">更新记录</a></li>
@@ -30,6 +31,22 @@
     <li><a href="xb-uni-agent-gateway.html">插课 B：Code 环境与 uni-agent 网关</a></li>
     <li><a href="xc-k8s-api.html">插课 C：仓库如何调用 k8s API</a></li>
     <li><a href="xd-k8s-identity.html">插课 D：agent 配置来源与 k8s 身份</a></li>
+    <li><a href="xe-separate-async-init.html">插课 E：SeparateAsync 的初始化</a></li>
+    <li><a href="xf-megatron-parallel.html">插课 F：Megatron / MindSpeed 与五种分片</a></li>
+  </ol>
+  <h2 style="margin-top:20px">流程细节地图</h2>
+  <ol>
+    <li><a href="arch/index.html">地图索引（总入口）</a></li>
+    <li><a href="arch/verl-init.html">初始化总分图</a></li>
+    <li><a href="arch/verl-train-loop.html">训练主循环与三模式</a></li>
+    <li><a href="arch/verl-ppo-step.html">训练步九阶段</a></li>
+    <li><a href="arch/verl-single-controller.html">single-controller 分派</a></li>
+    <li><a href="arch/verl-rollout.html">推理副本与路由</a></li>
+    <li><a href="arch/verl-weight-sync.html">权重同步</a></li>
+    <li><a href="arch/verl-engines.html">vLLM / SGLang 内部</a></li>
+    <li><a href="arch/verl-npu.html">NPU 补丁分层</a></li>
+    <li><a href="arch/verl-model-init.html">模型初始化与设备放置</a></li>
+    <li><a href="arch/verl-sharding-anim.html">并行与分片动画</a></li>
   </ol>
 </nav>
 <main>
@@ -78,6 +95,8 @@
   <tr><td>插课 B</td><td>Code 环境走 uni-agent：替换 rollout 管理器、网关 session、链匹配与回退、runner、四 harness 混训、两条路对比</td><td><a href="xb-uni-agent-gateway.html">xb-uni-agent-gateway</a></td><td>✅</td></tr>
   <tr><td>插课 C</td><td>仓库如何调用 k8s API：唯一出口、接口清单、独立客户端、创建与就绪轮询、exec 全过程、文件进出、删除、detached exec、RBAC</td><td><a href="xc-k8s-api.html">xc-k8s-api</a></td><td>✅</td></tr>
   <tr><td>插课 D</td><td>agent 配置 yaml 的来源与读取位置（General / Code）；身份三参数；创建命名空间、账号、Role、令牌；生成 kubeconfig、验证、接入训练；pod 启动配置来源、namespace 约束、kubeconfig 要求、防误删分层方案与检查清单</td><td><a href="xd-k8s-identity.html">xd-k8s-identity</a></td><td>✅</td></tr>
+  <tr><td>插课 E</td><td>trainer 注册与选择；PPOTrainerSeparateAsync 的 __init__ 检查、hybrid 副本开关、DetachActorWorker、独立推理池、两个权重同步器、首次推权重；§12 追问：standalone 创建链路（资源池、CheckpointEngineWorker、每节点 server actor、路由）</td><td><a href="xe-separate-async-init.html">xe-separate-async-init</a></td><td>✅</td></tr>
+  <tr><td>插课 F</td><td>从 <code>RayClassWithInitArgs</code> 到 GPU 上的 Megatron 五层链路；worker 类与后端无关、<code>EngineRegistry</code> 三维键查表；MindSpeed 靠 <code>device=npu</code> 自动顶替 + import 顺序 + repatch 时机；并行度两处落地（<code>initialize_model_parallel</code> 建通信组、<code>provider_overrides</code> 切权重）；TP/PP/CP/EP/ETP/SP/DP 各切什么；8 卡 TP2·EP8·ETP1 实例推演</td><td><a href="xf-megatron-parallel.html">xf-megatron-parallel</a></td><td>✅</td></tr>
 </table>
 
 <h2 id="lessons">各课要点</h2>
@@ -189,7 +208,46 @@
       <li>防误删：专用命名空间 + Role（决定性）→ 单 context kubeconfig 并验证边界 → 可选准入策略限定 <code>mimoagent-*</code> → 限定范围的清理脚本（默认只预览）。</li>
     </ul>
   </div>
+  <div class="card">
+    <h3><a href="xe-separate-async-init.html">插课 E：SeparateAsync 的初始化</a></h3>
+    <ul>
+      <li><code>trainer.v1.trainer_mode</code> 查 <code>TRAINER_REGISTRY</code> 选类，默认 <code>sync</code> → <code>PPOTrainerSync</code>。</li>
+      <li><code>trainer_cls(config)</code> 只做检查和建对象；GPU 上的东西在 <code>init()</code> = <code>_setup()</code> + <code>on_init_end()</code>。</li>
+      <li>前置检查：<code>train_batch_size = parameter_sync_step × mini_batch</code>；推理要有自己的 GPU；权重同步不能用 naive；奖励模型要独立池。</li>
+      <li><code>_enable_hybrid_replicas</code>（= <code>enable_switch</code>，默认 False）决定训练 GPU 上放不放推理副本。</li>
+      <li>三个钩子：worker 换成 <code>DetachActorWorker</code>（存/取 π_old）；额外起独立推理池 + nccl 等权重同步器；启动后推一次权重。</li>
+      <li>§12：<code>LLMServerManager.create</code> 自己向 Ray 申请新 GPU → 每副本一组 <code>CheckpointEngineWorker</code>（收权重）+ 每节点一个 server actor（对外生成）→ 路由；默认下它是唯一真正提供生成的那套。</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3><a href="xf-megatron-parallel.html">插课 F：Megatron / MindSpeed 与五种分片</a></h3>
+    <ul>
+      <li><code>RayClassWithInitArgs</code> 只是「配方」；<code>role_worker_mapping</code> 里<b>只有两个类且与后端无关</b>，选 Megatron 发生在更里面。</li>
+      <li>五层：外层 <code>ActorRolloutRefWorker</code>（壳）→ 内层 <code>TrainingWorker</code> → <code>EngineRegistry.new</code> → <code>MegatronEngine</code> → <code>initialize()</code> 建模型。</li>
+      <li><code>actor.strategy=megatron</code> 一个字符串串起整条链：hydra 挂配置组 → <code>self.engine = self.megatron</code> → 注册表 backend 键。</li>
+      <li><b>MindSpeed 不是独立 backend</b>：配置仍写 <code>megatron</code>，靠 <code>EngineRegistry</code> 的 <code>(device=npu)</code> 键自动顶替；子类只重写 <code>_init_device_mesh</code>（插 repatch）与 <code>to</code>（FP8 搬运），分片代码零改动。</li>
+      <li>并行度<b>落地两次</b>：<code>mpu.initialize_model_parallel</code> 建通信组（进程全局、只建一次 → actor/ref 必须同构），<code>provider_overrides</code> 经 Megatron-Bridge 决定权重切几份。</li>
+      <li>DP 无配置项，由 <code>world/(TP×PP×CP)</code> 推出；ETP 默认 <code>null</code>（跟随 TP），MoE 上忘设会算出超额卡数。</li>
+    </ul>
+  </div>
 </div>
+
+<h2 id="maps">流程细节地图</h2>
+<p>与上面「各课要点」不同，这一组是<b>可随时查阅的参考地图</b>，不按学习顺序组织，而是按模块切分；每个主要节点都带源码引用（文件 + 行号区间）。总入口：<a href="arch/index.html"><b>地图索引</b></a>。</p>
+<table>
+  <tr><th>图</th><th>回答什么</th></tr>
+  <tr><td><a href="arch/verl-init.html">初始化总分图</a></td><td>从命令行到进入 <code>fit</code> 的六个阶段，以及 <code>_setup()</code> 十九步的真实顺序</td></tr>
+  <tr><td><a href="arch/verl-train-loop.html">训练主循环与三模式</a></td><td>一个 global step 的顺序；sync / colocate_async / separate_async 的 GPU 交接差异</td></tr>
+  <tr><td><a href="arch/verl-ppo-step.html">训练步九阶段</a></td><td><code>_step_once</code> 九个阶段的往返与条件分支</td></tr>
+  <tr><td><a href="arch/verl-single-controller.html">single-controller 分派</a></td><td>一行 driver 调用怎么变成 N 次远程调用；八种 Dispatch 模式；角色共卡</td></tr>
+  <tr><td><a href="arch/verl-rollout.html">推理副本与路由</a></td><td>副本几何、请求路由（不走 HTTP）、三种 RolloutMode</td></tr>
+  <tr><td><a href="arch/verl-weight-sync.html">权重同步</a></td><td>训练分片权重怎么进到推理引擎；六种检查点引擎</td></tr>
+  <tr><td><a href="arch/verl-engines.html">vLLM / SGLang 内部</a></td><td>两个引擎的进程结构与 IPC，以及 verl 的非常规接入方式</td></tr>
+  <tr><td><a href="arch/verl-npu.html">NPU 补丁分层</a></td><td>MindSpeed / MegatronAdaptor / vllm-ascend 如何在不改上游的前提下生效</td></tr>
+  <tr><td><a href="arch/verl-model-init.html">模型初始化与设备放置</a></td><td>Megatron 与 vLLM/SGLang 各自怎么在设备上建层、读权重、切分片、定 KV 容量；以 Qwen3.8-27B 真实配置代入算形状</td></tr>
+  <tr><td><a href="arch/verl-sharding-anim.html">并行与分片动画</a></td><td>FSDP、Ulysses、推理三维 mesh 与权重回收的 2D / 3D 交互动画</td></tr>
+</table>
+<p class="meta">不在本仓库的子模块（vLLM、SGLang、Megatron-LM、Ascend 全套共 10 个）已按匹配版本 clone 进 <code>third_party/</code> 并登记为 git submodule，版本绑定到具体 commit，清单见<a href="arch/index.html#pins">地图索引 · 版本钉子</a>。</p>
 
 <h2 id="qa">问答索引</h2>
 <table>
@@ -207,6 +265,9 @@
   <tr><td>agent 配置 yaml 在哪加载、来源是什么；给 k8s 集群配置命名空间、账号和权限</td><td><a href="xd-k8s-identity.html">插课 D</a></td></tr>
   <tr><td>（澄清）pod 启动的 yaml 配置从哪里加载、namespace 有无约束、kubeconfig 要求，如何避免误删生产 pod</td><td><a href="xd-k8s-identity.html#xd-9">插课 D §9–§16</a></td></tr>
   <tr><td>集群的 RBAC 是什么；给训练新建一个权限小的用户是不是就可以了</td><td><a href="xd-k8s-identity.html#xd-17">插课 D §17</a></td></tr>
+  <tr><td><code>trainer_cls(config=config)</code> 会加载哪个 trainer；SeparateAsync 的 init</td><td><a href="xe-separate-async-init.html">插课 E</a></td></tr>
+  <tr><td>standalone 这部分在干吗（<code>LLMServerManager.create</code> 那三行）</td><td><a href="xe-separate-async-init.html#xe-12">插课 E §12</a></td></tr>
+  <tr><td>底层如何加载 Megatron 和 MindSpeed；TP / PP / EP / CP / ETP 分片在哪里做、具体位置</td><td><a href="xf-megatron-parallel.html">插课 F</a></td></tr>
 </table>
 
 <h2 id="todo">待学内容</h2>
@@ -227,6 +288,14 @@
   <li>2026-10-22：新增插课 D（agent 配置来源与 k8s 身份配置），附 <code>k8s-identity/mimo-rollout-rbac.yaml</code> 与 <code>make-kubeconfig.sh</code>；记录发现：Code 路径未把 <code>K8S_NAMESPACE</code> 传进 Ray。</li>
   <li>2026-10-23：插课 D 追加 §9–§16（问题澄清：pod 启动配置来源、namespace 约束、kubeconfig 要求、全部删除路径分析、防误删分层方案、检查清单），新增 <code>k8s-identity/mimo-rollout-guardrails.yaml</code> 与 <code>cleanup-stale-pods.sh</code>；原 §0–§8 保留。</li>
   <li>2026-10-23：插课 D 追加 §17 答疑（RBAC 是什么；只建低权限用户够不够）。</li>
+  <li>2026-10-30：新增插课 E（SeparateAsync 的初始化），基于分支 <code>mimo-agent-env</code>。</li>
+  <li>2026-10-30：插课 E 追加 §12 答疑（standalone 那三行在干什么：create 的三步、副本数计算、init_standalone 的资源池与 worker、每节点 server actor 与命名撞名、与 hybrid 对照）。</li>
+  <li>2026-10-31：新增<a href="arch/index.html">流程细节地图</a>（9 张）：初始化、训练主循环与三模式、训练步九阶段、single-controller 分派、推理副本与路由、权重同步、vLLM / SGLang 内部、NPU 补丁分层，以及并行与分片的 2D / 3D 动画。同时把 vLLM、SGLang、Megatron-LM 与 Ascend 全套共 10 个外部依赖按匹配版本登记为 <code>third_party/</code> 下的 git submodule（版本绑定到 commit）。</li>
+  <li>2026-10-31：流程细节地图改版——每个模块的<b>功能、内部变换方式、关键约束和源码位置</b>都挂到图下面的参考卡片上，卡片标题用 ①②③ 与图中环节一一对应；原来只写出入关系的节点说明不再作为主要内容。</li>
+  <li>2026-10-31：初始化图补上两条非默认部署路径——<b>非共卡模式</b>（<code>_enable_hybrid_replicas=False</code> 时角色退化成 <code>Role.Actor</code> 并新增独立 <code>RefPolicy</code>）和 <b>PD 分离部署</b>（<code>disaggregation.enabled</code>，1 prefill + N decode、副本 world_size 放大、非对称 TP）。同时统一了全部八页「图上编号 ↔ 卡片编号」的对应关系，此前有五页图上完全没有编号、init 页的箭头编号还和卡片编号撞了。</li>
+  <li>2026-10-31：新增插课 F（Megatron / MindSpeed 的加载与 TP·PP·EP·CP·ETP 分片）：从 <code>trainer_base.py:508</code> 展开五层链路，<code>EngineRegistry</code> 的三维键查表与 MindSpeed 的自动顶替、import 顺序与 repatch 时机，并行度的两处落地点，七个维度各切什么，8 卡 TP2·EP8·ETP1 实例推演，以及 ETP 默认 <code>null</code>、TP=1 静默关 SP、actor/ref 必须同构等四个坑。<b>澄清</b>：仓库里 Qwen3.5-27B 只有 FSDP 脚本，Megatron 的实测配置取自同族 MoE 的 <code>run_qwen3_5_35b_megatron.sh</code>。</li>
+  <li>2026-10-31：新增<a href="arch/verl-model-init.html">模型初始化与设备放置</a>——补上此前完全缺失的两块：Megatron 侧怎么在各设备上定并行组 / 分层 / 建层 / 读权重切分片 / 包装优化器，以及 vLLM、SGLang 侧怎么加载权重与定出 KV 块数。以 <b>Qwen3.8-27B</b>（架构标识 qwen3_5，hybrid 注意力 + MTP + VL）的真实 config.json 代入算每个 rank 的具体形状。</li>
+  <li>2026-10-31：九张图的参考卡片全面重写——每张按「<b>触发 → 为什么 → 怎么做</b>」组织，补上了此前缺的触发点与设计原因（例如绑定为什么发生在建 WorkerGroup 那一刻、ND mesh 的映射为什么只能由 worker 自己登记、为什么必须先建通信组再拍显存基线）。同时把<b>图上每个节点</b>都编了号并与卡片标题逐一对齐，此前只有主干节点带号、泳道细节节点全是无号的。</li>
 </ul>
 </main>
 </body>

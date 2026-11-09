@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "6d30a0b7-6794-40d4-b999-068efe770281",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/docs/learning-mimo/.archify/verl-map-20261031/ppo-step.candidate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/verl-ppo-step.html",
+  "specification": {
+    "sha256": "dc9bef015e1cd7699823cd28121723857bf7486f813decf8deebff9606d75574",
+    "bytes": 21054
+  },
+  "artifact": {
+    "sha256": "674996fb9caf75d7e75df15248bcff07298fd33b3488159638f6d70dfbb63514",
+    "bytes": 861084
+  }
+}
