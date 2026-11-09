@@ -135,10 +135,11 @@ outputs
 tensorboard_log
 .history
 
-# NPU build dependencies: standalone clones of vllm / sglang / Megatron / Ascend
-# repos, pinned by the launch scripts rather than by this repo. They are not
-# submodules -- tracking them here put a gitlink to another project's commit in
-# every clone, and nothing in verl reads them through git.
+# NPU build dependencies: vllm / sglang / Megatron / Ascend checkouts that a
+# machine may clone here to build against. They are deliberately not submodules
+# -- the launch scripts pin their versions, nothing in verl reads them through
+# git, and registering them put a gitlink to another project's commit in every
+# clone of this repo. Listed so a local checkout cannot be committed by accident.
 third_party/vllm
 third_party/sglang
 third_party/Megatron-LM
