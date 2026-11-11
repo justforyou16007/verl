@@ -53,6 +53,18 @@
       </ol>
     </li>
     <li><a href="#xg-14">14. 已落地到分支的两个改动</a></li>
+    <li><a href="#xg-15">15. Qwen3.8-27B / 262K 的推荐配置</a>
+      <ol>
+        <li><a href="#xg-15-1">15.1 官方 27B 脚本是 3K，不是 262K</a></li>
+        <li><a href="#xg-15-2">15.2 环境版本（直接照用）</a></li>
+        <li><a href="#xg-15-3">15.3 这个模型必须设的五项</a></li>
+        <li><a href="#xg-15-4">15.4 sequence_parallel 是最大的变量</a></li>
+        <li><a href="#xg-15-5">15.5 推荐并行度与批大小</a></li>
+        <li><a href="#xg-15-6">15.6 真正的显存风险在最后一段</a></li>
+        <li><a href="#xg-15-7">15.7 必须说的风险：CP&gt;1 没有背书</a></li>
+        <li><a href="#xg-15-8">15.8 完整参数片段</a></li>
+      </ol>
+    </li>
   </ol>
 </nav>
 <main>
@@ -784,6 +796,225 @@ reserved   ≈ 55 GB   （分配器攥着，其中 36 GB 是空闲缓存块）
 <p>关键是 <code>device free</code> 这一项来自 <code>mem_get_info()</code>，是<b>设备自己的视角</b>。通信域的 QP 和 CCL buffer 是直接向设备要的、不走 PyTorch 分配器，所以<b>决定 HCCL 能不能成功的是这个数，而不是 <code>total − allocated</code></b>。另外埋点整体包在 <code>try/except</code> 里：它被放在 <code>finally</code> 中、可能在设备已经出错的状态下执行，<b>探针绝不能成为训练失败的原因</b>。</p>
 
 <p class="meta">验证：pinned ruff（check + format）、仓库的 docstring 与 license sanity 检查、以及新增的两个 CPU 测试全部通过。设备侧行为（HCCL 通信域真的提前建出来、埋点在 NPU 上的真实数字）只能在你的集群上验。</p>
+
+
+<h3 id="xg-15">15. Qwen3.8-27B / 262K 的推荐配置</h3>
+
+<div class="box ask"><b>追问</b>：我问的是 Qwen3.8 27B 262K 的训练推荐配置。</div>
+
+<p class="meta">上一节答成了 235B 那个脚本，这节纠正。</p>
+
+<h4 id="xg-15-1">15.1 先把话说清楚：官方 27B 脚本是 3K 序列、单节点，不是 262K</h4>
+
+<p>仓库里有这个模型自己的脚本——<code>examples/grpo_trainer/run_qwen3_8_27b_megatron.sh</code>，它的头注释写得很明确：</p>
+
+<pre><code>The default Ascend setup uses one 16-NPU node and the Geo3K dataset:
+  TP=2 PP=4 CP=1 EP=1 ETP=1, rollout TP=8.
+Requirements: 8 A3 cards (2*64GB each, exposed as 16 NPU devices)</code></pre>
+
+<table>
+  <tr><th></th><th>仓库 27B 参考</th><th>你</th><th>倍数</th></tr>
+  <tr><td>序列长度</td><td>1024 + 2048 = <b>3072</b></td><td><b>262144</b></td><td><b>85×</b></td></tr>
+  <tr><td>卡数 / 布局</td><td>1 节点 × 16 device（A3 双 die）</td><td>8 节点 × 8 卡 = 64</td><td>4×</td></tr>
+  <tr><td>TP / PP / <b>CP</b></td><td>2 / 4 / <b>1</b></td><td>4 / 4 / <b>4</b></td><td>—</td></tr>
+  <tr><td>DP</td><td>16/(2×4×1) = 2</td><td>64/(4×4×4) = <b>1</b></td><td>—</td></tr>
+</table>
+
+<div class="box warn"><b>所以：262K 没有现成的推荐配置可抄。</b>这个脚本从来没跑过长序列，CP 一直是 1。它能给你的是三样东西：<b>钉死的环境版本</b>（15.2）、<b>这个模型在 NPU 上必须设的几项</b>（15.3，你一项都没设）、以及一个已知能跑的 baseline。<b>并行度和批大小必须自己推</b>（15.5）。</div>
+
+<h4 id="xg-15-2">15.2 环境版本（这部分直接照用）</h4>
+
+<table>
+  <tr><th>组件</th><th>参考脚本钉的版本</th></tr>
+  <tr><td>基础</td><td>Python 3.12.13、CANN 9.0.0、ATB 9.0.0.B160、PyTorch 2.10.0、torch-npu 2.10.0.post4</td></tr>
+  <tr><td>Python 包</td><td>transformers 5.5.4、vllm 0.23.0、vllm-ascend 0.23.0、ray 2.56.1、<b>flash-linear-attention 0.5.2</b>、<b>fla-npu 1.0.0</b>、nvidia-modelopt 0.45.0</td></tr>
+  <tr><td>Megatron-Core</td><td><b>0.18.0（<code>ba7b5ebce12a</code>）</b> ← 和你 <code>third_party/Megatron-LM</code> 钉的 commit 一致 ✓</td></tr>
+  <tr><td>其余</td><td>MindSpeed-Bridge 0.3.1（<b>必须含 <code>mindspeed_bridge/models/qwen/</code> 和 <code>recipes/qwen/</code> 下的 Qwen3.8 注册</b>）、Megatron-Bridge 0.5.0、TransformerEngineNPU 2.13.0</td></tr>
+</table>
+
+<div class="box note"><b>顺便确认你的两个 <code>~</code> 删除是对的。</b><code>grad_offload</code> 和 <code>vanilla_mbridge</code> <b>在当前配置 schema 里根本不存在</b>（我核了 <code>_generated_ppo_megatron_trainer.yaml</code> 的 megatron 块）。参考脚本里那行 <code>megatron.grad_offload=${ALL_OFFLOAD}</code> 在这个分支上会直接报错——<b>参考脚本本身比 schema 落后了</b>。所以别照抄它的 <code>grad_offload</code>，你删得没错。</div>
+
+<h4 id="xg-15-3">15.3 这个模型在 NPU 上必须设的五项（你一项都没设）</h4>
+
+<p>这是从参考脚本里能直接拿到的最实在的收获：</p>
+
+<table>
+  <tr><th>项</th><th>参考值</th><th>你</th><th>为什么重要</th></tr>
+  <tr>
+    <td><code>override_transformer_config.mtp_num_layers</code></td>
+    <td><b>0</b></td>
+    <td>未设</td>
+    <td><b>这一项最要紧。</b>verl 的 <code>model.mtp.enable</code> 默认已是 <code>false</code>（我核了生成配置），但<b>那只关 verl 的 MTP loss 路径</b>；Megatron-Bridge 仍会按 HF config 里 mtp 段的 <code>num_hidden_layers=1</code> <b>把那一层建出来</b>。所以参考脚本在 NPU 分支上<b>两边都关</b>：<code>model.mtp.enable=False</code> 加这一项</td>
+  </tr>
+  <tr>
+    <td><code>override_transformer_config.use_ascend_gdn</code></td>
+    <td><b>False</b></td>
+    <td>未设</td>
+    <td>和 <code>use_triton_gdn=True</code> 成对出现，明确 GDN 走哪条实现。你只设了前者</td>
+  </tr>
+  <tr>
+    <td><code>megatron.sequence_parallel</code></td>
+    <td><b>False</b></td>
+    <td>默认 <code>true</code></td>
+    <td><b>见 15.4</b>——262K 下这是最大的一个变量</td>
+  </tr>
+  <tr>
+    <td><code>model.use_remove_padding</code><br><code>megatron.use_remove_padding</code></td>
+    <td>都是 <b>False</b></td>
+    <td>默认 <code>true</code>（你 <code>~</code> 删了后者，删完仍回落到 <code>true</code>）</td>
+    <td>参考是显式关掉的。<code>~</code> 删除对这个键没用——它在 schema 里存在，删掉只是回落默认值</td>
+  </tr>
+  <tr>
+    <td><code>override_transformer_config.attention_backend</code></td>
+    <td><code>auto</code></td>
+    <td>未设</td>
+    <td>让 Megatron 自己选，而不是撞上某个被 repatch 换掉的实现</td>
+  </tr>
+</table>
+
+<p>环境变量侧（参考脚本的 NPU 分支）：<code>CUDA_DEVICE_MAX_CONNECTIONS=1</code>、<code>VLLM_USE_V1=1</code>、<code>VLLM_ALLREDUCE_USE_SYMM_MEM=0</code>、<code>CPU_AFFINITY_CONF=1</code>、<code>HCCL_CONNECT_TIMEOUT=1800</code>、<code>MINDSPEED_BRIDGE_AUTOREG_MODE=strict</code>、<code>unset PYTORCH_NPU_ALLOC_CONF</code>。<code>HCCL_OP_EXPANSION_MODE=AIV</code> 见 §12.6 的口径冲突，先别跟。</p>
+
+<h4 id="xg-15-4">15.4 <code>sequence_parallel</code> 是 262K 下最大的变量，而参考把它关了</h4>
+
+<p>它决定每个 rank 实际存下多少 token：</p>
+
+<pre><code>每层存下的激活 = (262144 / (CP × TP_sp)) × 5120 × 2 B      TP_sp = 开 SP 时为 TP，否则为 1</code></pre>
+
+<p>代入你现在的 <code>TP=4 CP=4</code>：</p>
+
+<table>
+  <tr><th></th><th>每 rank token</th><th>每层</th><th>stage0（14 层 × 4 微批）</th></tr>
+  <tr><td>SP <b>开</b>（verl 默认）</td><td>16384</td><td>168 MB</td><td><b>9.4 GB</b></td></tr>
+  <tr><td>SP <b>关</b>（参考脚本的设法）</td><td>65536</td><td>671 MB</td><td><b>37.6 GB</b></td></tr>
+</table>
+
+<div class="box key"><b>这是对 §11⑤ 的一个重要补充。</b>那里算的 19 GB <b>是假设 SP 开着</b>。如果 SP 实际没生效——不管是被显式关掉，还是这个模型/这版 MindSpeed-Bridge 不支持——stage 0 总量会到 <b>~47 GB / 64 GB</b>，<b>显存立刻变紧，§12.3 那条"分配器攥着"的假设就不必要了，直接就是显存不够</b>。<br><br><b>所以这是你最该先确认的一件事</b>，而 §14 的内存埋点正好能一眼看出来：SP 真的在工作，stage0 的 allocated 应该在 20 GB 量级；没工作则在 45 GB 以上。</div>
+
+<p>怎么设：<b>262K 下你想要 SP 开着</b>（4 倍差距），所以保持默认、不要跟参考关掉。参考那个 3K 的 run 关不关都无所谓，它设 False 更可能是为了绕某个兼容问题。<b>只有在 forward/backward 真的在 GDN 层报错时</b>，才用 <code>sequence_parallel=False</code> 换稳定性并付那 4 倍显存。</p>
+
+<h4 id="xg-15-5">15.5 推荐并行度与批大小</h4>
+
+<p>约束：<code>TP × PP × CP = 64</code>；想让 CP 不出节点需 <code>TP × CP ≤ 8</code>（§12.1）；<code>num_key_value_heads = 4</code> 限制 <code>TP ≤ 4</code>。</p>
+
+<div class="box key"><b>主推：<code>TP=2, CP=4, PP=8</code>（DP=1），<code>ppo_mini_batch_size=4</code>，SP 保持开启，不设首尾层数覆盖。</b></div>
+
+<table>
+  <tr><th>选择</th><th>理由</th></tr>
+  <tr><td><code>TP×CP = 2×4 = 8</code></td><td><b>正好一个节点</b> → CP 组和 DP×CP 组都回到节点内走 HCCS，<b>直接消除本次故障暴露的跨节点建链</b>（§12.1）。这是整个推荐的出发点</td></tr>
+  <tr><td><code>TP=2</code> 而不是 4</td><td>和 27B 参考一致；4 个 KV 头切 2 份 = 每 rank <b>2 个</b>，留了余量（TP=4 是每 rank 1 个，已经到底）</td></tr>
+  <tr><td><code>PP=8</code></td><td>64 层正好 <b>8 层/段</b>，整除，不用凑</td></tr>
+  <tr><td><code>ppo_mini_batch_size=4</code></td><td><b>这是压显存的主力。</b>1F1B 下 stage <i>i</i> 在手的微批数是 <code>min(PP−i, 微批数)</code>；微批数 = <code>4/(DP 1 × mbs 1) = 4</code>，所以 <b>stage 0 只持 4 个而不是 8 个</b>。这就是 235B 256K 脚本用 <code>mini_bsz=4</code> 配 <code>PP=16</code> 的那个手法</td></tr>
+  <tr><td><b>删掉</b> <code>num_layers_in_first/last_pipeline_stage</code></td><td>微批数（4）≤ PP（8）时，<b>stage 0~4 持有的微批数完全相同（都是 4）</b>，首尾调小买不到任何东西，只会打乱计算均衡。你现在的 14/14 是为 PP=4 填满流水线算的，换到这套就该去掉</td></tr>
+</table>
+
+<p>显存估算（stage 0 单卡）：</p>
+
+<table>
+  <tr><th>项</th><th>SP 开</th><th>SP 关</th></tr>
+  <tr><td>激活（8 层 × 4 微批 × 每层）</td><td>8×4×335 MB = <b>10.7 GB</b></td><td>8×4×671 MB = <b>21.5 GB</b></td></tr>
+  <tr><td>权重（8 层 × 341M/TP2 = 1.36B，bf16）</td><td>2.7 GB</td><td>2.7 GB</td></tr>
+  <tr><td>梯度（<code>main_grads_dtype=bf16</code>）</td><td>2.7 GB</td><td>2.7 GB</td></tr>
+  <tr><td>重算单层工作集（65536 token，MLP 中间 8704）</td><td>≈2.5 GB</td><td>≈2.5 GB</td></tr>
+  <tr><td>HCCL（TP/CP/DP×CP/PP 四个域）</td><td>1.6 GB</td><td>1.6 GB</td></tr>
+  <tr><td colspan="1"><b>合计</b></td><td><b>≈20 GB</b></td><td><b>≈31 GB</b></td></tr>
+</table>
+
+<p><b>这套布局的好处之一是它两种情况都装得下</b>——即使 SP 没生效，31 GB 在 64 GB 卡上仍有余量。</p>
+
+<p><b>备选 B：<code>TP=4, CP=2, PP=8</code></b>。权重最省（1.4+1.4 = 2.8 GB，比主推省 2.7 GB），<code>TP×CP</code> 同样是 8。代价：<code>CP=2</code> 时每个 CP rank 要扛 131072 token 的注意力，<b>GDN 层的压力翻倍</b>，而且 TP=4 把 KV 头用到底。<b>除非主推方案显存不够，不建议先选 B。</b></p>
+
+<h4 id="xg-15-6">15.6 真正的显存风险不在 stage 0，在最后一段</h4>
+
+<p>算一下最后一段 PP 的 lm_head logits：</p>
+
+<pre><code>logits = (262144 / CP) × (248320 / TP) × 2 B = 262144 × 248320 / (CP × TP) × 2 B</code></pre>
+
+<table>
+  <tr><th><code>CP × TP</code></th><th>logits 单张量</th></tr>
+  <tr><td>16（你现在的 TP4·CP4）</td><td>8.1 GB</td></tr>
+  <tr><td>8（主推，以及备选 B）</td><td><b>16.3 GB</b></td></tr>
+</table>
+
+<p>两件事：</p>
+<ol>
+  <li><b>把 CP 收进节点内，logits 也跟着翻倍</b>（和激活一样，都只看 <code>CP×TP</code> 的积）。这是 15.5 那套方案的隐性代价。</li>
+  <li><b>所以你的 <code>use_fused_kernels=True</code> 在 262K 下是承重的</b>——它把 logits 和交叉熵分块算，不整块落地。<b>不要关它。</b>也正因为如此，15.3 里 <code>mtp_num_layers=0</code> 才那么要紧：MTP 会在最后一段再算一遍这个量级的 logits。</li>
+</ol>
+
+<h4 id="xg-15-7">15.7 一个必须说的风险：<code>CP&gt;1</code> 在这个模型上没有仓库背书</h4>
+
+<div class="box warn">
+<ul style="margin:0">
+  <li>27B 参考脚本用的是 <b><code>CP=1</code></b>，从没开过 CP。</li>
+  <li>仓库里唯一用 <code>CP=4</code> 的 GDN 系脚本是 <code>run_qwen3_5_122b_a10b_32k_megatron.sh</code>——<b>不同模型</b>（122B-A10B MoE）、<b>不同硬件</b>（A3 每节点 16 卡，所以它 <code>TP=2 CP=4</code> 的 <code>TP×CP=8≤16</code> 在节点内）、<b>而且只到 32K</b>。</li>
+  <li>verl 自己对 GDN + 上下文并行是显式把关的：HF 路径在 <code>chunk_gated_delta_rule</code> 不接受 <code>cp_context</code> 时直接 <code>raise NotImplementedError("Qwen3.5 Ulysses SP requires FLA chunk_gated_delta_rule cp_context support.")</code>（<code>verl/models/transformers/qwen3_5.py:172</code>）。Megatron 路径的实现不在本仓库。</li>
+  <li>而你的报错栈正落在 <code>megatron/core/ssm/gated_delta_net.py</code>。</li>
+</ul>
+<b>也就是说：GDN 混合模型 + <code>CP&gt;1</code> + 262K，这三样叠在一起没有任何现成验证。</b>
+</div>
+
+<p><b>建议的推进方式——把两个问题分开</b>：</p>
+<ol>
+  <li><b>先用短序列把布局跑通。</b>拿 <code>TP=2 CP=4 PP=8</code> 这套，序列压到 8K，跑通 1~2 步。这验证的是"布局 + CP 对这个模型可用"，不掺显存问题。</li>
+  <li><b>再拉长序列</b>：8K → 32K → 128K → 262K，每一档看 §14 埋点的 <code>allocated</code> 增长是否符合 15.4 的公式。<b>如果某一档的增长是预期的 4 倍，就说明 SP 在那一档失效了。</b></li>
+  <li>每一档都确认 §14 预建链的日志（<code>comm warmup: built communicators for [...]</code>）里出现了 <code>data_parallel_with_cp</code>。</li>
+</ol>
+
+<h4 id="xg-15-8">15.8 完整参数片段</h4>
+
+<pre><code># ---- 环境（来自 27B 参考脚本的 NPU 分支）----
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export VLLM_USE_V1=1
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+export CPU_AFFINITY_CONF=1
+export HCCL_CONNECT_TIMEOUT=1800
+export MINDSPEED_BRIDGE_AUTOREG_MODE=strict
+ulimit -n 32768                                  # 来自 235B 256K 脚本
+# HCCL_OP_EXPANSION_MODE：先别设，见 §12.6 的口径冲突
+# HCCL_BUFFSIZE：先别设，见 §11⑦
+
+# ---- 排查期（§12.7）----
+export PYTORCH_NPU_ALLOC_CONF=garbage_collection_threshold:0.8   # 参考脚本是 unset，这是排查用
+export VERL_LOG_ACTOR_UPDATE_MEMORY=1                            # §14 的埋点
+export ASCEND_PROCESS_LOG_PATH=&lt;挂载出来的目录&gt;                   # 保住 plog
+# VERL_MEGATRON_WARMUP_COMM_GROUPS 默认就是开，不用设
+
+# ---- 并行度：TP×CP=8=每节点卡数 → CP 回到节点内；TP×PP×CP=64 → DP=1 ----
+actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2
+actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=8
+actor_rollout_ref.actor.megatron.context_parallel_size=4
+++actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_model_parallel_size=8
+++actor_rollout_ref.actor.megatron.override_transformer_config.context_parallel_size=4
+++actor_rollout_ref.actor.megatron.override_transformer_config.cp_comm_type=all_gather
+# 删掉 num_layers_in_first/last_pipeline_stage —— 理由见 15.5
+# sequence_parallel 保持默认 true —— 理由见 15.4
+
+# ---- 批大小：用 min(PP, 微批数) 压住 stage0 ----
+actor_rollout_ref.actor.ppo_mini_batch_size=4
+actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+actor_rollout_ref.actor.use_dynamic_bsz=False
+
+# ---- 这个模型在 NPU 上必须设的五项（15.3）----
+actor_rollout_ref.model.mtp.enable=False
+++actor_rollout_ref.actor.megatron.override_transformer_config.mtp_num_layers=0
++actor_rollout_ref.actor.megatron.override_transformer_config.use_triton_gdn=True
++actor_rollout_ref.actor.megatron.override_transformer_config.use_ascend_gdn=False
+++actor_rollout_ref.actor.megatron.override_transformer_config.attention_backend=auto
+
+# ---- 这些你已经设对了，保持 ----
+++actor_rollout_ref.model.use_fused_kernels=True                  # 262K 下承重，见 15.6
+++actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
+++actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform
+++actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
+++actor_rollout_ref.actor.megatron.override_transformer_config.deallocate_pipeline_outputs=True
+++actor_rollout_ref.actor.megatron.param_offload=True
+++actor_rollout_ref.actor.megatron.optimizer_offload=True
+++actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
+~actor_rollout_ref.actor.megatron.grad_offload                    # 这个键不存在，删对了，见 15.2
+~actor_rollout_ref.actor.megatron.vanilla_mbridge                 # 同上
+</code></pre>
+
+<div class="box key"><b>这一节的净结论</b>：262K 没有官方配置可抄，27B 那个脚本是 3K/CP=1。它给你三样东西：<b>环境版本</b>（15.2，你的 Megatron commit 已经对了）、<b>五项你全没设的模型参数</b>（15.3，其中 <code>mtp_num_layers=0</code> 最要紧）、以及"<code>grad_offload</code> 这个键已不存在、你删对了"的确认。并行度我推 <b><code>TP=2 CP=4 PP=8</code> + <code>mini_batch=4</code></b>，它把 CP 收回节点内、两种 SP 状态下都装得下。但 <b><code>CP&gt;1</code> 在这个模型上没有仓库背书</b>，所以先短序列验布局、再逐档拉长，用 §14 的埋点按 15.4 的公式核对每一档。</div>
 
 <div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xf-megatron-parallel.html">← 插课 F</a></div>
 </main>
