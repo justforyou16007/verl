@@ -1329,3 +1329,58 @@ def restore_megatron_model_from_cpu(models, cpu_state):
                 if name in model_state:
                     param_state = model_state[name]
                     param.data.copy_(param_state["data"].to(param.device))
+
+
+# ---------------------------------------------------------------------------
+# Communication-group warm-up
+# ---------------------------------------------------------------------------
+
+
+# Groups whose backend communicator we build up front. Every entry must be a group the
+# training step uses anyway, so that warming it can only move *when* the communicator is
+# created, never create one that would not have existed. The pipeline-parallel group is
+# deliberately absent: its first use is already in the forward pass, and warming it would
+# need a matched send/recv round rather than a single collective.
+_WARMUP_GROUP_GETTERS = (
+    # The one that matters. With use_distributed_optimizer the gradient reduce-scatter and
+    # the parameter all-gather run over data-parallel-with-context-parallel, and nothing
+    # in the forward pass touches that group.
+    ("data_parallel_with_cp", lambda: parallel_state.get_data_parallel_group(with_context_parallel=True)),
+    ("data_parallel", lambda: parallel_state.get_data_parallel_group()),
+    ("tensor_model_parallel", lambda: parallel_state.get_tensor_model_parallel_group()),
+    ("context_parallel", lambda: parallel_state.get_context_parallel_group()),
+)
+
+
+def warmup_megatron_comm_groups() -> None:
+    """Build the collective communicators for Megatron's process groups at startup.
+
+    A process group's communicator is created on its first collective, and creating one
+    takes device memory that does not come from the PyTorch caching allocator -- see
+    :func:`verl.utils.distributed.warmup_process_groups`.
+
+    The data-parallel-with-context-parallel group is the case worth caring about. With
+    ``use_distributed_optimizer`` it carries the gradient reduce-scatter, and the forward
+    pass never touches it. Note also that it is a *separate* group object from the
+    context-parallel group even when the two contain exactly the same ranks (DP=1, CP>1),
+    so a warm context-parallel communicator does not cover it. Its communicator therefore
+    gets built partway through the first backward, at the activation peak, with whatever
+    the device has left. When that allocation fails on Ascend it surfaces as
+    ``Resource_Error(EI0007) ... CreateOneQp ... Resources are exhausted``, reported to
+    Python as a ``torch.OutOfMemoryError`` naming ``HcclReduceScatter`` -- which reads like
+    a tensor out-of-memory but is not one.
+
+    Calling this right after ``initialize_model_parallel`` moves the work to a point where
+    no weights are loaded yet. Cost is a few milliseconds.
+
+    Note:
+        Collective. Must be called on every rank. Set
+        ``VERL_MEGATRON_WARMUP_COMM_GROUPS=0`` to skip.
+    """
+    if os.environ.get("VERL_MEGATRON_WARMUP_COMM_GROUPS", "1").lower() in ("0", "false", "no"):
+        return
+
+    from verl.utils.distributed import warmup_process_groups
+
+    warmed = warmup_process_groups(_WARMUP_GROUP_GETTERS)
+    logger.info(f"comm warmup: built communicators for [{', '.join(warmed) or 'none'}]")

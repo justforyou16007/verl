@@ -23,7 +23,14 @@ import ray
 import torch.distributed
 from torch.distributed import TCPStore
 
-from verl.utils.device import get_device_name, get_nccl_backend, get_resource_name, get_torch_device, is_npu_available
+from verl.utils.device import (
+    get_device_id,
+    get_device_name,
+    get_nccl_backend,
+    get_resource_name,
+    get_torch_device,
+    is_npu_available,
+)
 from verl.utils.net_utils import is_ipv6
 
 
@@ -215,3 +222,64 @@ def stateless_init_process_group(master_address, master_port, rank, world_size, 
 
     pynccl = PyNcclCommunicator(pg, device=device)
     return pynccl
+
+
+def warmup_process_groups(group_getters) -> list[str]:
+    """Force the collective backend to build each group's communicator now.
+
+    torch.distributed creates a process group's backend communicator lazily, on that
+    group's first collective. The communicator is not free: it allocates device memory
+    outside the PyTorch caching allocator (on Ascend, ``2 * HCCL_BUFFSIZE`` of CCL buffers
+    per communication domain) and establishes a link -- a queue pair -- for every
+    cross-node peer. Deferring that to a group's first real use means paying it at
+    whatever point in the step that happens to be, which for gradient-reduction groups is
+    partway through the first backward, when the device has least to spare.
+
+    One tiny all-reduce per group moves the cost to wherever this is called instead.
+
+    Args:
+        group_getters: ``(label, callable)`` pairs. The callable returns a process group,
+            or raises if this build does not have it. Pass a fixed, ordered sequence:
+            every rank walks it in the same order, which is what keeps the members of each
+            group in lockstep. Only pass groups the workload uses anyway -- warming an
+            unused group creates a communicator that would otherwise never have existed,
+            which costs memory rather than saving it.
+
+    Returns:
+        Labels of the groups that were actually warmed, for logging.
+
+    Note:
+        Collective. Must be called on every rank, with the same ``group_getters``.
+    """
+    if not torch.distributed.is_initialized():
+        return []
+
+    warmed = []
+    used_device_backend = False
+    for label, getter in group_getters:
+        # A getter that raises means this build does not expose that group. The outcome
+        # is deterministic given the installed version, so every rank skips the same
+        # entries and the remaining collectives stay aligned.
+        try:
+            group = getter()
+        except Exception:
+            continue
+        if group is None:
+            continue
+        group_size = torch.distributed.get_world_size(group=group)
+        if group_size <= 1:
+            # No peers, so no communicator and nothing to build.
+            continue
+        # The tensor has to live where the group's backend communicates: a gloo group
+        # moves host memory, every other backend moves device memory.
+        on_gloo = torch.distributed.get_backend(group=group) == torch.distributed.Backend.GLOO
+        used_device_backend |= not on_gloo
+        warm = torch.ones(1, dtype=torch.int32, device="cpu" if on_gloo else get_device_id())
+        torch.distributed.all_reduce(warm, group=group)
+        warmed.append(f"{label}(size={group_size})")
+
+    if used_device_backend:
+        # Device collectives are async. Wait, so that the communicators really exist --
+        # and any failure is raised here -- before the caller moves on.
+        get_torch_device().synchronize()
+    return warmed

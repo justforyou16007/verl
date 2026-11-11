@@ -286,6 +286,14 @@ class MegatronEngine(BaseEngine):
             **extra_args,
         )
 
+        # Build the collective communicators now, while the device is still empty. They are
+        # otherwise created on each group's first collective -- and the gradient
+        # reduce-scatter group is first used partway through the first backward, at the
+        # activation peak. See warmup_megatron_comm_groups for the failure that causes.
+        from verl.utils.megatron_utils import warmup_megatron_comm_groups
+
+        warmup_megatron_comm_groups()
+
     def _build_tf_config(self):
         from verl.utils.megatron_utils import mapping_string_to_attn_backend
         from verl.utils.torch_dtypes import PrecisionType

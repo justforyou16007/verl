@@ -323,3 +323,54 @@ class MemorySnapshotSampler:
         except Exception as e:
             logger.warning(f"[memory_visualize] dump failed: {e}")
             return None
+
+
+def log_actor_update_memory(stage: str) -> None:
+    """Log the device-memory picture that decides whether HCCL/NCCL can still allocate.
+
+    Off by default; set ``VERL_LOG_ACTOR_UPDATE_MEMORY=1`` to enable. It prints one line
+    per rank per call, which is a lot of output on a large cluster, so it is a probe you
+    turn on while chasing a problem rather than something every run pays for.
+
+    Why it reports four numbers instead of just "allocated":
+
+    - ``allocated`` is only what live tensors hold.
+    - ``reserved`` is what the PyTorch caching allocator has taken from the device and
+      kept, including segments whose tensors were already freed. The gap between the two
+      is memory the process is sitting on and nothing else can use.
+    - ``device free/total`` comes from ``mem_get_info``, i.e. the device's own view. This
+      is the number that matters for a collective communicator, because its queue pairs
+      and its ``2 * HCCL_BUFFSIZE`` of CCL buffers are allocated straight from the device,
+      not through the caching allocator -- so a large ``reserved`` starves it even while
+      ``allocated`` looks modest.
+    - the cumulative peaks, to see how high this rank has ever gone.
+
+    So a run that dies building a communicator with a small ``allocated`` and a ``device
+    free`` near zero points at the allocator holding the rest; one where both are low
+    points away from memory entirely, at the link/queue-pair side.
+
+    Logged on every rank, because the rank that fails first is usually not rank 0.
+    """
+    if os.environ.get("VERL_LOG_ACTOR_UPDATE_MEMORY", "0").lower() not in ("1", "true", "yes"):
+        return
+    # A probe must never be the reason a step fails, and it is called from an `except`
+    # path where the device may already be in an error state.
+    try:
+        device = get_torch_device()
+        if not device.is_available():
+            return
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        info = get_memory_info()
+        free, total = device.mem_get_info()
+        gb = 1024**3
+        logger.warning(
+            f"[mem][rank {rank}] {stage}: "
+            f"allocated {info['allocated_memory_gb']:.2f} GB, "
+            f"reserved {info['reserved_memory_gb']:.2f} GB "
+            f"(cached but idle {info['cached_memory_gb']:.2f} GB), "
+            f"device free {free / gb:.2f} / {total / gb:.2f} GB, "
+            f"peak allocated {info['max_memory_allocated_gb']:.2f} GB, "
+            f"peak reserved {info['max_memory_reserved_gb']:.2f} GB"
+        )
+    except Exception as e:
+        logger.warning(f"[mem] probe at '{stage}' failed, ignoring: {type(e).__name__}: {e}")

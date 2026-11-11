@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>插课 G：昇腾 EI0007 / QP 建链失败被包成 OutOfMemoryError · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>插课 G：EI0007 排查</h2>
+  <ol>
+    <li><a href="#xg-0">0. 结论</a></li>
+    <li><a href="#xg-1">1. 这段日志要倒着读</a></li>
+    <li><a href="#xg-2">2. Python 栈为什么指错了地方</a></li>
+    <li><a href="#xg-3">3. 为什么叫 OutOfMemoryError 却不是张量显存不够</a></li>
+    <li><a href="#xg-4">4. QP 是什么，谁在消耗它</a></li>
+    <li><a href="#xg-5">5. 两种稀缺资源，日志分不出来</a></li>
+    <li><a href="#xg-6">6. 时间点是最强的证据</a></li>
+    <li><a href="#xg-7">7. 一条命令定性</a></li>
+    <li><a href="#xg-8">8. 按顺序能做的四件事</a></li>
+    <li><a href="#xg-9">9. 那份 AI 回答里反掉的五条</a></li>
+    <li><a href="#xg-10">10. 位置索引</a></li>
+    <li><a href="#xg-11">11. 代入真实配置后的重算</a>
+      <ol>
+        <li><a href="#xg-11-1">① DP = 1</a></li>
+        <li><a href="#xg-11-2">② 失败的是哪个通信域</a></li>
+        <li><a href="#xg-11-3">③ rank 12 在 PP stage 0</a></li>
+        <li><a href="#xg-11-4">④ TP×CP vs 每节点卡数</a></li>
+        <li><a href="#xg-11-5">⑤ 显存账：约 19 GB</a></li>
+        <li><a href="#xg-11-6">⑥ 处理顺序要改</a></li>
+        <li><a href="#xg-11-7">⑦ 两个被卡住的旋钮</a></li>
+      </ol>
+    </li>
+    <li><a href="#xg-12">12. 8 卡/节点确认、plog 已丢失之后</a>
+      <ol>
+        <li><a href="#xg-12-1">12.1 跨节点成立</a></li>
+        <li><a href="#xg-12-2">12.2 一个矛盾：两个量级都不像</a></li>
+        <li><a href="#xg-12-3">12.3 reserved ≠ allocated</a></li>
+        <li><a href="#xg-12-4">12.4 三个分配器旋钮</a></li>
+        <li><a href="#xg-12-5">12.5 更正第 9 节一句话</a></li>
+        <li><a href="#xg-12-6">12.6 和仓库 27B 脚本的差异</a></li>
+        <li><a href="#xg-12-7">12.7 下一次跑之前做什么</a></li>
+      </ol>
+    </li>
+    <li><a href="#xg-13">13. 官方 235B 256K 脚本推荐什么</a>
+      <ol>
+        <li><a href="#xg-13-1">13.1 它的十条取舍</a></li>
+        <li><a href="#xg-13-2">13.2 核心算术：只看 CP×TP</a></li>
+        <li><a href="#xg-13-3">13.3 你 64 卡的候选布局</a></li>
+        <li><a href="#xg-13-4">13.4 但先别改并行度</a></li>
+      </ol>
+    </li>
+    <li><a href="#xg-14">14. 已落地到分支的两个改动</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xf-megatron-parallel.html">← 插课 F：Megatron / MindSpeed 与五种分片</a></div>
+
+<h2 id="xg">插课 G：昇腾 EI0007 / QP 建链失败被包成 OutOfMemoryError</h2>
+
+<div class="box ask"><b>提问</b>：昇腾 NPU 上 verl + Megatron 训练报 <code>torch.OutOfMemoryError</code>，底下跟着 <code>Resource_Error(EI0007): Failed to allocate resource qp with info CreateOneQp</code>，当前算子是 <code>HcclReduceScatter</code>。帮我看下这个报错。另外有一份 AI 给的回答，建议调小 batch、加 recompute 层数、设 <code>PYTORCH_NPU_ALLOC_CONF</code>、把 <code>HCCL_RDMA_QPS_PER_CONNECTION</code> 设成 1，这些对不对。</div>
+
+<p class="meta">写于 2026-11-11。本页区分"日志里直接写了的"和"我据此推断的"，推断处都标了【推断】，不要当成已证实的结论去改生产配置。</p>
+
+<h3 id="xg-0">0. 结论</h3>
+
+<div class="box key">
+<ol style="margin:0">
+  <li><b>这不是张量显存不够。</b>真正的首发故障是 HCCL 在<b>建通信链路</b>时创建 QP 失败（EI0007，21:45:39）。<code>torch.OutOfMemoryError</code> 只是 torch_npu 把这个底层错误包了一层后挑的异常类型，<b>所以先不要去调 batch size</b>。</li>
+  <li><b>Python 栈里那行 <code>gated_delta_net.py:584</code> 是无辜的。</b>它是 30 秒后第一个碰到设备同步点的地方，错误在那里才被抛出来。日志自己也写了 "the stacktrace may be inaccurate"。</li>
+  <li><b>"资源耗尽"有两种可能：设备显存（HBM）不够装 QP 上下文和通信域缓存，或者网卡的 QP 配额用完。</b>这份日志区分不了。第 7 节给了一条命令去定性，第 8 节给了按顺序做的四件事。</li>
+  <li>【推断】时间点更像前者：挂在 <b>0/151 的第一个训练步</b>、挂在 backward 里、挂在那个通信域第一次用到的集合通信上——也就是 HCCL 来要显存的时刻正好是整个 run 里显存最紧的时刻。</li>
+</ol>
+</div>
+
+<h3 id="xg-1">1. 这段日志要倒着读</h3>
+
+<p>日志末尾那四块东西不是一条链上的四个环节，而是<b>按时间倒序</b>堆在一起的。把时间戳抽出来排一下就清楚了：</p>
+
+<table>
+  <tr><th>时刻</th><th>日志里的那一行</th><th>它说明什么</th></tr>
+  <tr>
+    <td><b>21:45:39</b>.089</td>
+    <td><code>Resource_Error(EI0007): Failed to allocate resource qp with info CreateOneQp. Reason: Resources are exhausted.</code></td>
+    <td><b>首发故障。</b>HCCL 要创建一个 QP（RDMA 连接的一端），申请资源失败。</td>
+  </tr>
+  <tr>
+    <td>紧接着</td>
+    <td><code>TraceBack: Getting socket times out ... 可能是不同 rank 行为不一致 ... 搜索 EI0006</code></td>
+    <td><b>下游噪音。</b>这个 rank 的链路没建起来，握手的 socket 自然就等超时了。这段"不同 rank 行为不一致"是 HCCL 对建链超时的<b>通用提示文案</b>，不是在说你的 rank 调了不同的集合通信算子。</td>
+  </tr>
+  <tr>
+    <td><b>21:46:09</b>（+30s）</td>
+    <td><code>ERR00100 PTA call acl api failed</code>（PID 1764, Device 4, RankID 12）</td>
+    <td>PTA = PyTorch Adapter，即 torch_npu。它发现自己调的 ACL 接口返回了错误。<b>比首发故障晚了 30 秒</b>。</td>
+  </tr>
+  <tr>
+    <td>同时</td>
+    <td><code>torch.OutOfMemoryError: The Inner error is reported as above ... the current working operator name is HcclReduceScatter.</code></td>
+    <td>Python 层抛出的异常。它明说自己是"上面那个 inner error"的外壳，并指出真正出问题的算子是 <code>HcclReduceScatter</code>。</td>
+  </tr>
+</table>
+
+<div class="box note"><b>读法</b>：昇腾的报错是"Python 异常 + PTA 层 + CANN 层"三层拼接打印的，顺序和发生顺序相反。<b>永远先找时间戳最早的那一行</b>，那才是首发故障。而且 30 秒这个间隔本身就在告诉你：异常抛出的位置和故障发生的位置没有因果关系。</div>
+
+<h3 id="xg-2">2. Python 栈为什么指错了地方</h3>
+
+<p>栈底是这两行：</p>
+
+<pre><code>  File "/Megatron-LM/megatron/core/ssm/gated_delta_net.py", line 312, in forward
+    cu_seqlens_q = self._resolve_cu_seqlens(
+  File "/Megatron-LM/megatron/core/ssm/gated_delta_net.py", line 584, in _resolve_cu_seqlens
+    total_cu = cu_seqlens[-1].cpu().item()</code></pre>
+
+<p>关键是 <code>.cpu().item()</code> 这个动作：它要把一个设备上的值搬到主机再读出来，<b>必须等设备把排在前面的任务都做完</b>。NPU 上算子是异步下发的——Python 这边 <code>return</code> 了不代表设备那边算完了。所以真实顺序是：</p>
+
+<ol>
+  <li>某个 <code>HcclReduceScatter</code> 被下发到设备队列，Python 继续往下跑；</li>
+  <li>设备上执行它时建链失败（21:45:39），错误被记在设备侧，<b>但 Python 还不知道</b>；</li>
+  <li>Python 一路跑到 <code>.cpu()</code>，这是第一个必须"问设备你好了吗"的地方；</li>
+  <li>设备回答"我出错了"，于是异常在 <code>.cpu()</code> 这一行被抛出（21:46:09）。</li>
+</ol>
+
+<p>所以 <code>gated_delta_net.py:584</code> 只是<b>第一个同步点</b>，不是故障点。日志自己写了这件事：</p>
+
+<pre><code>Since the operator is called asynchronously, the stacktrace may be inaccurate.
+If you want to get the accurate stacktrace, please set ASCEND_LAUNCH_BLOCKING=1.</code></pre>
+
+<div class="box warn"><b>顺带一个真实的性能问题</b>：看完整栈能发现 <code>_resolve_cu_seqlens</code> 是在 <b>backward 里的重算 forward</b> 中被调到的（<code>random.py:621 backward → ctx.run_function → transformer_block.py:533 custom_forward → ... → gated_delta_net.py:312</code>）。也就是说<b>每一层重算都会做一次设备→主机同步</b>。这会把流水线打断，是独立于本次报错的性能损耗；同时它也解释了为什么异步错误恰好落在这里——这是代码里同步点最密的地方。</div>
+
+<h3 id="xg-3">3. 为什么叫 OutOfMemoryError 却不是张量显存不够</h3>
+
+<p>这是最容易被带跑偏的一点。<b>异常类型是错误翻译层挑的，不是 PyTorch 显存分配器报的。</b>判据很简单——真正的张量 OOM 长这样：</p>
+
+<pre><code>NPU out of memory. Tried to allocate 2.00 GiB (NPU 4; 60.97 GiB total capacity;
+55.12 GiB already allocated; 1.03 GiB free; 58.20 GiB reserved in total by PyTorch)</code></pre>
+
+<p>它一定会报出<b>申请的大小、设备号、已分配/已保留的统计量</b>——因为这些数字就在分配器自己手里。而这次的报错里<b>一个这样的数字都没有</b>，只有一句 "The Inner error is reported as above"。</p>
+
+<div class="box key"><b>可以自己验的判据</b>：报错里有没有 "Tried to allocate … already allocated … reserved in total by PyTorch"。有，是张量显存不够，去调 batch / recompute；没有，就是别的东西在报 OOM，调 batch 是白费的。这次是后者。</div>
+
+<h3 id="xg-4">4. QP 是什么，谁在消耗它</h3>
+
+<p>QP = Queue Pair，RDMA 连接的一端（一个发送队列 + 一个接收队列）。两个 rank 要通过 RoCE/RDMA 通信，<b>各自</b>要有一个 QP，配对之后才算"链路建好"。<code>CreateOneQp</code> 就是在建这一个端点。</p>
+
+<p>要理解它什么时候被创建、创建要花什么，得先知道 HCCL 的三个事实：</p>
+
+<ol>
+  <li><b>按通信域组织。</b>一个"通信域"对应一组参与通信的卡（Megatron 里就是 TP 组、PP 组、CP 组、DP 组、DP×CP 组、embedding 组……）。资源是按通信域为单位管理的，各通信域互不复用。</li>
+  <li><b>通信域是惰性创建的。</b>torch_npu 和 NCCL 一样，<code>new_group()</code> 的时候只登记一个 process group 对象，<b>直到这个组第一次真的做集合通信</b>，才去创建底层 HCCL 通信域、建链、分配缓存。</li>
+  <li><b>通信域一创建就占显存。</b>按昇腾官方文档：每个通信域会创建 CCL_In / CCL_Out 两块缓存，<b>各 <code>HCCL_BUFFSIZE</code> 大小（默认 200 MB），合计每个通信域 2×200 MB = 400 MB</b>，而且这块内存 <b>HCCL 独占，不与业务内存复用</b>。文档明确写了："若集群中通信域较多，占用量增多，可能影响模型数据正常存放，此时可调小该变量"。</li>
+</ol>
+
+<p>把这三条串起来：<b>"第一次用到某个通信组"这件事，会在那个瞬间同时触发"建链（要 QP）"和"分配几百 MB 显存（要 HBM）"。</b>这就是本次报错的现场。</p>
+
+<h4>这个 job 大概有几个活跃通信域</h4>
+
+<p>配置是 <code>PP=4</code>、<code>CP=4</code>、TP 没给（默认 1）、<code>EP=ETP=1</code>、<code>use_distributed_optimizer=True</code>、<code>cp_comm_type=all_gather</code>。训练 rank 上真正会发生集合通信的组：</p>
+
+<table>
+  <tr><th>通信域</th><th>大小</th><th>谁在用</th><th>按默认 BUFFSIZE 占用</th></tr>
+  <tr><td>TP</td><td>1</td><td>TP=1，不产生通信</td><td>0</td></tr>
+  <tr><td>CP</td><td>4</td><td><code>cp_comm_type=all_gather</code>，attention 的 KV all-gather</td><td>400 MB</td></tr>
+  <tr><td>PP</td><td>4</td><td>流水线 send/recv（也是<a href="#xg-10">插课 F</a>提到的 NPU p2p 补丁所在之处）</td><td>400 MB</td></tr>
+  <tr><td>DP</td><td>?</td><td>数据并行</td><td>400 MB</td></tr>
+  <tr><td>DP×CP</td><td>DP×4</td><td><b>分布式优化器的梯度 reduce-scatter / 参数 all-gather</b></td><td>400 MB</td></tr>
+  <tr><td>embedding</td><td>PP 首尾</td><td>共享 embedding 的梯度 all-reduce</td><td>400 MB</td></tr>
+</table>
+
+<p>也就是<b>每张卡约 2 GB 的 HBM 被 HCCL 独占</b>，模型一个字节都用不到。64 GB 的卡上这是 3% 多——不致命，但它是在最糟的时刻才被拿走的（见第 6 节）。</p>
+
+<h3 id="xg-5">5. 两种稀缺资源，日志分不出来</h3>
+
+<p><code>Reason: Resources are exhausted</code> 这句话很笼统，底下可能是两件完全不同的事，<b>处理方向正好相反</b>：</p>
+
+<table>
+  <tr><th></th><th>(a) 设备显存不够</th><th>(b) 网卡 QP 配额用完</th></tr>
+  <tr><td>机制</td><td>QP 的上下文、收发队列、通信域的 CCL buffer 都要占设备内存。HBM 快满时，这笔申请就失败。</td><td>每张卡支持的 RDMA 连接数有硬上限。链路数超了就建不出新 QP。</td></tr>
+  <tr><td>和规模的关系</td><td>和<b>活跃通信域个数</b> × <code>HCCL_BUFFSIZE</code> 成正比，和当时模型占了多少显存强相关。</td><td>和<b>走 RoCE 的链路条数</b>成正比。走 HCCS（机内/超节点内）的链路<b>不吃 QP</b>。</td></tr>
+  <tr><td>典型触发时机</td><td>显存峰值期（backward 中段）。</td><td>初始化或首次建链期，<b>和模型显存无关</b>。</td></tr>
+  <tr><td>对应的处理</td><td>调小 <code>HCCL_BUFFSIZE</code>；把建链提前到显存还空的时候。</td><td>检查有没有把本该走 HCCS 的链路强行改成 RoCE；检查多 QP 是否被打开。</td></tr>
+</table>
+
+<div class="box warn"><b>注意一个常见的错误推论</b>：有人会说"32 卡规模大，HCCL 要为每一对 rank 建 QP，基数巨大"。<b>不对。</b>QP 是<b>按链路</b>建的，而且只有走 RoCE 的链路才需要 QP；同一个通信域里一个 rank 也只和它的邻居建链，不是和所有 peer 两两建链。集群卡数本身不构成 QP 压力，<b>拓扑把多少链路甩到 RoCE 上才构成压力</b>。</div>
+
+<h4>按 rank 布局算一下自己的 RDMA 链路数</h4>
+
+<p>Megatron 默认 rank 排布顺序是 <code>tp-cp-ep-dp-pp</code>，即 <code>rank = tp + cp·TP + dp·(TP·CP) + pp·(TP·CP·DP)</code>。【推断，要用你真实的 <code>trainer.nnodes</code> 复核】如果训练侧也是 4 节点 × 8 卡 = 32 卡，那么 TP=1、CP=4 → DP=2：</p>
+
+<ul>
+  <li>rank 0–7 是 PP stage 0，8–15 是 stage 1 …… 正好一个节点一个 stage；</li>
+  <li><b>CP 组和 DP 组都在节点内</b>（走 HCCS，不吃 QP）；</li>
+  <li><b>只有 PP 跨节点</b>，每个 rank 两个 PP 邻居 → 走 RoCE 的链路很少；</li>
+  <li>报错的 RankID 12 落在 PP stage 1、dp=1、cp=0。</li>
+</ul>
+
+<p>这个布局下 QP 需求本来是很低的。所以如果定性结果是 (b)，那说明<b>有东西把机内/超节点内的链路也推到 RoCE 上去了</b>——第 8 节第三步专门查这个。</p>
+
+<h3 id="xg-6">6. 时间点是最强的证据</h3>
+
+<p>日志里有一行很容易被跳过：</p>
+
+<pre><code>Training Progress:   0%|          | 0/151 [3:31:33&lt;?, ?it/s]</code></pre>
+
+<p>它说明：跑了 <b>3 小时 31 分，第一个训练步都还没完成</b>（separate_async 模式下这段时间都花在 agent rollout 上），然后在 <code>_update_actor</code> 里挂了。这个时间点排除了一类原因、指向了另一类：</p>
+
+<div class="box key">
+<ul style="margin:0">
+  <li><b>排除"集群 QP 配额天生不够这个拓扑"。</b>如果是那样，故障会出现在初始化阶段或第一次权重同步时，而不是 3.5 小时后的第一次 backward。</li>
+  <li><b>指向"首次用到的通信域 + 显存峰值撞在了一起"。</b>失败的是 <code>ReduceScatter</code>；配了 <code>use_distributed_optimizer=True</code>，梯度 reduce-scatter 走 DP×CP 组；这个组在 forward 阶段用不到，<b>backward 才是它第一次被用到</b>。按第 4 节第 2 条，第一次用到 = 这一刻才建链、才分配那 400 MB。</li>
+  <li>而这一刻的显存状态是：<code>param_offload=True</code> 的权重刚从 CPU 搬回设备、激活值和梯度都活着——<b>整个 run 里显存最紧的时刻</b>。HCCL 偏偏在这时候来要几百 MB 它独占的显存。</li>
+</ul>
+</div>
+
+<p>这条链能解释日志里每一行，而且解释了为什么异常被标成 OOM 却找不到分配器统计量。但它仍然是【推断】，下一节是定性的办法。</p>
+
+<h3 id="xg-7">7. 一条命令定性</h3>
+
+<p>决定性证据在<b>设备侧 plog</b> 里——EI0007 那条记录的上下文会打出 HCCL 到底在申请什么、申请多大。到出错的那个节点（<code>172.16.29.213</code>）上，PID 是 <code>1764</code>：</p>
+
+<pre><code># plog 路径：$ASCEND_PROCESS_LOG_PATH，未设置时默认 ~/ascend/log/debug/plog/
+grep -rn "CreateOneQp\|EI0007" ${ASCEND_PROCESS_LOG_PATH:-~/ascend/log}/ | head
+
+# 找到行号后看前后各 50 行，重点看申请的是什么资源
+grep -rn -B50 -A20 "CreateOneQp" ${ASCEND_PROCESS_LOG_PATH:-~/ascend/log}/debug/plog/plog_1764_*.log</code></pre>
+
+<table>
+  <tr><th>上下文里看到</th><th>判定</th><th>去做</th></tr>
+  <tr><td>显存申请失败、<code>devMem</code> / <code>Malloc</code> / 某个字节数不够</td><td>(a) 显存</td><td>第 8 节 步骤 1、2</td></tr>
+  <tr><td>QP 个数达到上限、网卡/qpn 相关的配额</td><td>(b) QP 配额</td><td>第 8 节 步骤 3</td></tr>
+</table>
+
+<p>同一份 plog 里还有两个有用的东西：</p>
+<ul>
+  <li>grep <code>ccl buffer</code> / <code>BUFFSIZE</code>：看实际生效的每通信域缓存大小，验证第 4 节的算术。</li>
+  <li>grep 通信域创建记录（<code>CommInit</code> 之类）的<b>时间戳</b>：如果它们集中出现在 21:45 附近而不是启动阶段，就直接证实了"惰性建链撞上显存峰值"这条推断。</li>
+</ul>
+
+<div class="box warn"><b>一定要跨节点比时间戳。</b>这个 rank 建链失败会让它的 peer 全部 socket 等超时，于是别的节点会报一堆 EI0006 / 超时。<b>只有全集群最早的那条错误才是源头</b>，不然很容易去修一个受害者。</div>
+
+<h3 id="xg-8">8. 按顺序能做的四件事</h3>
+
+<h4>步骤 1：调小 <code>HCCL_BUFFSIZE</code>（一行，先做这个）</h4>
+
+<pre><code>export HCCL_BUFFSIZE=100   # 默认 200，单位 MB；每个通信域占 2×该值</code></pre>
+
+<p>直接命中 (a)：把每个通信域的独占显存从 400 MB 降到 200 MB，按第 4 节的 5 个活跃域算，每张卡让出约 1 GB；更重要的是<b>让那笔失败的申请本身变小一半</b>。这是官方文档为"通信域较多、挤占模型显存"给的处理方式。</p>
+
+<p>代价和下限：如果单次集合通信的数据量超过这个缓存，通信会变慢。文档给的参考下限是 <code>micro_batch × seq_len × hidden × dtype字节数 / 1MB</code>（取最大的那个集合通信算）。<b>改完要看一眼 step 时间</b>，别用通信变慢换来一个跑得动但巨慢的 job。仓库里已有调过它的先例：<code>tests/special_npu/nightly_ci_ascend/run_grpo_qwen3_30b_veomni_fsdp.sh:30</code> 设的是 610（往大调的方向，为了通信性能）。</p>
+
+<h4>步骤 2：把建链提前到显存还空的时候（结构性修法）</h4>
+
+<p>既然问题的本质是"惰性建链把资源申请推到了显存峰值"，那正面的解法就是<b>在启动阶段、权重还没加载的时候，主动把每个通信组都用一次</b>，让 HCCL 在 HBM 几乎全空时把缓存和 QP 占住——之后这些资源一直留着，不会在 backward 里再申请一次。</p>
+
+<p>落点在 <code>verl/workers/engine/megatron/transformer_impl.py:277</code> 的 <code>mpu.initialize_model_parallel(...)</code> 之后：对 TP 组、CP 组、DP 组、DP×CP 组各做一次极小的 <code>all_reduce</code>（一个 <code>int8</code> 标量就够），PP 组做一轮 p2p。代价是启动时多几百毫秒。</p>
+
+<div class="box note">这个做法在昇腾社区的万卡实践里是标准手段（"TP 组初始化时主动建链、DP 组懒加载"的取舍讨论，以及 HCCL 性能测试工具用 <code>-w</code> 预热迭代把首轮建链开销排除在统计外，都是同一件事）。本仓库目前<b>没有</b>做这个预建链——<code>_mindspeed_repatch</code>（<code>verl/workers/engine/mindspeed/transformer_impl.py:39</code>）只打补丁，不触发通信。要的话可以写成一个小 patch。</div>
+
+<h4>步骤 3：查有没有东西把 HCCS 链路推成了 RoCE（命中 (b) 才做）</h4>
+
+<p>在<b>出错的 worker 进程里</b>（不是提交机上）查这几个变量：</p>
+
+<pre><code>env | grep -E 'HCCL_(INTER_HCCS|INTRA_ROCE|INTRA_PCIE|RDMA|BUFFSIZE|OP_EXPANSION)'</code></pre>
+
+<p>两个最该怀疑的，<b>本仓库里就各有一处在设</b>——都是为了绕别的 bug：</p>
+
+<table>
+  <tr><th>变量</th><th>仓库里的出处</th><th>后果</th></tr>
+  <tr><td><code>HCCL_INTER_HCCS_DISABLE=TRUE</code></td><td><code>tests/special_npu/nightly_ci_ascend/run_grpo_glm52_top16_megatron_npu_multinode.sh:6</code>（绕 hcomm issue 1083）</td><td>超节点内本可走 HCCS 的跨节点链路改走 RoCE，<b>QP 需求成倍上升</b></td></tr>
+  <tr><td><code>HCCL_INTRA_ROCE_ENABLE=1</code></td><td><code>verl/checkpoint_engine/README.md:52</code>（CANN ≥ 8.5.0 + kimi checkpoint engine）</td><td>Server/超节点内的卡间通信改走 RoCE，<b>机内链路也开始吃 QP</b>（默认值是 0）</td></tr>
+</table>
+
+<p>如果启动脚本从这些地方抄过来了其中任何一个，它就是 (b) 的头号嫌疑。还要注意 Ray worker 的环境变量有三个来源：提交进程继承、<code>PPO_RAY_RUNTIME_ENV</code>（<code>verl/trainer/constants_ppo.py:113</code>）、以及脚本里传的 <code>ray_kwargs.ray_init.runtime_env.env_vars</code>——<b>只在提交机上 echo 一下是不够的</b>。</p>
+
+<h4>步骤 4：多 QP 只在真被打开时才要管</h4>
+
+<ul>
+  <li><code>HCCL_RDMA_QPS_PER_CONNECTION</code>：<b>默认就是 1</b>，取值 [1,32]，官方建议不超过 8。<b>所以"把它设成 1"在默认情况下是个空操作</b>，只有当有人显式调大过才需要改回来。</li>
+  <li>但它的优先级链是：<code>hccn_tool -s multi_qp</code> 管理面配置 &gt; NSLB &gt; <code>HCCL_RDMA_QP_PORT_CONFIG_PATH</code> &gt; 这个环境变量。<b>也就是说环境变量没设，多 QP 仍可能是开着的</b>——要用 <code>hccn_tool</code> 查管理面配置才算查全。</li>
+  <li><code>HCCL_MULTI_QP_THRESHOLD</code>（默认 512，单位 KB，范围 [1,8192]）：它控制<b>多 QP 场景下每个 QP 至少要分担多少数据</b>，影响的是"已创建的 QP 里有几个真的承载载荷"。<b>在多 QP 没开的情况下调它没有任何作用</b>，不要当成第一手段。</li>
+</ul>
+
+<h3 id="xg-9">9. 那份 AI 回答里反掉的五条</h3>
+
+<p>那份回答把<b>两种互不相干的资源</b>（通信资源 / 张量显存）混在一起开药，有五条是无效甚至反向的。逐条给依据：</p>
+
+<table>
+  <tr><th>它的建议</th><th>问题</th></tr>
+  <tr>
+    <td><code>recompute_num_layers</code> 从 1 调到 2，"用计算换内存"</td>
+    <td><b>方向反了。</b><code>recompute_method=uniform</code> 时这个值是<b>分组大小</b>：层按 N 个一组做检查点，重算时<b>一整组的中间激活同时在显存里</b>。N=1 是把每层单独重算，已经是这组参数里最省显存的配置。调到 2 省下的是"少存一半的层边界输入"（每个只有 b×s×h，很小），换来的是"重算时峰值多一层的内部激活"（注意力分数、MLP 中间量，大一个量级）。<b>净效果是峰值变高。</b></td>
+  </tr>
+  <tr>
+    <td>开 <code>use_dynamic_bsz=True</code> 来"更精细地控制内存"</td>
+    <td><b>它降不下来。</b>dynamic bsz 是把<b>多条</b>序列按 token 预算打包进一个 micro-batch，<b>从不切分单条序列</b>——代码里有硬断言：<code>assert max_token_len &gt;= max_seq_len</code>（<code>verl/utils/seqlen_balancing.py:384</code>）。而现在 <code>ppo_micro_batch_size_per_gpu=1</code>，每个 micro-batch 已经就是一条序列，<b>已经到底了</b>，dynamic bsz 只能往里装更多，不能更少。（它真正的好处是均衡各 rank 负载，那是另一回事。）</td>
+  </tr>
+  <tr>
+    <td><code>PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256</code> "减少内存碎片"</td>
+    <td><b>对这个报错无效。</b>HCCL 的 QP 上下文和 CCL buffer <b>不走 PyTorch 的缓存分配器</b>，调 PyTorch 自己怎么切块，不会把显存让给 HCCL。真能让出来的动作是 <code>empty_cache()</code>——仓库在 offload 前后已经做了（<code>verl/utils/megatron_utils.py:724</code>、<code>752</code>）。<b>（2026-11-11 更正）</b>原先这里还写了"<code>max_split_size_mb</code> 设小往往让碎片更严重"，<b>这句是错的</b>：官方语义是"大于该值的块不再被拆分"，目的恰恰是保住大块以减少碎片（下限 &gt;20 MB），仓库里 1024 和 256 两个方向都有人用。但<b>本条的结论不变，理由是机制那条</b>：调 PyTorch 怎么切自己的块，不会把 HBM 还给 HCCL。详见 <a href="#xg-12-5">§12.5</a>。</td>
+  </tr>
+  <tr>
+    <td>"32 卡规模大 → HCCL 要为每对 rank 建 QP → 基数巨大"</td>
+    <td><b>机制说错了。</b>见第 5 节：QP 按链路建，且只有走 RoCE 的链路才要 QP，同一通信域内也不是两两建链。按第 5 节的布局推演，这个配置下跨节点的只有 PP，RDMA 链路很少。<b>卡数不是原因，拓扑把多少链路甩给 RoCE 才是。</b></td>
+  </tr>
+  <tr>
+    <td>"首要步骤：<code>export HCCL_RDMA_QPS_PER_CONNECTION=1</code>"</td>
+    <td><b>默认值就是 1，通常是空操作</b>（见第 8 节步骤 4）。把空操作放在"最直接的解决方法"的位置，会让人以为已经处理过了。</td>
+  </tr>
+</table>
+
+<p>它说对的部分：首发故障是 QP 而不是张量显存、Python 栈因异步而不可信、<code>ASCEND_LAUNCH_BLOCKING=1</code> 只在调试时开完就关。</p>
+
+<div class="box note"><b>关于 <code>ASCEND_LAUNCH_BLOCKING=1</code></b>：开了能拿到准确栈，但它把所有算子变成同步执行——本次故障在 HCCL 建链，同步模式下行为可能和原来不同（更容易变成 hang 而不是报错）。而且<b>本次并不需要它</b>：首发故障的身份已经由 EI0007 那行确定了，缺的是 plog 里的资源细节（第 7 节），不是 Python 栈。</div>
+
+<h3 id="xg-10">10. 位置索引</h3>
+
+<table>
+  <tr><th>东西</th><th>位置</th></tr>
+  <tr><td>报错栈里 verl 的最后一跳：Megatron 流水线调度入口</td><td><code>verl/workers/engine/megatron/transformer_impl.py:960</code> <code>losses_reduced = forward_backward_func(...)</code></td></tr>
+  <tr><td>建通信组的地方（预建链 patch 的落点）</td><td><code>verl/workers/engine/megatron/transformer_impl.py:277</code> <code>mpu.initialize_model_parallel(...)</code></td></tr>
+  <tr><td>NPU 引擎的补丁入口（只打补丁，不触发通信）</td><td><code>verl/workers/engine/mindspeed/transformer_impl.py:39</code> <code>_mindspeed_repatch</code></td></tr>
+  <tr><td>已有的 NPU 流水线 p2p 形状交换补丁（同一条 PP 通信路径上的另一个坑）</td><td><code>verl/models/mcore/patch.py</code> <code>apply_patch_megatron_npu_p2p_shape</code>（commit <code>85e6e4c3</code>）</td></tr>
+  <tr><td>offload 之后把显存还回设备</td><td><code>verl/utils/megatron_utils.py:724</code>、<code>752</code></td></tr>
+  <tr><td>dynamic bsz 不切分单条序列的断言</td><td><code>verl/utils/seqlen_balancing.py:384</code></td></tr>
+  <tr><td>Ray worker 默认环境变量（含两个 HCCL 端口范围）</td><td><code>verl/trainer/constants_ppo.py:113</code> <code>PPO_RAY_RUNTIME_ENV</code></td></tr>
+  <tr><td>仓库里把链路改走 RoCE 的两处先例</td><td><code>tests/special_npu/nightly_ci_ascend/run_grpo_glm52_top16_megatron_npu_multinode.sh:5-6</code>、<code>verl/checkpoint_engine/README.md:52</code></td></tr>
+  <tr><td>NPU 上 <code>checkpoint_engine.backend=nccl</code> 实际命中的类</td><td><code>verl/checkpoint_engine/hccl_checkpoint_engine.py:103</code>（<code>@CheckpointEngineRegistry.register("nccl")</code> 注册的是 HCCL 实现）</td></tr>
+</table>
+
+<h4>外部依据</h4>
+<ul>
+  <li><a href="https://www.hiascend.com/document/detail/zh/Pytorch/600/ptmoddevg/trainingmigrguide/performance_tuning_0047.html"><code>HCCL_BUFFSIZE</code> 官方说明</a>：默认 200 MB，每通信域占 2× 该值，HCCL 独占不与业务复用，通信域多时建议调小。</li>
+  <li><a href="https://www.hiascend.com/document/detail/zh/Pytorch/600/ptmoddevg/trainingmigrguide/performance_tuning_0044.html"><code>HCCL_INTRA_ROCE_ENABLE</code> 官方说明</a>：默认 0；置 1 后 Server / 超节点内改走 RoCE。</li>
+  <li><a href="https://github.com/tsukiyokai/hccl-docs/blob/main/hccl/HCCL%E9%9B%86%E5%90%88%E9%80%9A%E4%BF%A1%E5%BA%93%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97.md">HCCL 集合通信库使用指南（镜像）</a>：<code>HCCL_RDMA_QPS_PER_CONNECTION</code> 默认 1、范围 [1,32]、建议 ≤8 及其优先级链；<code>HCCL_MULTI_QP_THRESHOLD</code> 默认 512 KB。</li>
+  <li><a href="https://www.hiascend.com/doc_center/source/zh/canncommercial/850/commlib/hcclug/hcclug_000112.html">CANN HCCL 推荐业务配置</a>：A3 训练与训推一体场景下 <code>HCCL_OP_EXPANSION_MODE</code> / <code>HCCL_CONNECT_TIMEOUT</code> 的推荐值。</li>
+  <li><a href="https://ost.51cto.com/posts/54859">集合通信初始化的懒加载与预建链实践</a>：通信组多时缓存占用可达 20 GB 量级，以及"TP 组主动建链 + DP 组懒加载"的取舍。</li>
+</ul>
+
+<h3>还需要你补的三个信息</h3>
+<ol>
+  <li><b><code>trainer.nnodes</code> / <code>trainer.n_gpus_per_node</code> 和 TP</b>——第 5 节的 rank 布局推演是按"训练侧也是 4×8、TP=1"假设的，换成真值才能确定哪些链路跨节点。</li>
+  <li><b>出错 worker 里 <code>env | grep HCCL_</code> 的完整输出</b>——第 8 节步骤 3、4 全靠它。</li>
+  <li><b>plog 里 <code>CreateOneQp</code> 前后的上下文</b>——这是唯一能在 (a) 和 (b) 之间定性的证据。</li>
+</ol>
+
+
+<h3 id="xg-11">11. 代入真实配置后的重算</h3>
+
+<div class="box ask"><b>追问</b>：我是 TP4 PP4 CP4，训练节点是 64 个，推理节点 32 个，训推非共卡，Qwen3.8 27B，262K 序列长度。</div>
+
+<p>有了真实数字，第 5、6 节里几条标【推断】的东西可以算实了，而且其中<b>一条结论要翻过来</b>。先把参数摊开：</p>
+
+<table>
+  <tr><th>项</th><th>值</th><th>来源</th></tr>
+  <tr><td>训练卡数</td><td>64</td><td>追问（推理 32 卡与日志里 <code>rollout.nnodes=4 × n_gpus_per_node=8</code> 一致，故这里的"节点"按卡数理解）</td></tr>
+  <tr><td>TP / PP / CP / EP / ETP</td><td>4 / 4 / 4 / 1 / 1</td><td>追问 + 启动参数</td></tr>
+  <tr><td>序列长度</td><td>262144</td><td>追问</td></tr>
+  <tr><td>模型</td><td>Qwen3.8-27B（HF 架构标识 <code>qwen3_5</code>）：<br><code>hidden 5120</code>、<code>intermediate 17408</code>、<b><code>num_hidden_layers 64</code></b>、<code>heads 24</code>、<b><code>num_key_value_heads 4</code></b>、<code>head_dim 256</code>（显式给出）、<code>vocab 248320</code>，另有 1 层 MTP 和 depth 27 的视觉塔</td><td><a href="arch/verl-model-init.html">模型初始化与设备放置</a>（用的是真实 config.json）</td></tr>
+  <tr><td><code>sequence_parallel</code></td><td><b>True</b></td><td><code>verl/workers/config/engine.py:192</code> 默认 True，只在 <code>TP==1</code> 时被强制关掉（<code>engine.py:232</code>）。TP=4 → <b>SP 开着</b></td></tr>
+</table>
+
+<h4 id="xg-11-1">① DP = 1，这是第一个要注意的事</h4>
+
+<p><code>TP × PP × CP = 4 × 4 × 4 = 64</code>，正好等于训练卡数，所以</p>
+
+<pre><code>DP = 64 / (4 × 4 × 4) = 1</code></pre>
+
+<p>三个后果：</p>
+
+<ol>
+  <li><b>纯 DP 维度上没有任何集合通信</b>（组大小 1）。所以失败的那个 <code>ReduceScatter</code> <b>不可能</b>是"DP 梯度规约"。</li>
+  <li><b>但 <code>use_distributed_optimizer=True</code> 并没有因此失效。</b>Megatron 的分布式优化器切分用的是 <code>get_data_parallel_group(<b>with_context_parallel=True</b>)</code>，在 DP=1、CP=4 时这个组的<b>大小是 4</b>——也就是说<b>优化器状态和梯度是沿着 CP 维度切的</b>，梯度 reduce-scatter 走的是 DP×CP 组。</li>
+  <li><b>没有 DP 就没法用数据并行摊微批</b>：<code>ppo_mini_batch_size</code> 有多大，就有多少个 micro-batch 串着过流水线。</li>
+</ol>
+
+<h4 id="xg-11-2">② 失败的是哪个通信域：DP×CP，它和 CP 成员相同但是<b>另一个</b>通信域</h4>
+
+<p>这是这一节里最有价值的一点。DP×CP 组（DP=1 时）的成员和 CP 组<b>完全一样</b>，都是那 4 张卡。很容易以为"CP 组在 forward 已经用过了，链路早就建好了"。<b>但不是</b>：</p>
+
+<div class="box key">
+Megatron 调 <code>new_group()</code> 把它们建成<b>两个不同的 process group 对象</b>（<code>_DATA_PARALLEL_GROUP_WITH_CP</code> 和 <code>_CONTEXT_PARALLEL_GROUP</code>）。按第 4 节第 2 条，HCCL 通信域是跟着 process group 惰性创建的——<b>成员相同不等于复用通信域</b>。于是：
+<ul style="margin:6px 0 0">
+  <li><b>CP 组</b>：forward 第一次做 KV all-gather 时建域、建链、分配 2×<code>HCCL_BUFFSIZE</code>。此时显存还不算紧。</li>
+  <li><b>DP×CP 组</b>：forward 全程用不到它，<b>backward 里梯度 reduce-scatter 才是它的第一次使用</b> → 在显存峰值那一刻从零开始建域、建链、再要一份 2×<code>HCCL_BUFFSIZE</code>。</li>
+</ul>
+</div>
+
+<p>这和日志完全吻合：失败的算子是 <code>HcclReduceScatter</code>、失败动作是 <code>CreateOneQp</code>（<b>建链</b>，不是传数据）、失败时刻在 backward。第 6 节那条推断到这里基本可以当成结论了，<b>而且它给出了一个很窄的修法</b>：不用做全量预建链，<b>只要在启动阶段对 DP×CP 这一个组打一次极小的 all_reduce</b>，就能把它的建域时刻从"backward 显存峰值"挪到"权重还没加载"。</p>
+
+<pre><code># 落点：verl/workers/engine/megatron/transformer_impl.py:277
+#       mpu.initialize_model_parallel(...) 之后
+import torch
+from megatron.core import parallel_state as mpu
+
+g = mpu.get_data_parallel_group(with_context_parallel=True)
+if torch.distributed.get_world_size(group=g) > 1:
+    warm = torch.ones(1, dtype=torch.int8, device=torch.npu.current_device())
+    torch.distributed.all_reduce(warm, group=g)   # 这一下就把通信域和链路建起来了</code></pre>
+
+<h4 id="xg-11-3">③ RankID 12 落在 PP stage 0——也就是显存最紧的那个 stage</h4>
+
+<p>Megatron 默认 rank 排布 <code>tp-cp-ep-dp-pp</code>，代入 TP=4、CP=4、DP=1：</p>
+
+<pre><code>rank = tp + 4·cp + 16·pp
+
+PP stage 0 = rank 0–15     stage 1 = 16–31     stage 2 = 32–47     stage 3 = 48–63
+RankID 12  →  pp=0, cp=3, tp=0   →  PP 第一段</code></pre>
+
+<p>1F1B 调度下，stage <i>i</i> 同时在手的 micro-batch 数是 <code>PP − i</code>：stage 0 要攒 <b>4 个</b>，stage 3 只要 <b>1 个</b>。所以<b>报错的 rank 恰好是显存压力最大的那一段</b>，这又是一条和"显存峰值"自洽的证据。</p>
+
+<div class="box note"><b>顺便确认一件事：你的 <code>num_layers_in_first/last_pipeline_stage=14</code> 是对的，不要改。</b>64 层 PP=4，均分是 16/段；设成 14 后变成 <b>14 / 18 / 18 / 14</b>。按"层数 × 在手微批数"算加权负担：stage0 = 14×4 = 56，stage1 = 18×3 = 54，stage2 = 18×2 = 36，stage3 = 14×1 = 14 —— <b>首尾调小正好把 stage 0 和 stage 1 配平了</b>。仓库里的 256K 参考脚本也是同一个思路（94 层 PP=16，均分 5.9，它设 <code>first_layer=5</code>）。</div>
+
+<h4 id="xg-11-4">④ 最关键的一条：<code>TP × CP</code> 和「每节点几张卡」的关系</h4>
+
+<p>因为 rank 排布里 TP 最快变、CP 次之，<b>前 <code>TP×CP</code> 个连续 rank 构成一个 "TP×CP 块"</b>。这个块是否塞得进一个节点，决定了 CP 的通信走 HCCS 还是 RoCE——<b>也就决定了它要不要 QP</b>。</p>
+
+<p>你的配置是 <code>TP × CP = 4 × 4 = <b>16</b></b>。于是分两种情况：</p>
+
+<table>
+  <tr><th></th><th>每节点 8 卡（64 卡 = 8 节点）</th><th>每节点 16 卡（64 卡 = 4 节点，A3）</th></tr>
+  <tr><td>TP 组 {0,1,2,3}</td><td>节点内 ✓ HCCS</td><td>节点内 ✓ HCCS</td></tr>
+  <tr><td>CP 组 {0,4,8,12}</td><td><b>跨 2 个节点</b>（0、4 在节点 A；8、12 在节点 B）→ <b>走 RoCE，吃 QP</b></td><td>节点内 ✓ HCCS，<b>不吃 QP</b></td></tr>
+  <tr><td>DP×CP 组（= 同样那 4 张卡）</td><td><b>跨节点</b> → 它的 reduce-scatter <b>需要建 QP</b></td><td>节点内 → <b>完全不需要 QP</b></td></tr>
+  <tr><td>对本次报错的含义</td><td>②的故事成立：backward 首次使用 + 跨节点建链 + 显存峰值，三件事撞在一起</td><td>②的通信域故事仍成立，但<b>它不该需要 QP</b> → 说明另有东西把节点内链路推成了 RoCE（见第 8 节步骤 3），或失败的是别的域</td></tr>
+</table>
+
+<div class="box warn"><b>所以现在最需要你确认的就是这一个数：训练节点每节点几张卡（8 还是 16）。</b>日志里只能看到推理侧是 <code>n_gpus_per_node=8</code>。这个数会让排查往两个完全不同的方向走。</div>
+
+<h4>和仓库自带的 256K 昇腾参考脚本对照</h4>
+
+<p><code>examples/ascend_extras/grpo_trainer/run_qwen3_235b_256k_megatron.sh</code> 是仓库里唯一的 256K 长序列昇腾配置（235B MoE）。它的并行度选择很能说明问题：</p>
+
+<table>
+  <tr><th></th><th>仓库 256K 参考（235B）</th><th>你（27B）</th></tr>
+  <tr><td>规模</td><td>16 节点 × <b>16 卡</b> = 256 卡</td><td>64 卡</td></tr>
+  <tr><td>TP / CP / PP</td><td>2 / <b>8</b> / <b>16</b>（EP16 ETP1）</td><td>4 / 4 / 4</td></tr>
+  <tr><td><b>TP × CP</b></td><td><b>2 × 8 = 16 = 每节点卡数</b> → CP 严格在节点内</td><td>4 × 4 = 16 → <b>取决于每节点卡数</b></td></tr>
+  <tr><td>每 CP rank 的 token</td><td>262144 / 8 = 32768</td><td>262144 / 4 = <b>65536</b>（2 倍）</td></tr>
+  <tr><td>SP 区间 token（再除 TP）</td><td>32768 / 2 = 16384</td><td>65536 / 4 = 16384（<b>巧合地相同</b>）</td></tr>
+  <tr><td>首/尾 stage 层数</td><td>5 / 5（共 94 层，均分 5.9）</td><td>14 / 14（共 64 层，均分 16）</td></tr>
+</table>
+
+<p>读出来两件事：</p>
+<ul>
+  <li><b>它把 <code>TP×CP</code> 刻意凑成正好一个节点。</b>262K 下 CP 的集合通信量极大，这显然是为了不让它出节点。</li>
+  <li><b>它用更大的 CP（8）而不是更大的 TP。</b>长序列场景下切序列比切张量更划算——TP 每层都要两次 all-gather/reduce-scatter，CP 只在注意力处通信。</li>
+</ul>
+
+<h4 id="xg-11-5">⑤ 显存账：算下来约 19 GB —— 这<b>削弱</b>了"显存被挤占"的假设</h4>
+
+<p>第 6 节推断"HCCL 来要显存时显存最紧"。代入真实数字算一遍 stage 0 单卡（<code>recompute_granularity=full</code> + <code>recompute_method=uniform</code> + <code>recompute_num_layers=1</code>，优化器全 offload）：</p>
+
+<table>
+  <tr><th>项</th><th>算式</th><th>大小</th></tr>
+  <tr><td>每层存下的激活（SP 形态的层输入）</td><td><code>16384 × 5120 × 2 B</code></td><td>168 MB</td></tr>
+  <tr><td>stage 0 存的激活总量</td><td><code>14 层 × 4 个在手微批 × 168 MB</code></td><td><b>9.4 GB</b></td></tr>
+  <tr><td>权重（bf16）</td><td>每层每卡 ≈ 85 M 参数 × 14 层 = 1.19 B</td><td>2.4 GB</td></tr>
+  <tr><td>梯度（<code>main_grads_dtype=bf16</code>）</td><td>同上</td><td>2.4 GB</td></tr>
+  <tr><td>重算单层的工作集</td><td>MLP gate+up <code>2 × 65536 × 4352 × 2 B</code> = 1.14 GB，加 q/k/v</td><td>≈ 2 GB</td></tr>
+  <tr><td>HCCL 独占（TP / CP / DP×CP / PP / embedding ≈ 5 个域）</td><td><code>5 × 2 × 200 MB</code></td><td>2.0 GB</td></tr>
+  <tr><td colspan="2">合计</td><td><b>≈ 18–20 GB</b></td></tr>
+</table>
+
+<div class="box warn"><b>这是对我自己第 6 节推断的修正。</b>19 GB 在 64 GB 的卡上并不紧张，所以<b>"HBM 快满导致 QP 申请失败"这条路的证据变弱了</b>。相应地，第 5 节的 (b)（网卡 / 链路侧资源）权重上升，第 7 节那条 plog 命令从"建议做"变成<b>"必须做"</b>——它是唯一能在两者之间定性的证据。</div>
+
+<p>两个可能让这个估算失真、值得你顺手验一下的地方：</p>
+<ol>
+  <li><b>GDN 层在 CP 下到底怎么切。</b>报错栈在 <code>megatron/core/ssm/gated_delta_net.py</code>，这是线性注意力/类 SSM 层，它的上下文并行<b>不是</b> KV all-gather 那一套，而要传递递归状态。如果 Megatron 的实现在 CP 下把整条 262K 序列 all-gather 到每个 CP rank 本地跑递归，那这些层的 token 数就是 262144 而不是 65536，<b>存下来的激活要乘 4</b>，上表的 9.4 GB 会变成 37 GB，显存立刻变紧、第 6 节的推断反而重新成立。<br>（旁证：verl 的 HF 路径对这件事是显式把关的——<code>verl/models/transformers/qwen3_5.py:172</code> 在 <code>chunk_gated_delta_rule</code> 不接受 <code>cp_context</code> 时直接 <code>raise NotImplementedError</code>。Megatron 路径的实现不在本仓库，得去 <code>third_party/Megatron-LM</code> 看。）</li>
+  <li><b>实测一下。</b>在 <code>update_actor</code> 前后各打一次 <code>verl/utils/memory_utils.py</code> 里的 <code>get_memory_info()</code>，看 <code>reserved</code> / <code>allocated</code> 的真实峰值。比任何估算都靠得住。</li>
+</ol>
+
+<h4 id="xg-11-6">⑥ 于是第 8 节的处理顺序要改</h4>
+
+<table>
+  <tr><th>新顺序</th><th>做什么</th><th>为什么挪位置</th></tr>
+  <tr><td><b>1</b></td><td>确认<b>训练侧每节点几张卡</b></td><td>决定 CP / DP×CP 是否跨节点，整条链的走向都靠它（④）</td></tr>
+  <tr><td><b>2</b></td><td><b>只给 DP×CP 组做预建链</b>（上面那 5 行）</td><td>它是唯一"forward 用不到、backward 才首次使用"的通信域（②）。改动极小、无性能代价，而且不管底下是显存还是 QP，<b>把申请挪到启动阶段都更安全</b></td>
+  </tr>
+  <tr><td><b>3</b></td><td>plog 里看 <code>CreateOneQp</code> 的上下文（第 7 节）</td><td>⑤ 削弱了显存假设，这条从"建议"升为<b>必做</b></td></tr>
+  <tr><td><b>4</b></td><td>查 <code>HCCL_INTER_HCCS_DISABLE</code> / <code>HCCL_INTRA_ROCE_ENABLE</code>（第 8 节步骤 3）</td><td>若每节点 16 卡、CP 本应在节点内却仍报 QP 失败，<b>这就是头号嫌疑</b></td></tr>
+  <tr><td><b>5</b></td><td><code>HCCL_BUFFSIZE</code>：<b>先别调小</b>（见⑦）</td><td>从"第一步"降到最后，原因见下</td></tr>
+</table>
+
+<h4 id="xg-11-7">⑦ 两个被真实数字卡住的旋钮</h4>
+
+<p><b>(一) <code>HCCL_BUFFSIZE</code> 在 262K 下不该盲目调小 —— 这条推翻第 8 节步骤 1。</b></p>
+
+<p>按官方给的参考下限 <code>micro_batch × seq_len × hidden × dtype字节数 / 1MB</code>，取最大的那个集合通信（SP 的 all-gather / reduce-scatter，它的输出是 TP 聚合后的完整长度）：</p>
+
+<pre><code>1 × 65536 × 5120 × 2 B / 1 MB = 640 MB</code></pre>
+
+<p>也就是说<b>默认的 200 MB 已经远低于单次 SP 集合通信的数据量，这些通信本来就在被切块传</b>。再调小会让每层两次的 SP 通信更碎——而 262K 下这是整个 step 里最热的通信路径。<b>所以在这个配置上，<code>HCCL_BUFFSIZE</code> 是一个真实的两难，不是免费的"省显存"旋钮</b>：往小省 HBM、往大省时间。等第 3 步定性结果出来、确认是显存不足了再权衡，并且改完一定要看 step 时间。</p>
+
+<p><b>(二) <code>num_key_value_heads = 4</code> 把 TP 锁在 ≤ 4。</b></p>
+
+<p>GQA 的 KV 头只有 4 个，TP=4 时每个 rank 正好分到 <b>1 个</b> KV 头——已经到底了。所以如果④的结论是"要让 <code>TP×CP</code> 塞进一个节点"，你能动的方向是：</p>
+
+<ul>
+  <li><b>降 TP 到 2</b>（<code>TP×CP = 8</code>，8 卡节点刚好装下），那么 <code>PP = 64/(2×4) = 8</code>。代价：SP 区间的 token 从 16384 翻到 32768，<b>每层存的激活翻倍到 335 MB</b>；而 PP=8 时 stage 0 要攒 8 个微批、每段 8 层 → <code>8 × 8 × 335 MB ≈ 21 GB</code>，<b>比现在的 9.4 GB 更费显存</b>。不是白捡的。</li>
+  <li><b>升 TP 到 8：不行</b>，4 个 KV 头切不成 8 份（除非复制 KV，仓库的模型初始化地图里专门点了这个坑）。</li>
+  <li><b>学参考脚本的思路：加大 CP、减小 TP</b>，但 64 卡的总量限制了 <code>TP×PP×CP=64</code> 的组合空间，每一种都要连带重算显存，别只看通信。</li>
+</ul>
+
+<div class="box key"><b>这一节的净结论</b>：①②③ 把"失败的是 DP×CP 这个在 backward 才首次使用的跨节点通信域"钉得很实，并给出了一个 5 行的窄修法；④ 指出 <code>TP×CP=16</code> 与每节点卡数的关系是整件事的分水岭，需要你确认一个数；⑤ 则<b>反过来削弱了我原先"显存被挤占"的推断</b>，所以 plog 定性现在是必做项；⑦ 撤回了"先调小 <code>HCCL_BUFFSIZE</code>"这条建议。</div>
+
+
+<h3 id="xg-12">12. 每节点 8 卡确认、plog 已丢失之后</h3>
+
+<div class="box ask"><b>追问</b>：每个节点 8 卡，plog 我现在拿不到了。</div>
+
+<h4 id="xg-12-1">12.1 跨节点的部分，从推断变成结论</h4>
+
+<p>64 卡 ÷ 8 = <b>8 个节点</b>。代入 §11③ 的 rank 公式 <code>rank = tp + 4·cp + 16·pp</code>：</p>
+
+<pre><code>节点 0: rank 0–7     节点 1: rank 8–15    ← PP stage 0 占这两个节点
+节点 2: rank 16–23   节点 3: rank 24–31   ← stage 1
+节点 4–5: stage 2    节点 6–7: stage 3
+
+TP 组 {0,1,2,3} {4,5,6,7}        → 节点 0 内        ✓ HCCS
+TP 组 {8,9,10,11} {12,13,14,15}  → 节点 1 内        ✓ HCCS
+CP 组 {0,4,8,12}                 → 0、4 在节点 0；8、12 在节点 1   ← 跨节点
+DP×CP 组（同样这 4 张卡，但是独立通信域）                          ← 跨节点
+PP 组 {0,16,32,48}               → 四个不同节点                    ← 跨节点</code></pre>
+
+<div class="box key"><b>§11④ 的分叉到此收敛</b>：<code>TP×CP = 16 &gt; 8</code>，所以 <b>CP 组和 DP×CP 组都跨节点、都走 RoCE、都需要 QP</b>。加上 §11② 的"DP×CP 是 backward 才首次使用的独立通信域"，<b>"在 backward 里第一次为跨节点的 DP×CP 组建链，建链时创建 QP 失败"这条链现在是完整自洽的</b>，不再需要标【推断】。</div>
+
+<h4 id="xg-12-2">12.2 但有个矛盾要先说清楚：两个"量级"都不像</h4>
+
+<p>链条自洽不等于原因找到了。把两种稀缺资源（§5 的 a / b）各自的量算出来，<b>两个都不像是"用光了"</b>：</p>
+
+<table>
+  <tr><th></th><th>算出来是多少</th><th>离上限有多远</th></tr>
+  <tr><td>(b) QP / RDMA 链路条数</td><td>每 rank：CP ≈2 条、DP×CP ≈2 条、PP 2 条、embedding ≤1 条 → <b>约 6–7 个 QP</b></td><td>远低于网卡能支持的数量。<b>除非多 QP 被打开</b>（×4 或 ×8 也才 24–56），单纯"条数触顶"解释不了</td></tr>
+  <tr><td>(a) 显存</td><td>§11⑤ 实算 stage 0 单卡 <code>allocated</code> ≈ <b>19 GB</b></td><td>64 GB 卡上还剩 ~45 GB。<b>也不像</b></td></tr>
+</table>
+
+<div class="box key"><b>于是方向要修一下</b>：报错写的是 <code>Resources are exhausted</code>，但更可能是 <b>"这一笔分配没成功"</b> 而不是 <b>"这类资源的总数用光了"</b>。把这两件事分开想，就只剩一个解释口子——<b>HCCL 要向设备申请 QP 所需的那块内存时拿不到，而设备上的空闲显存并没有真的被模型用掉</b>。那它在谁手里？</div>
+
+<h4 id="xg-12-3">12.3 答案的候选：PyTorch 分配器"保留"着，但没"占用"</h4>
+
+<p>这是第 3 节判据的另一面。PyTorch 的缓存分配器有两个数：</p>
+
+<table>
+  <tr><th>指标</th><th>含义</th><th>谁能用</th></tr>
+  <tr><td><code>memory_allocated</code></td><td>当前活着的张量真正占的字节</td><td>模型</td></tr>
+  <tr><td><code>memory_reserved</code></td><td>分配器<b>向设备要来、并且一直攥着</b>的字节（含张量释放后仍留在缓存里的块）</td><td><b>只有 PyTorch 自己</b></td></tr>
+</table>
+
+<p>而 <b>HCCL 的 QP 上下文和每通信域 2×<code>HCCL_BUFFSIZE</code> 的 CCL buffer 不走 PyTorch 分配器</b>，它直接向设备要。两者抢的是同一块 HBM，但 HCCL 看不到也拿不到 PyTorch 已经 reserved 的那部分。所以完全可能出现：</p>
+
+<pre><code>allocated  ≈ 19 GB   （模型真正在用）
+reserved   ≈ 55 GB   （分配器攥着，其中 36 GB 是空闲缓存块）
+设备剩余    ≈  9 GB   ← HCCL 只能从这里拿
+</code></pre>
+
+<p>这个配置里有三件事专门把 <code>reserved</code> 推高：</p>
+
+<ol>
+  <li><b>262K 的变长序列</b>。每个 micro-batch 的真实长度都不同，分配器要不断为不同大小的块开新段，释放后又留在缓存里 → 碎片化严重。</li>
+  <li><b><code>param_offload=True</code> + <code>optimizer_offload=True</code> 的反复搬运</b>。每次 H2D 都要新块，offload 后块被释放但<b>段仍被 reserved</b>。仓库在 offload 路径上确实调了 <code>empty_cache()</code>（<code>verl/utils/megatron_utils.py:724</code>、<code>752</code>），但那是在 offload 之后，不是在 backward 之前。</li>
+  <li><b>3.5 小时的 rollout 期间，训练进程并不是全程干净的</b>：初始权重同步、<code>log_prob</code> 计算（<code>log_prob_micro_batch_size_per_gpu=1</code>，262K 一条）都在这个进程里留下过大块。</li>
+</ol>
+
+<div class="box note"><b>这个解释能同时说通三件事</b>：① 为什么异常被标成 <code>OutOfMemoryError</code>（它确实是内存问题）；② 为什么报错里没有分配器统计量（因为<b>不是分配器</b>报的，是 HCCL 报的，见第 3 节）；③ 为什么 <code>allocated</code> 只有 19 GB 也会失败。<br>但它仍然是候选，不是结论——<b>12.7 给了替代 plog 的验证办法</b>。</div>
+
+<h4 id="xg-12-4">12.4 三个分配器旋钮，以及仓库自己怎么用的</h4>
+
+<table>
+  <tr><th>旋钮</th><th>机制</th><th>仓库里的用法</th><th>对本问题</th></tr>
+  <tr>
+    <td><code>garbage_collection_threshold:0.8</code></td>
+    <td><code>reserved</code> 超过容量 80% 时，分配器<b>主动把空闲缓存块还给设备</b></td>
+    <td><b>仓库在两个大模型 NPU 脚本里就是用这个</b>：<code>examples/grpo_trainer/run_qwen3_5_397b_megatron.sh:60</code>、<code>run_qwen3_5_122b_a10b_megatron.sh:62</code></td>
+    <td><b>最对症</b>：它直接给 HCCL 留出空间，而且不需要改代码</td>
+  </tr>
+  <tr>
+    <td><code>expandable_segments:True</code></td>
+    <td>用一段可增长的虚拟内存代替多个固定段，<b>大幅压缩 reserved 与 allocated 的差距</b></td>
+    <td>verl 有 <code>set_expandable_segments()</code>（<code>verl/utils/device.py:137</code>），并在共卡权重同步前后 <code>False → True</code> 地包了一层（<code>verl/workers/engine_workers.py:831</code>、<code>889</code>）</td>
+    <td><b>要小心</b>：见下方两条约束</td>
+  </tr>
+  <tr>
+    <td><code>max_split_size_mb:N</code></td>
+    <td>大于 N 的块不再被拆分，用于保住大块</td>
+    <td>NPU 脚本用过 1024（<code>run_grpo_qwen3_30b_veomni_fsdp.sh:32</code>）；某 CUDA 调优脚本用 256</td>
+    <td><b>对本问题无效</b>，理由见 12.5</td>
+  </tr>
+</table>
+
+<div class="box warn"><b><code>expandable_segments</code> 在昇腾上的两条约束，必须知道：</b>
+<ol style="margin:6px 0 0">
+  <li><b>和 <code>max_split_size_mb</code> / <code>garbage_collection_threshold</code> 互斥</b>——这两个任一为非默认值时，<code>expandable_segments</code> 必须是 False。<b>所以不要把它和上面的 <code>garbage_collection_threshold:0.8</code> 一起设。</b></li>
+  <li><b>它和 RDMA 内存注册有已知摩擦。</b>仓库两处注释写得很直白："<i>use cupy instead of torch to avoid memory register error when <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code></i>"（<code>verl/checkpoint_engine/nccl_checkpoint_engine.py:167</code>、<code>nixl_checkpoint_engine.py:272</code>）。这正是"虚拟内存"与"需要注册物理地址的 RDMA"打架的典型表现。本次失败的是 <code>CreateOneQp</code> 而非注册用户 buffer，所以不能直接归因，<b>但这个方向值得留个心</b>。</li>
+  <li>附带一个坑：<code>engine_workers.py:889</code> 在共卡权重同步结束时会 <code>set_expandable_segments(<b>True</b>)</code>。你是 <code>hybrid_engine=false</code> 的 separate_async，这条路大概不会走到；但<b>万一走到了，它会把进程后半段的 expandable_segments 全局打开</b>，和你设的 <code>garbage_collection_threshold</code> 撞上。</li>
+</ol>
+</div>
+
+<h4 id="xg-12-5">12.5 更正第 9 节关于 <code>max_split_size_mb</code> 的一句话</h4>
+
+<p>我在第 9 节写过"<code>max_split_size_mb</code> 设小往往让碎片更严重"。<b>这句话是错的，撤回。</b>官方语义是：<b>大于该值的块不再被拆分</b>，目的恰恰是把大块完整留着给后续的大请求，从而<b>减少</b>碎片（取值下限 &gt;20 MB）。仓库里两个方向都有人用（NPU 1024、CUDA 256），该设多少是跟负载有关的，没有一个普适方向。</p>
+
+<div class="box key"><b>但第 9 节那一条的结论不变，只是理由要换成机制那条</b>：调 PyTorch <b>怎么切自己已经攥住的块</b>，不会把 HBM 还给 HCCL。真正能还回去的只有三种动作——<code>empty_cache()</code>（手动释放已保留的段）、<code>garbage_collection_threshold</code>（到阈值自动释放）、<code>expandable_segments</code>（一开始就少保留）。<b><code>max_split_size_mb</code> 不属于这三种，所以它治不了本病。</b></div>
+
+<h4 id="xg-12-6">12.6 和仓库自带的 Qwen3.8-27B 脚本逐项对照</h4>
+
+<p><code>examples/grpo_trainer/run_qwen3_8_27b_megatron.sh:208–225</code> 是仓库里<b>你这个模型</b>的 NPU 分支。它和你的配置有几处实质差异：</p>
+
+<table>
+  <tr><th>仓库 27B 脚本（NPU 分支）</th><th>你的启动参数</th><th>说明</th></tr>
+  <tr><td><code>unset PYTORCH_NPU_ALLOC_CONF</code></td><td>未见</td><td>它<b>明确不设</b>分配器参数（即全部用默认）</td></tr>
+  <tr><td><code>HCCL_OP_EXPANSION_MODE=AIV</code></td><td>未见</td><td><b>这一项仓库内部三种口径</b>：这个脚本设 AIV；glm52 多机脚本 <code>unset</code> 它（绕 hcomm issue 1084）；而<b>昇腾官方对 A3「RL 训推一体」的建议是保持默认 <code>AI_CPU</code></b>，AIV 是给推理场景的。<b>值得查你实际是哪个值</b></td></tr>
+  <tr><td><code>HCCL_CONNECT_TIMEOUT=1800</code></td><td>未见</td><td>建链超时。改大不能修 QP 申请失败，但能减少 peer 被连带拖挂</td></tr>
+  <tr><td><code>use_ascend_gdn=False</code></td><td><b>未设</b></td><td>你只设了 <code>use_triton_gdn=true</code>，没显式关掉另一条 GDN 实现</td></tr>
+  <tr><td><code>mtp_num_layers=0</code></td><td><b>未设</b>（模型自带 1 层 MTP）</td><td>它在 NPU 上<b>把 MTP 关掉了</b>。MTP 的 logits 要再走一遍 vocab 248320，落在最后一段 PP 上，和你 stage 0 的报错不直接相关，<b>但这是和已知能跑的配置的实质偏离</b></td></tr>
+  <tr><td><code>MINDSPEED_BRIDGE_AUTOREG_MODE=strict</code></td><td>未见</td><td>MindSpeed-Bridge 的算子自动注册模式</td></tr>
+</table>
+
+<p class="meta">注："未见"只是说日志里那串 <code>sys.argv</code> 没有，环境变量是看不到的——以 12.7 第 5 步实际 dump 出来的为准。</p>
+
+<h4 id="xg-12-7">12.7 下一次跑之前做什么（既降风险，又自带诊断）</h4>
+
+<p>plog 没了就无法对这次故障定性，所以目标改成：<b>让下一次跑要么不再复现，要么自己把证据留下来</b>。按这个顺序：</p>
+
+<table>
+  <tr><th>#</th><th>做什么</th><th>为什么</th></tr>
+  <tr>
+    <td><b>1</b></td>
+    <td><b>给 DP×CP 组做预建链</b>（<a href="#xg-11-2">§11②</a> 那 5 行，落在 <code>transformer_impl.py:277</code> 之后）</td>
+    <td>它是唯一"forward 用不到、backward 才首次建域建链"的跨节点通信域。<b>无论底下是显存还是 QP，把这笔申请挪到权重还没加载时都更安全</b>，而且零性能代价。这是最值得先做的一件事</td>
+  </tr>
+  <tr>
+    <td><b>2</b></td>
+    <td><code>export PYTORCH_NPU_ALLOC_CONF=garbage_collection_threshold:0.8</code><br><span class="meta">（不要同时设 <code>expandable_segments</code>，见 12.4）</span></td>
+    <td>直接针对 12.3：把分配器攥着的空闲缓存还给设备，给 HCCL 留出空间。<b>仓库在更大的模型上就是这么用的</b>，不是臆造的参数</td>
+  </tr>
+  <tr>
+    <td><b>3</b></td>
+    <td><b>打内存埋点</b>：在 <code>update_actor</code> 进入时、forward 结束时、backward 结束时各调一次 <code>verl/utils/memory_utils.py</code> 的 <code>get_memory_info()</code>，把 <code>reserved</code> 和 <code>allocated</code> 一起打出来</td>
+    <td><b>这是替代 plog 的关键一步。</b>如果 <code>reserved</code> 贴着容量上限而 <code>allocated</code> 只有 ~19 GB，12.3 当场被证实；如果两个都不高，那就只剩 (b) 的链路侧，排查转向 12.6 的 <code>HCCL_OP_EXPANSION_MODE</code> 和第 8 节步骤 3</td>
+  </tr>
+  <tr>
+    <td><b>4</b></td>
+    <td><b>把 plog 存到持久目录</b>：<code>export ASCEND_PROCESS_LOG_PATH=&lt;挂载出来的路径&gt;</code></td>
+    <td>这次拿不到就是因为它留在容器里随 pod 一起没了。下次复现才有第 7 节那条命令可用</td>
+  </tr>
+  <tr>
+    <td><b>5</b></td>
+    <td><b>在 worker 里 dump 环境</b>：<code>env | grep -E 'HCCL_|PYTORCH_NPU_|ASCEND_'</code>，并对齐 12.6 的差异（尤其 <code>HCCL_OP_EXPANSION_MODE</code>、<code>mtp_num_layers</code>）</td>
+    <td>Ray worker 的环境变量来自三处（提交进程继承、<code>PPO_RAY_RUNTIME_ENV</code>、<code>runtime_env.env_vars</code>），只在提交机上看不准</td>
+  </tr>
+  <tr>
+    <td><b>6</b></td>
+    <td><code>HCCL_BUFFSIZE</code> <b>继续不动</b></td>
+    <td>262K 下单次 SP 集合通信约 640 MB，已远超默认 200 MB（<a href="#xg-11-7">§11⑦</a>）。它是时间/显存的两难，不是免费旋钮</td>
+  </tr>
+</table>
+
+<div class="box key"><b>这一节的净结论</b>：8 卡/节点让"跨节点的 DP×CP 组在 backward 首次建链失败"成为确定的事实链；但 QP 条数（6–7）和显存占用（19 GB）<b>两个量级都离上限很远</b>，所以更像"这一笔分配没成功"而非"资源总量用尽"，最可能的去处是 <b>PyTorch 分配器 reserved 着而 HCCL 拿不到</b>。plog 丢失意味着这次无法定性，于是改为：<b>第 1 步把建链挪到启动阶段（治本且零成本），第 2 步用 <code>garbage_collection_threshold</code> 给 HCCL 腾地方，第 3 步用内存埋点替代 plog 留下证据。</b></div>
+
+
+<h3 id="xg-13">13. 官方 235B 256K 脚本推荐什么，哪些能搬到你这里</h3>
+
+<div class="box ask"><b>追问</b>：按照官方 235B 的 256K 训练脚本有推荐的训练配置吗？</div>
+
+<p>有——<b>那个脚本本身就是推荐配置</b>，<code>examples/ascend_extras/grpo_trainer/run_qwen3_235b_256k_megatron.sh</code>，开头注释写着 "<i>This script can be used for inference in 256 K and 128 K</i>"。但它是 <b>235B MoE 跑在 256 卡（16 节点 × 16 卡）</b>上的，你是 <b>27B 混合注意力跑在 64 卡（8 节点 × 8 卡）</b>上，<b>数字不能照搬，能搬的是方法</b>。下面先把它的取舍列清楚，再推一遍你这边的算术。</p>
+
+<h4 id="xg-13-1">13.1 它的十条取舍</h4>
+
+<table>
+  <tr><th>#</th><th>它怎么设</th><th>背后的取舍</th></tr>
+  <tr><td>1</td><td><code>TP=2 CP=8</code>，<b><code>TP×CP = 16 = NPUS_PER_NODE</code></b></td><td><b>最重要的一条。</b>刻意让 TP 和 CP 都落在节点内，长序列下这两类通信量最大，不能出节点（见 §11④）</td></tr>
+  <tr><td>2</td><td>宁可加大 CP（8）而不是 TP（只有 2）</td><td>TP 每层都要一次 all-gather + 一次 reduce-scatter，<b>和层数成正比</b>；CP 只在注意力处通信。长序列下切序列比切张量便宜</td></tr>
+  <tr><td>3</td><td><code>PP=16</code>，<code>first_layer=last_layer=5</code>（共 94 层，均分 5.875）</td><td>首尾只是<b>略微</b>调小，不是大幅倾斜——因为过度倾斜会放大流水线气泡</td></tr>
+  <tr><td>4</td><td><code>train_prompt_mini_bsz=4</code>，而 <code>PP=16</code></td><td><b>容易被忽略的一条</b>：微批只有 4 个而 PP 是 16，流水线<b>根本填不满</b>。stage 0 在手的微批数是 <code>min(PP, 微批数) = 4</code> 而不是 16，<b>小 mini batch 直接给 stage 0 显存设了上限</b></td></tr>
+  <tr><td>5</td><td><code>recompute_granularity=full</code> + <code>method=uniform</code> + <code>num_layers=1</code></td><td>和你一样，已经是最省的那档（见第 9 节）</td></tr>
+  <tr><td>6</td><td><code>all_offload=True</code>、<code>optimizer_offload_fraction=1</code>、<code>optimizer_cpu_offload=True</code>、<code>use_precision_aware_optimizer=True</code></td><td>和你一样，优化器全放 CPU</td></tr>
+  <tr><td>7</td><td><code>use_dynamic_bsz=False</code>、<code>ppo_micro_batch_size_per_gpu=1</code>、<code>ppo_max_token_len_per_gpu = prompt+response</code></td><td>和你一样。262K 一条序列，动态打包没有空间（见第 9 节）</td></tr>
+  <tr><td>8</td><td>actor 和 ref 都显式写 <code>sequence_parallel=True</code>、<code>use_distributed_optimizer=True</code></td><td>verl 默认就是 True（<code>engine.py:192</code>），显式写只是防止被别处覆盖</td></tr>
+  <tr><td>9</td><td><code>use_dist_checkpointing=True</code> + <code>use_mbridge=True</code> + 预转好的 <code>dist_checkpointing_path</code></td><td><b>你的配置里没有这个。</b>它用离线转好的 mcore 权重，省掉每次启动的 HF→mcore 转换</td></tr>
+  <tr><td>10</td><td><b>一个 HCCL 环境变量都没设</b>，只有 <code>ulimit -n 32768</code>；<code>PYTORCH_NPU_ALLOC_CONF</code> 也没设</td><td>和 §11⑦ 的结论一致：<code>HCCL_BUFFSIZE</code> 不是该随手调的东西</td></tr>
+</table>
+
+<h4 id="xg-13-2">13.2 核心算术：stage 0 的激活只取决于 <code>CP×TP</code>，和 PP 无关</h4>
+
+<p>选并行度时最容易算错的就是这一步。把 stage 0 存下来的激活写成公式：</p>
+
+<pre><code>stage0 激活 ≈ (stage0 的层数) × min(PP, 微批数) × (262144 / (CP × TP_sp)) × 5120 × 2 B
+                 ↑ 约 64/PP                                   ↑ 开 SP 时 TP_sp=TP，TP=1 时 SP 被强制关掉 → TP_sp=1</code></pre>
+
+<p>注意前两项：层数约 <code>64/PP</code>，在手微批数是 <code>min(PP, 微批数)</code>。<b>微批数足够多时这两项相乘约等于 64，PP 被约掉了</b>——</p>
+
+<div class="box key">
+<b>① 加大 PP 并不会减少 stage 0 的激活。</b>每段层数变少了，但同时在手的微批数变多了，正好抵消。<br>
+<b>② 真正决定激活大小的是 <code>CP × TP</code>（开 SP 时）</b>，因为它决定每个 rank 实际持有多少 token。<br>
+<b>③ 微批数少于 PP 时，<code>min()</code> 生效，小 mini batch 直接压住 stage 0 的显存</b>——这就是 235B 脚本第 4 条在做的事。
+</div>
+
+<p>代入你现在的配置（<code>CP×TP = 16</code> → 每 rank 16384 token → 每层 168 MB，stage 0 有 14 层）：</p>
+<ul>
+  <li>微批数 ≥ 4：<code>14 × 4 × 168 MB = 9.4 GB</code>（§11⑤ 那个数）</li>
+  <li>微批数 = 2：<code>14 × 2 × 168 MB = 4.7 GB</code></li>
+</ul>
+
+<h4 id="xg-13-3">13.3 你 64 卡 / 每节点 8 卡的候选布局</h4>
+
+<p>约束有三条：<code>TP × PP × CP = 64</code>；想让 CP 不出节点就要 <code>TP × CP ≤ 8</code>；<code>num_key_value_heads = 4</code> 把 <code>TP ≤ 4</code>（§11⑦）。</p>
+
+<table>
+  <tr><th>TP</th><th>CP</th><th>PP</th><th>TP×CP</th><th>CP 出节点?</th><th>每 rank token</th><th>stage0 激活<br><span class="meta">(均分层数, 微批≥PP)</span></th><th>权重+梯度<br><span class="meta">(stage0, bf16)</span></th></tr>
+  <tr style="background:#fff8c5"><td><b>4</b></td><td><b>4</b></td><td><b>4</b></td><td>16</td><td><b>是</b> ← 现状</td><td>16384</td><td><b>9.4 GB</b></td><td>4.8 GB</td></tr>
+  <tr><td>4</td><td>2</td><td>8</td><td>8</td><td>否</td><td>32768</td><td>21 GB</td><td><b>2.8 GB</b></td></tr>
+  <tr><td>2</td><td>4</td><td>8</td><td>8</td><td>否</td><td>32768</td><td>21 GB</td><td>5.5 GB</td></tr>
+  <tr><td>1</td><td>8</td><td>8</td><td>8</td><td>否</td><td>32768</td><td>21 GB</td><td>11 GB <span class="meta">(TP=1 权重不切)</span></td></tr>
+  <tr><td>2</td><td>2</td><td>16</td><td>4</td><td>否</td><td>65536</td><td>43 GB</td><td>5.5 GB</td></tr>
+</table>
+
+<p>读出三件事：</p>
+
+<ol>
+  <li><b>三个 <code>TP×CP=8</code> 的方案，激活完全一样（21 GB）</b>，因为每 rank token 数只看 <code>CP×TP</code> 的积。连重算工作集也一样（每层 MLP 中间量约 2.3 GB）——每个 rank 的总工作量是守恒的。</li>
+  <li><b>它们只在两处分开</b>：权重切分（TP 越大越省，所以 <code>TP=4 CP=2</code> 最省显存）和每层的 TP 集合通信次数（TP 越小越省时间，所以 <code>TP=1 CP=8</code> 最省通信，但代价是权重完全不切、多吃 8 GB，而且 <b>TP=1 会让 verl 强制关掉 SP</b>）。235B 脚本选的是偏小 TP 那一端。</li>
+  <li><b>把 CP 收进节点内的代价是激活从 9.4 GB 翻到 21 GB</b>（+11.6 GB）。按 §11⑤ 的合计 ~19 GB 推，换完大约 30 GB，在 64 GB 卡上仍然装得下。<b>所以这是可行的，但不是免费的。</b></li>
+</ol>
+
+<h4 id="xg-13-4">13.4 但按 §12 的结论，现在<b>还不该</b>动并行度</h4>
+
+<div class="box warn">
+重排并行度是这几个办法里<b>最贵</b>的一个：要重新验证收敛、重新调 batch、重新测 step 时间。而 §12.2 算出来的两个量——<b>QP 条数 6~7、显存 19 GB/64 GB——都离上限很远</b>，也就是说<b>目前没有证据表明这个布局的通信或显存真的超了</b>。在这种情况下换布局是赌，不是修。<br><br>
+<b>合理的顺序是</b>：先上 §12.7 的 1～3 步（预建链 + <code>garbage_collection_threshold</code> + 内存埋点，全部是低成本、可回退的），拿到内存埋点的真实数字。<b>只有在埋点显示显存确实见底、或者排查最终指向跨节点链路资源</b>时，再把 <code>TP×CP</code> 收进节点内才是有依据的决定。这张表届时直接用。
+</div>
+
+<p>另外两条和并行度无关、可以顺手对齐的：<b>13.1 第 9 条</b>（预转 mcore 权重 + <code>use_dist_checkpointing</code>，省启动时间）和 <b><code>ulimit -n 32768</code></b>（连接数多的场景）。</p>
+
+<h3 id="xg-14">14. 已落地到分支的两个改动</h3>
+
+<p>按要求把 §11② 的预建链和 §12.7 第 3 步的内存埋点写进了 <code>mimo-agent-env</code> 分支。</p>
+
+<h4>改动一：启动阶段预建通信域</h4>
+
+<table>
+  <tr><th>文件</th><th>做了什么</th></tr>
+  <tr><td><code>verl/utils/distributed.py</code></td><td>新增通用函数 <code>warmup_process_groups(group_getters)</code>：对传进来的每个 process group 发一次 1 个 <code>int32</code> 的 all-reduce，逼 torch.distributed 立刻建出后端通信域。跳过三类情况——getter 抛异常（该 Megatron 版本没这个组）、返回 None、组大小 ≤ 1（没有 peer 就没有通信域）。gloo 组用 CPU 张量、其他后端用设备张量；只要用过设备后端就在最后 <code>synchronize()</code>，保证通信域真的建成、失败在这里就抛</td></tr>
+  <tr><td><code>verl/utils/megatron_utils.py</code></td><td>新增 <code>warmup_megatron_comm_groups()</code>：环境变量开关 + 要预热的组清单，然后委托给上面那个函数</td></tr>
+  <tr><td><code>verl/workers/engine/megatron/transformer_impl.py:277</code> 之后</td><td>在 <code>mpu.initialize_model_parallel(...)</code> 后调用它。这段代码被 <code>if mpu.is_initialized(): return</code> 挡着，<b>每个进程只会执行一次</b>，actor/ref 共用同一套通信组不会重复预热</td></tr>
+  <tr><td><code>tests/utils/test_comm_warmup_on_cpu.py</code></td><td>两个 CPU 测试（gloo、2 进程）：验证"抛异常 / None / size-1 三类都被静默跳过，只有 2 卡组被预热"，以及"预热后这个组的真实 all-reduce 结果仍然正确（1+2=3），没留下脏状态"；另一个验证单进程下是 no-op</td></tr>
+</table>
+
+<p>预热的组清单，以及为什么是这四个：</p>
+
+<table>
+  <tr><th>组</th><th>为什么在清单里</th></tr>
+  <tr><td><code>data_parallel_with_cp</code></td><td><b>真正的目标。</b>开 <code>use_distributed_optimizer</code> 时梯度 reduce-scatter 和参数 all-gather 走它，而 forward 全程不碰它（§11②）</td></tr>
+  <tr><td><code>data_parallel</code></td><td>指标 all-gather 用它（<code>engine_workers.py:244</code>）</td></tr>
+  <tr><td><code>tensor_model_parallel</code> / <code>context_parallel</code></td><td>forward 里本来就会用到，提前建只是更早、更安全</td></tr>
+  <tr><td><b>PP 组：故意不在清单里</b></td><td>它的首次使用已经在 forward；而且预热它需要配对的 send/recv 而不是一次集合通信，容易写出死锁</td></tr>
+</table>
+
+<div class="box key"><b>为什么只预热"反正会用到"的组</b>：预热一个<b>本来永远不会被用到</b>的组，会凭空造出一个通信域、白占 2×<code>HCCL_BUFFSIZE</code>（默认 400 MB）——那是帮倒忙。所以清单的判据不是"有哪些组"，而是"<b>这一步反正要建的组有哪些</b>"。基于同样的理由，<code>embedding</code> 组也没放进去：它只在共享 embedding 时才用，而这个模型 <code>tie_word_embeddings = false</code>。</div>
+
+<p><b>默认开启</b>（它是修复而不是探针，而且只改变建域的时机、不改变建不建），要关掉：</p>
+<pre><code>export VERL_MEGATRON_WARMUP_COMM_GROUPS=0</code></pre>
+
+<h4>改动二：<code>update_actor</code> 前后的内存埋点</h4>
+
+<table>
+  <tr><th>文件</th><th>做了什么</th></tr>
+  <tr><td><code>verl/utils/memory_utils.py</code></td><td>新增 <code>log_actor_update_memory(stage)</code>：在<b>每个 rank</b> 上打一行，内容是 allocated / reserved / 两者之差 / <b>设备级 free·total</b> / 累计峰值</td></tr>
+  <tr><td><code>verl/workers/engine_workers.py</code> 的 <code>update_actor</code></td><td>前后各调一次，<b>用 <code>try/finally</code></b>——这样<b>更新抛异常时第二行照样会打出来</b>，而那恰恰是最想要的那个采样点</td></tr>
+</table>
+
+<p><b>默认关闭</b>（一行 × 每 rank × 每次更新，64 卡上输出量很大，这是排查期才开的探针）：</p>
+<pre><code>export VERL_LOG_ACTOR_UPDATE_MEMORY=1</code></pre>
+
+<p>为什么打这几个数、而不是只打 allocated —— 以及怎么读：</p>
+
+<table>
+  <tr><th>看到的形态</th><th>结论</th></tr>
+  <tr><td><code>allocated</code> 不高（~19 GB），但 <code>reserved</code> 很高、<b><code>device free</code> 接近 0</b></td><td><b>§12.3 成立</b>：PyTorch 分配器攥着显存，HCCL 拿不到。上 <code>garbage_collection_threshold:0.8</code></td></tr>
+  <tr><td>两个都不高，<code>device free</code> 还剩很多</td><td><b>和显存无关</b>，转向链路/QP 侧：查 §12.6 的 <code>HCCL_OP_EXPANSION_MODE</code>、第 8 节步骤 3 的 RoCE 开关</td></tr>
+</table>
+
+<p>关键是 <code>device free</code> 这一项来自 <code>mem_get_info()</code>，是<b>设备自己的视角</b>。通信域的 QP 和 CCL buffer 是直接向设备要的、不走 PyTorch 分配器，所以<b>决定 HCCL 能不能成功的是这个数，而不是 <code>total − allocated</code></b>。另外埋点整体包在 <code>try/except</code> 里：它被放在 <code>finally</code> 中、可能在设备已经出错的状态下执行，<b>探针绝不能成为训练失败的原因</b>。</p>
+
+<p class="meta">验证：pinned ruff（check + format）、仓库的 docstring 与 license sanity 检查、以及新增的两个 CPU 测试全部通过。设备侧行为（HCCL 通信域真的提前建出来、埋点在 NPU 上的真实数字）只能在你的集群上验。</p>
+
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xf-megatron-parallel.html">← 插课 F</a></div>
+</main>
+</body>
+</html>

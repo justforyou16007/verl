@@ -40,7 +40,7 @@ from verl.utils.distributed import initialize_global_process_group_ray, set_numa
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.megatron.low_precision import bf16_layers_at_start_end
-from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.memory_utils import aggressive_empty_cache, log_actor_update_memory
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
@@ -768,7 +768,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        output = self.actor.train_mini_batch(data=data)
+        # Probed before and after because the interesting question is how much the device
+        # has left at the activation peak, not just at rest. `finally` so the second line
+        # is still written when the update raises -- that is the sample we actually want.
+        log_actor_update_memory("before update_actor")
+        try:
+            output = self.actor.train_mini_batch(data=data)
+        finally:
+            log_actor_update_memory("after update_actor")
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
