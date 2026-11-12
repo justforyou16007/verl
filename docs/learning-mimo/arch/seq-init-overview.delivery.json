@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "6bc60ee4-06f0-4130-80b7-df80dc0f4a7d",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/init-overview.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-init-overview.html",
+  "specification": {
+    "sha256": "b16438624a585fee7b9ac376235cc66b5d6b354efab270e23cc91e06232d2d7d",
+    "bytes": 13770
+  },
+  "artifact": {
+    "sha256": "1a27bdd3dd3efca9d84b9b12fda039c98799e8d2bc709706dd184b9d0f013938",
+    "bytes": 859816
+  }
+}

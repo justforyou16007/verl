@@ -12,6 +12,7 @@
   <ol>
     <li><a href="#about">说明</a></li>
     <li><a href="#how">怎么查</a></li>
+    <li><a href="#seq">跨栈时序图</a></li>
     <li><a href="#init">初始化</a></li>
     <li><a href="#train">训练</a></li>
     <li><a href="#sub">子模块</a></li>
@@ -19,7 +20,18 @@
     <li><a href="#pins">版本钉子</a></li>
     <li><a href="#caveat">已知坑与死代码</a></li>
   </ol>
-  <h2 style="margin-top:20px">九张图</h2>
+  <h2 style="margin-top:20px">跨栈时序图</h2>
+  <ol>
+    <li><a href="seq-init-overview.html">初始化总时序</a></li>
+    <li><a href="seq-train-step.html">训练一步总时序</a></li>
+    <li><a href="seq-worker-bootstrap.html">子：worker 启动与通信域</a></li>
+    <li><a href="seq-rollout-generate.html">子：一次生成请求</a></li>
+    <li><a href="seq-data-layout.html">子：数据形状与布局</a></li>
+    <li><a href="seq-actor-update.html">子：actor 更新</a></li>
+    <li><a href="seq-weight-sync.html">子：权重同步两条路</a></li>
+    <li><a href="seq-pd-disagg.html">子：推理 PD 分离部署</a></li>
+  </ol>
+  <h2 style="margin-top:20px">模块地图（九张）</h2>
   <ol>
     <li><a href="verl-init.html">初始化总分图</a></li>
     <li><a href="verl-train-loop.html">训练主循环与三模式</a></li>
@@ -86,6 +98,33 @@
   <tr><td>KV 头数少于 TP 时两边各自怎么处理</td><td><a href="verl-model-init.html">模型初始化与设备放置</a> 卡片 ④（GQA）</td></tr>
   <tr><td>hybrid 注意力 / MTP 层对 KV cache 的影响</td><td><a href="verl-model-init.html">模型初始化与设备放置</a> 卡片 ⑥</td></tr>
 </table>
+
+<h2 id="seq">跨栈时序图</h2>
+<p>上面那组图回答「<b>谁是谁的一部分</b>」，按模块切分。这一组回答「<b>谁先调谁、谁等谁、跨栈边界落在哪</b>」，按时间轴组织，泳道从左到右大致就是软件栈从上到下：启动进程 → Ray → driver → worker → 通信库 → Megatron → 推理引擎 → 硬件。</p>
+<p class="meta">橙色箭头是跨出 verl 的调用，也就是出问题时责任可能不在 verl 的地方；虚线是为腾显存或防故障刻意加的动作；绿色竖条是真正阻塞的同步点。</p>
+<table>
+  <tr><th>图</th><th>回答什么</th></tr>
+  <tr><td><a href="seq-init-overview.html"><b>初始化总时序</b></a></td><td>从启动脚本到 ready to fit 的 18 步：先认硬件 → 起 Ray → 要资源定地址 → 建通信域 → 建模型 → 起推理引擎 → 首次权重同步</td></tr>
+  <tr><td><a href="seq-train-step.html"><b>训练一步总时序</b></a></td><td>一个 step 的九个阶段，含异步下发与同步点的分界；三种 trainer 模式的差别只在钩子落点</td></tr>
+  <tr><td><a href="seq-worker-bootstrap.html">子流程：worker 启动与通信域建立</a></td><td>昇腾三处补丁时机为何必须排对；惰性建链为什么会撞上显存峰值，预热为什么只选四个组</td></tr>
+  <tr><td><a href="seq-rollout-generate.html">子流程：一次生成请求</a></td><td>生成为什么不走 HTTP；路由与粘滞表如何服务前缀缓存；KV cache 在一步里的进出</td></tr>
+  <tr><td><a href="seq-data-layout.html"><b>子流程：数据的形状与布局变换</b></a></td><td><code>use_remove_padding</code> 这一个开关如何决定整条路的布局；三种布局依次出现与逆变换；微批划分为何不改形状却决定快慢</td></tr>
+  <tr><td><a href="seq-actor-update.html">子流程：actor 更新</a></td><td>集合通信的三类归属（verl 显式 / Megatron 隐式 / 优化器内部）；四个同步点与异步错误的落点；打包与切分的形状变化</td></tr>
+  <tr><td><a href="seq-weight-sync.html">子流程：权重同步两条路</a></td><td>共卡传显存句柄 vs 分离部署集合通信广播；导出为何写成生成器；中间那道栅栏的必要性</td></tr>
+  <tr><td><a href="seq-pd-disagg.html"><b>子流程：推理 PD 分离部署</b></a></td><td>一个副本 = 1 prefill + N decode 怎么在单节点内编排；vLLM 串行两段 vs SGLang 并发扇出两种接力；KV 走 NIXL / Mooncake；非对称 TP 下权重同步为何仍成立；当前 MVP 限制（<b>昇腾上不可用</b>）</td></tr>
+</table>
+<div class="box key">
+  <b>几个与直觉相反、容易把图画错的事实</b>（都已在图上标出）：
+  <ul>
+    <li><b>生成不走 HTTP</b>：vLLM 与 SGLang 都是 Ray RPC 到 server actor，再在同一进程里调引擎。那个 OpenAI 兼容端口是给外部客户端的。只有 TRT-LLM 生成、以及 SGLang 的权重同步控制面才真的走 HTTP。</li>
+    <li><b>首次与每步的权重同步默认都不是集合通信广播</b>：hybrid 的后端在代码里被硬编码成 <code>naive</code>，走同卡 CUDA IPC，配置里写 nccl 也不生效；只有 separate_async 会另建一套用真实后端。</li>
+    <li><b>hybrid 模式的推理引擎没有自己的 placement group</b>，申请的加速器数是零，靠节点亲和性共享训练 actor 的可见设备。</li>
+    <li><b>优势计算不调任何外部库</b>：driver 上纯 PyTorch CPU 张量，没有 Megatron、没有设备、没有集合通信。</li>
+    <li><b><code>use_remove_padding</code> 的生效值会被 model 配置覆盖 engine 配置</b>（代码注释自认 <i>not elegant</i>），所以两处都要设；而 <code>CP&gt;1</code> 时它<b>必须为 True</b>，否则启动即 <code>raise ValueError</code>——per-token 损失在 CP&gt;1 时由 Megatron-Bridge 自动开启，它硬性要求 THD 布局。</li>
+    <li><b>verl 从不自己发流水线收发和梯度归约</b>：一次 <code>forward_backward_func</code> 调用全包；verl 只在启动时把归约钩子装进 Megatron 的配置。</li>
+    <li><b>路由器是 verl 自己写的 Python</b>，不是 sglang_router 或 vLLM 的路由进程。</li>
+  </ul>
+</div>
 
 <h2 id="init">初始化</h2>
 <div class="cards">
@@ -215,6 +254,7 @@
 <h2 id="caveat">已知坑与死代码</h2>
 <p>读代码时容易被带偏的地方，各图的卡片里都标了，这里汇总：</p>
 <ul>
+  <li><b>PD 分离的传输后端</b>：<a href="verl-init.html">初始化总分图</a>卡片里列的「nixl / mooncake / ascend / mori / fake」是<b>配置白名单</b>，不是实际可用的集合——vLLM 的 PD 副本只接受 nixl 与 mooncake，其余抛 <code>NotImplementedError</code>；而且<b>两个 PD 副本类都断言不在 NPU 上</b>，昇腾上这条路当前不可用。详见 <a href="seq-pd-disagg.html">PD 分离时序图</a>。</li>
   <li><b>没有 register center</b>：MASTER_ADDR / PORT 由一个钉在 PG 0 bundle 0 上的 Ray task 返回；<code>ray_wait_register_center_timeout</code> 被接收但从未使用。</li>
   <li><b>worker 里的 LOCAL_WORLD_SIZE 恒为 1</b>：WorkerGroup 注入的是 <code>RAY_LOCAL_WORLD_SIZE</code>，要真实值得读那个。</li>
   <li><b>FusedWorker 全套没有调用方</b>：实际在跑的是被注释标成 deprecated 的 <code>WorkerDict</code> 路径。</li>

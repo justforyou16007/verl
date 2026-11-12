@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "934a0d29-29c6-457f-9947-02c28d7750ee",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/train-step.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-train-step.html",
+  "specification": {
+    "sha256": "5e47677a36390e6ea109581b5263469cd658621de79b037aa3fda89c0d95ce1d",
+    "bytes": 12624
+  },
+  "artifact": {
+    "sha256": "f0102a7c35bc1d65737a62c90a1ee13973fbbbf8a31825f4343b1dc3afc16a59",
+    "bytes": 858182
+  }
+}

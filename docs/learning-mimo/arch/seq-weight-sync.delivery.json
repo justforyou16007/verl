@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "f43658b6-2f58-4fd9-9596-8285e61e5633",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/weight-sync.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-weight-sync.html",
+  "specification": {
+    "sha256": "1e52a164ed9a6016c5e9e4cf4707abd0594caa1cb155bd28258321749687208c",
+    "bytes": 10943
+  },
+  "artifact": {
+    "sha256": "3de082c218c7d65e9c15305a49cecbd69c138899ed8ff1cceb013152087c7885",
+    "bytes": 851887
+  }
+}

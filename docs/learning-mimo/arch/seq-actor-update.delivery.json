@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "6cae2808-2215-4d50-9f8d-31de42f0684c",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/actor-update.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-actor-update.html",
+  "specification": {
+    "sha256": "506c5b5378539de87d335797db922f3ea1efc1679f37a8321ae4c2af67f0732d",
+    "bytes": 13725
+  },
+  "artifact": {
+    "sha256": "df463360207c318d3d686a623299c9415f3e6ea29144c4c0db036a9498ab210a",
+    "bytes": 858201
+  }
+}

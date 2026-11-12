@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "59e7bc6d-8619-4379-9672-92f006828a66",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/data-layout.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-data-layout.html",
+  "specification": {
+    "sha256": "5cd8f8d316aa5353125218f6824e9d3eaaeb1835e4ff7b317b562b2f80ed81cb",
+    "bytes": 13046
+  },
+  "artifact": {
+    "sha256": "100fea66490cc7a598f8880e79873a9f455bdd8423553b735d7af8f297408d39",
+    "bytes": 854896
+  }
+}

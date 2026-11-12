@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "077187ad-f415-4194-b93b-21a89c300cfa",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/pd-disagg.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-pd-disagg.html",
+  "specification": {
+    "sha256": "c599cab4affefb5ae4e6a4d8302cc096cdb63024b7f13d561fe82eaf6625a2ac",
+    "bytes": 16994
+  },
+  "artifact": {
+    "sha256": "09145aa0ae1dc119eb534bc60ac242aa2e6807459719e342e820ea09fd00f131",
+    "bytes": 866219
+  }
+}

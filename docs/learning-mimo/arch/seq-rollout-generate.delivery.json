@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "60a607e4-6563-4859-b7ca-eb9f80764057",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/rollout-generate.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-rollout-generate.html",
+  "specification": {
+    "sha256": "390512d1395a5b983750d66f4474c8baf2261782d789366176111430e762217e",
+    "bytes": 10154
+  },
+  "artifact": {
+    "sha256": "076a3904a1632317a6bdd9c565fd33f9eaf5813833823a33df4d356e9f678aa8",
+    "bytes": 852993
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "35eea615-caf0-47eb-b26c-ca84df0181a4",
+  "status": "current",
+  "command": "deliver",
+  "type": "sequence",
+  "input": "/home/liu/projects/verl/.archify/sequence-verl-stack-20261112-100000/worker-bootstrap.json",
+  "output": "/home/liu/projects/verl/docs/learning-mimo/arch/seq-worker-bootstrap.html",
+  "specification": {
+    "sha256": "fbbb6580b3833281cc107a4acaf8447f003f0fecaed98ce681f6e19b699ae254",
+    "bytes": 11395
+  },
+  "artifact": {
+    "sha256": "3e6ba2c995ffc3d670efb839702be3a56ebcd742879115a73836328fcc65f23a",
+    "bytes": 853137
+  }
+}

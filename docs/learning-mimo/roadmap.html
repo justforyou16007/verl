@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>学习路线：verl 与配套软件栈 · verl mimo 学习笔记</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav class="side">
+  <h2><a href="index.html">↑ 总览</a></h2>
+  <h2>学习路线</h2>
+  <ol>
+    <li><a href="#r0">0. 这份路线按什么组织</a></li>
+    <li><a href="#r1">1. 你现在站在哪里</a></li>
+    <li><a href="#r2">2. 分层与「错误伪装表」</a></li>
+    <li><a href="#r3">3. 三本账：优化 idea 从哪来</a></li>
+    <li><a href="#r4">4. 九个阶段</a>
+      <ol>
+        <li><a href="#s1">① 先把「看得见」做出来</a></li>
+        <li><a href="#s2">② 配置层的权威查法</a></li>
+        <li><a href="#s3">③ 数据平面</a></li>
+        <li><a href="#s4">④ FSDP 作为对照系</a></li>
+        <li><a href="#s5">⑤ 算法层</a></li>
+        <li><a href="#s6">⑥ 推理引擎与训推一致</a></li>
+        <li><a href="#s7">⑦ 依赖栈的内部</a></li>
+        <li><a href="#s8">⑧ checkpoint 与长稳</a></li>
+        <li><a href="#s9">⑨ 从账本到优化</a></li>
+      </ol>
+    </li>
+    <li><a href="#r5">5. 故障现象 → 定位路径</a></li>
+    <li><a href="#r6">6. 依赖栈的版本现实</a></li>
+    <li><a href="#r7">7. 没有卡的时候能做什么</a></li>
+    <li><a href="#r8">8. 官方 main 的新进展</a></li>
+    <li><a href="#r9">9. 这份路线的边界</a></li>
+  </ol>
+</nav>
+<main>
+<div class="topbar"><a href="index.html">总览</a><span class="sp"></span><a href="xg-npu-ei0007-qp-oom.html">← 插课 G：昇腾 EI0007 排查</a></div>
+
+<h1>学习路线：verl 与配套软件栈</h1>
+
+<p class="meta">写于 2026-11-11。基于分支 <code>mimo-agent-env</code>（<code>65e5da92</code>）；官方 <code>main</code> 已同步到 <code>81464bb6</code>。路径与符号名以此时代码为准，<b>正文尽量写符号名而不是行号</b>——行号改代码就偏，符号名要稳得多。</p>
+
+<h2 id="r0">0. 这份路线按什么组织</h2>
+
+<p>你给的目标是三条：掌握 verl 和它的依赖栈、训练出问题能快速定位、能想出优化系统的点子。这三条不是「把代码读完」能换来的，原因在插课 G 里已经完整演示过一遍：</p>
+
+<div class="box key">
+那次的现象是 <code>torch.OutOfMemoryError</code> 抛在一行 <code>.cpu()</code> 上。真正的原因是反向传播里第一次用到某个通信域、建链失败。两者相隔 <b>30 秒</b>和<b>四五层软件</b>。
+<br><br>
+当时真正起作用的能力，不是「读过哪个文件」，而是三件事：知道算子是异步下发的、所以 Python 栈指向的那一行是无辜的；知道真张量 OOM 一定带 <code>Tried to allocate … reserved in total</code> 这组统计量、没有就不是；知道通信域是惰性创建的、所以「第一次用到」和「显存峰值」会撞在一起。
+</div>
+
+<p>所以这份路线按<b>能力</b>组织，而不是按模块目录组织。三条目标对应三种能力，它们各自的瓶颈不一样：</p>
+
+<table>
+  <tr><th>你要的</th><th>真正卡住人的是</th><th>路线里怎么练</th></tr>
+  <tr>
+    <td>快速定位</td>
+    <td><b>不知道每一层会把下一层的错误包装成什么样子</b>。现象离原因远，就会在错误的层里反复找。</td>
+    <td>第 2 节的「错误伪装表」+ 第 5 节按现象索引的定位路径；阶段 ① 先把测量手段配齐，阶段 ④ 建立对照系用来做二分。</td>
+  </tr>
+  <tr>
+    <td>优化 idea</td>
+    <td><b>算不出账</b>。说不清一个 step 的时间、显存、通信各自花在哪，优化就只能靠试参数，试出来也不知道为什么。</td>
+    <td>第 3 节的三本账；阶段 ① 把账记下来，阶段 ⑨ 从账里找「不必要的支出」。</td>
+  </tr>
+  <tr>
+    <td>掌握整个栈</td>
+    <td><b>栈的边界不清</b>。分不清哪个问题是 verl 的、哪个是 Megatron 的、哪个是 CANN 的，就会去改不该改的地方。</td>
+    <td>第 2 节的分层表给出每层的归属判据；第 6 节讲清版本约束怎么锁死的。</td>
+  </tr>
+</table>
+
+<p>每个阶段都写了三样东西：<b>要建立的判断力</b>（学完能回答什么问题）、<b>读什么</b>、<b>做什么能验证自己真的会了</b>。只读不做的阶段会很快忘掉，因为这些知识的形态是「判据」，判据必须在真实数据上用过才能内化。</p>
+
+<h2 id="r1">1. 你现在站在哪里</h2>
+
+<p>先盘点，避免路线重复已经走过的路。已有笔记（主线四课 + 七个插课 + 十张地图）已经覆盖得相当深的部分：</p>
+
+<table>
+  <tr><th>已掌握</th><th>在哪</th></tr>
+  <tr><td>从命令行到训练主循环的完整链路；三种 trainer 模式的 GPU 交接差异</td><td><a href="01-main-ppo.html">第一课</a>、<a href="arch/verl-init.html">初始化图</a>、<a href="arch/verl-train-loop.html">主循环图</a></td></tr>
+  <tr><td>agent 循环、harness 执行、消息→token、response_mask 的拼法</td><td><a href="02-agent-loop-init.html">第二课</a>、<a href="03a-thread-eventloop.html">第三课上</a>、<a href="03b-harness-execution.html">第三课下</a></td></tr>
+  <tr><td>奖励→优势→PPO 损失→参数同步；GRPO 与 prompt-mean 的具体算法</td><td><a href="04-actor-update.html">第四课</a></td></tr>
+  <tr><td>Megatron / MindSpeed 的加载五层链路；TP·PP·CP·EP·ETP 各切什么、在哪落地</td><td><a href="xf-megatron-parallel.html">插课 F</a>、<a href="arch/verl-model-init.html">模型初始化图</a></td></tr>
+  <tr><td>single-controller 的分派、推理副本与路由、权重同步、NPU 补丁分层</td><td><a href="arch/verl-single-controller.html">分派图</a>等四张地图</td></tr>
+  <tr><td>昇腾通信故障的排查方法：三层日志倒序、异步错误落点、QP 与通信域的资源账</td><td><a href="xg-npu-ei0007-qp-oom.html">插课 G</a></td></tr>
+</table>
+
+<p>对照这份清单，缺口集中在六块。这也是下面九个阶段的来源：</p>
+
+<table>
+  <tr><th>缺口</th><th>为什么它重要</th></tr>
+  <tr><td><b>测量基础设施</b>——profiler 怎么开、时间/显存/MFU 怎么采</td><td>插课 G §12 卡住的直接原因就是 plog 丢了、没有第二套证据。测量是定位和优化共同的前提，所以排在第一个阶段。</td></tr>
+  <tr><td><b>数据平面</b>——一条样本从文件到 loss 的全程变换</td><td>精度类问题（mask 错位、padding 串味、优势算错）只能靠追数据定位，没有别的办法。</td></tr>
+  <tr><td><b>FSDP 路径</b></td><td>笔记全程走 Megatron。少了第二套实现，就没法做「换后端复现一次」这种最有效的二分。而且 FSDP 能在很小的卡上跑起来。</td></tr>
+  <tr><td><b>算法层全貌</b></td><td>第四课讲透了 GRPO 这一条。但 <code>core_algos.py</code> 里有 14 个优势估计器、12 种损失模式，不知道可选项就判断不出「不收敛是配置选错还是实现有 bug」。</td></tr>
+  <tr><td><b>训推一致性</b></td><td>这是 agent RL 里最隐蔽的一类问题：不报错、不崩，只是学不动。仓库里有现成的探针工具，但笔记里还没用过。</td></tr>
+  <tr><td><b>checkpoint 与恢复</b></td><td>长训练必需。而且这里有个命名陷阱（见阶段 ⑧），不先弄清会找错文件。</td></tr>
+</table>
+
+<h2 id="r2">2. 分层与「错误伪装表」</h2>
+
+<p>这一节是整份路线里最该先记住的东西。先看分层——注意这个分层不是按目录划的，是按<b>「谁负责把事情做对」</b>划的，因为定位问题时你要回答的正是「这一步谁该负责」：</p>
+
+<pre><code>L7  配置层      hydra 配置组 + dataclass           决定「跑的到底是什么参数」
+L6  驱动层      trainer / fit 主循环               决定「按什么顺序做、等谁」
+L5  分派层      single_controller                  把一次驱动调用变成 N 次远程调用
+L4  数据层      TensorDict + TransferQueue         决定「张量的形状和掩码对不对」
+L3  引擎层      Megatron / FSDP + vLLM / SGLang    决定「算得快不快、显存够不够」
+L2  通信层      NCCL / HCCL                        决定「卡之间能不能对上」
+L1  运行时      CUDA / CANN + 驱动                 决定「算子到底执行了没有」</code></pre>
+
+<p>真正难的不是记住这七层，而是下面这张表。<b>每一层都会把下层的错误改头换面再交给你</b>，这是定位之所以难的根本原因：</p>
+
+<table>
+  <tr><th>层</th><th>它把下层错误伪装成什么</th><th>怎么看穿</th></tr>
+  <tr>
+    <td>L1 运行时</td>
+    <td>算子是<b>异步下发</b>的：错误不在出错的那一行抛出，而是攒到下一个<b>同步点</b>（<code>.cpu()</code>、<code>.item()</code>、打印一个标量）才冒出来。于是 Python 栈指向的那一行通常是无辜的。</td>
+    <td><b>看时间戳最早的那条日志</b>，而不是栈顶。昇腾下真正的首发故障可能比 Python 异常早几十秒。想临时关掉这层伪装，CUDA 下设 <code>CUDA_LAUNCH_BLOCKING=1</code> 让下发变同步（会很慢，只用于定位）。</td>
+  </tr>
+  <tr>
+    <td>L2 通信层</td>
+    <td>两种伪装。一是<b>伪装成显存不足</b>：建链、注册通信缓冲失败，被包成 <code>OutOfMemoryError</code>。二是<b>伪装成卡死</b>：某个 rank 没进集合通信，其他 rank 就一起等到超时，报错的是等的那些、不是缺席的那个。</td>
+    <td>第一种看<b>有没有分配统计量</b>：真张量 OOM 一定带 <code>Tried to allocate … reserved in total by PyTorch</code>，没有就不是显存问题，调 batch 无效。第二种<b>比对各 rank 的最后一条日志</b>，停在不同阶段的那个才是元凶。</td>
+  </tr>
+  <tr>
+    <td>L3 引擎层</td>
+    <td>伪装成「算法不收敛」。权重同步漏了一部分、量化精度掉了、训练和推理走了不同的核，表现出来只是奖励不涨——不报错、不崩。</td>
+    <td>用<b>训推 log_prob 的差距</b>做判据，仓库里有现成探针（阶段 ⑥）。先量这个数，再去怀疑算法。</td>
+  </tr>
+  <tr>
+    <td>L4 数据层</td>
+    <td>伪装成「模型学坏了」。掩码错位、padding 被当成真 token 参与统计、组内样本串了行，损失曲线看起来只是「有点怪」。</td>
+    <td><b>构造极小批次手工核对</b>：2 个 prompt × 2 个样本，把每一步的形状和掩码打出来，和手算对。这类问题靠看曲线永远看不出来。</td>
+  </tr>
+  <tr>
+    <td>L5 分派层</td>
+    <td>几乎不伪装，但<b>几乎没有容错</b>：单个 rank 的异常会原样从 <code>ray.get</code> 冒出来，没有重试、没有部分失败处理。好处是栈比较真实，坏处是一个 rank 挂掉整个作业就停。</td>
+    <td>直接读 worker 日志，不要只看 driver。driver 看到的是转述。</td>
+  </tr>
+  <tr>
+    <td>L6 驱动层</td>
+    <td>伪装成「性能问题」。某个阶段在等另一个阶段（生成等训练让出显存、训练等数据攒够），表现为吞吐低，但 GPU 其实在空转。</td>
+    <td>看<b>分阶段计时</b>而不是总时间（阶段 ①）。空转和算得慢，在总时间上长得一样。</td>
+  </tr>
+  <tr>
+    <td>L7 配置层</td>
+    <td>最隐蔽的一种：<b>你以为设了，其实没人读</b>。配置项写错名字或根本没接线，程序照常跑，行为是默认值。</td>
+    <td>查展平后的配置 + 全仓搜这个键有没有读取方（阶段 ②）。笔记里已经抓到四个这样的项：<code>algorithm.length_penalty</code>、<code>K8S_*</code> 那组、<code>pod_timeout</code>、<code>ray_wait_register_center_timeout</code>。</td>
+  </tr>
+</table>
+
+<div class="box note"><b>这张表的用法</b>：遇到问题时不要从「我觉得是哪里」开始，而是从<b>现象落在哪一层</b>开始，然后<b>先用判据排除伪装</b>，再往下走。第 5 节把它整理成了按现象查的形式。</div>
+
+<h2 id="r3">3. 三本账：优化 idea 从哪来</h2>
+
+<p>优化点子不是灵感，是<b>算出账之后看到的不合理支出</b>。你在插课 G §13 已经用过这个办法一次：把 stage0 激活显存写成一个公式，发现 PP 被约掉了、真正决定它的是 <code>CP×TP</code>——这个结论不可能靠试参数试出来，只能靠算。</p>
+
+<p>三本账要分开记，因为它们的优化手段互相冲突，不分开就会按下一头翘起另一头。</p>
+
+<h3>显存账</h3>
+<p>一张卡上的显存分给这几样东西，它们的缩放规律完全不同，所以要分项记而不是只看总量：</p>
+<table>
+  <tr><th>项</th><th>随什么变</th><th>注意</th></tr>
+  <tr><td>权重</td><td>÷ (TP×PP×EP)</td><td>固定支出，和序列长度无关</td></tr>
+  <tr><td>梯度 + 优化器状态</td><td>÷ 分布式优化器的切分维度</td><td>当 DP=1 时它沿别的维度切，要看实际建了什么组</td></tr>
+  <tr><td>激活</td><td>∝ 序列长度 ÷ (CP×TP<sub>sp</sub>)，× min(PP, 微批数)</td><td><b>长序列训练的主要支出</b>，也是最容易算错的一项</td></tr>
+  <tr><td>通信缓冲</td><td>每个通信域独占一份，惰性创建</td><td>不走 PyTorch 分配器，所以分配器攥着的空闲缓存它拿不到</td></tr>
+  <tr><td>推理 KV cache</td><td>推理引擎按剩余显存自己定</td><td>共卡时它和训练峰值互相挤</td></tr>
+</table>
+<p>关键区分：<code>reserved</code>（分配器从驱动那里要来的）和 <code>allocated</code>（真正给了张量的）不是一回事。通信库在这两者之外单独向驱动要内存，所以「<code>allocated</code> 离上限很远」并不能说明通信库申请得到——插课 G §12 的结论就卡在这个区别上。</p>
+
+<h3>通信账</h3>
+<p>每个并行维度在每一层引入几次集合通信、每次多少字节、走什么物理链路。<b>走什么链路这一项最容易被忽略，但它的影响是量级上的</b>：节点内走高速互联，跨节点走网络，带宽差一个数量级。</p>
+<p>所以「某个并行维度的组是否正好装进一个节点」往往比「这个维度设成几」更要紧。插课 G §11 里 <code>TP×CP=16</code> 是否塞得进一个节点就是那次的分水岭，官方 256K 参考脚本把 <code>TP×CP</code> 刻意凑成正好一个节点也是这个道理。</p>
+
+<h3>时间账</h3>
+<p>一个 step 的时间分解。这本账有现成工具（阶段 ①），记的时候要把三种情况分开，因为它们的优化方向完全不同：</p>
+<ul>
+  <li><b>真的在算</b>——优化方向是提高单卡效率（算子、精度、融合核）。判据是 MFU 不低。</li>
+  <li><b>在等通信</b>——优化方向是改并行布局或重叠通信。判据是各 rank 耗时接近但 MFU 低。</li>
+  <li><b>在等别人</b>——优化方向是改调度（异步、流水、预取）。判据是 rank 之间耗时差异大，或某阶段 GPU 几乎空闲。</li>
+</ul>
+<p>第三种最常见也最容易被误判成第一种。区分它们需要<b>分 rank 看</b>，不是看平均值——所以仓库里有个专门算尾部比例和最大最小值的工具函数（阶段 ①）。</p>
+
+<h2 id="r4">4. 九个阶段</h2>
+
+<p>顺序的逻辑是：<b>先能看见 → 再能查 → 再懂数据 → 再有对照 → 再懂算法 → 再懂训推 → 再懂底座 → 再能长跑 → 最后做优化</b>。前两个阶段投入最小、回报最快，建议不要跳。</p>
+
+<h3 id="s1">① 先把「看得见」做出来</h3>
+
+<p class="meta">要建立的判断力：拿到一个训练任务，能说出它的一个 step 时间花在哪、显存峰值由什么决定、哪个 rank 是拖后腿的。</p>
+
+<p>为什么排第一：没有测量，定位靠猜、优化靠赌。插课 G §12 之所以只能停在「候选原因」而给不出结论，就是因为 plog 丢了、而当时没有第二套证据。配齐测量手段之后，同样的问题下次会是可判定的。</p>
+
+<p><b>profiler</b>——仓库里是「一个分发器 + 五个后端」的结构，都在 <code>verl/utils/profiler/</code>：</p>
+<table>
+  <tr><th>后端</th><th>用来回答什么</th><th>实现</th></tr>
+  <tr><td><code>torch</code></td><td>算子级时间去哪了（产出可在浏览器里看的 trace）</td><td><code>torch_profile.py</code></td></tr>
+  <tr><td><code>nsys</code></td><td>同上，但能同时看到 CPU 下发和 GPU 执行的错位</td><td><code>nvtx_profile.py</code></td></tr>
+  <tr><td><code>npu</code></td><td>昇腾上的对应物</td><td><code>mstx_profile.py</code></td></tr>
+  <tr><td><code>torch_memory</code></td><td><b>显存是被谁占的</b>，以及 OOM 瞬间的现场</td><td><code>torch_memory_profile.py</code></td></tr>
+  <tr><td><code>precision_debugger</code></td><td>逐层数值对比，查精度</td><td><code>precision_debugger_profile.py</code></td></tr>
+</table>
+
+<div class="box key"><b>对你当下最有用的是 <code>torch_memory</code></b>。它会注册一个 OOM 观察器（<code>TorchMemoryProfiler._attach_oom_observer</code>，昇腾上走 <code>torch_npu</code> 的对应接口），在分配器报 OOM 的那一刻自动 dump 一份显存快照加 Python 栈，<b>而且刻意不做设备同步</b>——因为那时候流可能已经处于错误状态，同步会把现场冲掉。
+<br><br>
+这正好补上插课 G 缺的那块证据：下次再出 <code>EI0007</code>，你会同时拿到「分配器视角的显存构成」和「首发故障时间点」，前面那个「是显存不够还是网卡配额不够」的二选一就不用再靠推断。</div>
+
+<p>开关在 <code>verl/trainer/config/ppo_trainer.yaml</code> 的 <code>global_profiler</code> 块，往下传给每个角色（actor / critic / ref / rollout 各自可以覆盖）。<b>有个坑</b>：选哪些步去采样的键名是 <code>global_profiler.steps</code>，但它传到 worker 那层时参数名变成了 <code>profile_steps</code>——搜代码时两个名字都要试，不然会以为没接线。</p>
+
+<p><b>时间账</b>——计时器在 <code>verl/utils/profiler/performance.py</code>：</p>
+<ul>
+  <li><code>marked_timer(name, timing_raw)</code>：既记时间，又在 profiler 的时间轴上打一个区间标记。所以 trace 里的区间和指标里的阶段名是对得上的。</li>
+  <li>已经埋好的阶段名：<code>step</code>、<code>gen</code>、<code>reward</code>、<code>old_log_prob</code>、<code>ref</code>、<code>values</code>、<code>adv</code>、<code>update_critic</code>、<code>update_actor</code>、<code>update_weights</code>、<code>save_checkpoint</code>、<code>testing</code>；异步模式还多出 <code>switch_to_rollout</code> / <code>switch_to_trainer</code> / <code>switch_wait</code>。<b>这三个 switch 就是上面「在等别人」那类支出的直接读数</b>，异步模式下先看它们。</li>
+  <li><code>topk_reduce_ratio_min_max(timing, k=10)</code>：找拖后腿的 rank。这是时间账里唯一能区分「大家都慢」和「个别慢」的工具，平均值做不到。</li>
+</ul>
+
+<p><b>指标</b>——<code>verl/trainer/ppo/metric_utils.py</code> 把计时变成可读的数：<code>timing_s/{阶段}</code> 是绝对秒数，<code>timing_per_token_ms/{阶段}</code> 按 token 归一（跨 batch 比较要用这个），<code>perf/throughput</code> 是每 GPU 每秒多少 token。MFU 走 <code>verl/utils/flops_counter.py</code> 的 <code>FlopsCounter.estimate_flops</code>，它按模型架构分别估算，再除以设备峰值得到 <code>perf/mfu/*</code>。</p>
+
+<div class="box warn"><b>读 MFU 之前先看一眼它怎么算的</b>。<code>flops_counter.py</code> 是按架构写死的估算公式（每个模型族一个函数），你的模型如果走的是兜底分支，这个数只能用来做自己跟自己比较的相对参考，不能当绝对效率。判断方法：在 <code>flops_counter.py</code> 里搜你的架构标识，看有没有专门的估算函数。</div>
+
+<p><b>要做的</b>：在自己的训练上开一次 <code>torch</code> profiler（挑第 2 到第 3 步，第 1 步含预热不具代表性），再开一次 <code>torch_memory</code>，产出一张基线表：各阶段秒数、每 token 毫秒、吞吐、MFU、显存峰值、最慢 rank 与中位 rank 的比值。<b>这张表是后面所有优化的对照基准</b>——没有它，改完之后你没法证明是改好了还是改坏了。</p>
+
+<p><b>自测</b>：能回答「这个 step 里占比最大的那一段，是在算、在等通信、还是在等别人」，并说出判断依据。</p>
+
+<h3 id="s2">② 配置层的权威查法</h3>
+
+<p class="meta">要建立的判断力：给一个配置项名字，五分钟内判断它到底有没有生效。</p>
+
+<p>为什么排第二：投入最小、回报最高。你已经踩了四次「设了但没人读」，这不是知识不足，是缺一套固定查法。</p>
+
+<p>配置是两层拼起来的，这是「静默不生效」的根源：外层是 hydra 的配置组（<code>verl/trainer/config/</code> 下按角色分的目录：<code>actor</code>、<code>critic</code>、<code>ref</code>、<code>rollout</code>、<code>data</code>、<code>algorithm</code>、<code>model</code>、<code>engine</code>、<code>optim</code>、<code>profiler</code>、<code>reward</code>、<code>transfer_queue</code>），内层是接收它的 dataclass。yaml 里多写一个键，hydra 不一定报错；dataclass 那边没有对应字段，这个值就到不了任何代码。</p>
+
+<p><b>三步查法</b>：</p>
+<ol>
+  <li><b>看展平后的配置</b>。<code>verl/trainer/config/_generated_ppo_trainer.yaml</code>（以及 <code>_generated_ppo_megatron_trainer.yaml</code> 等变体）是 hydra 把所有配置组合并之后的完整快照，由 <code>scripts/generate_trainer_config.sh</code> 调 <code>scripts/print_cfg.py --cfg job</code> 生成。<b>你的键如果不在这里面，它就不是一个被承认的配置项。</b>想看自己那套覆盖之后的实际值，直接跑 <code>print_cfg.py</code> 带上同样的命令行覆盖。</li>
+  <li><b>搜读取方</b>。在 <code>verl/</code> 下搜这个键名，确认有代码真的取了它。笔记里那四个未接线项都是卡在这一步——配置里有、生成的 yaml 里也有，但没有任何读取方。</li>
+  <li><b>看是不是被改写了</b>。有些配置会在运行时被程序强制改掉，查法是搜「赋值」而不是「读取」。一个真实例子：<code>verl/trainer/main_ppo.py</code> 的 <code>TaskRunnerV1.run</code> 里把 <code>config.transfer_queue.enable</code> 直接设成 <code>True</code>——所以这一项在 v1 路径上<b>不是可选的</b>，你在 yaml 里关掉它也没用。</li>
+</ol>
+
+<p>还要知道 <code>verl/base_config.py</code> 的 <code>BaseConfig</code> 有个<b>冻结语义</b>：一个字段一旦有值，再赋值就抛 <code>FrozenInstanceError</code>，除非它被列进 <code>_mutable_fields</code>。这是故意的——防止配置在运行中被偷偷改掉。你写代码想改配置时会撞上它，那时要改的是 <code>_mutable_fields</code>，不是绕过它。</p>
+
+<p><b>要做的</b>：把自己正在用的训练脚本逐项过一遍这三步。<b>按以往命中率，大概率还能再挖出一两个不生效的项。</b></p>
+
+<h3 id="s3">③ 数据平面</h3>
+
+<p class="meta">要建立的判断力：能手工追一条样本从文件到 loss 的全程形状变换，并说出每个掩码是在哪一步生成的。</p>
+
+<p>为什么重要：这是精度类问题唯一的定位路径。而且这一层<b>正在换代</b>，不先搞清新旧之分会读错文件。</p>
+
+<div class="box warn"><b>先弄清一件事：<code>DataProto</code> 已经不在主路径上了。</b>
+<br>
+<code>verl/trainer/config/ppo_trainer.yaml</code> 里 <code>trainer.use_v1: true</code> 是默认值，v1 路径用的是朴素的 <code>TensorDict</code> 加 TransferQueue 的 <code>BatchMeta</code>。<code>DataProto</code> 只在老的 <code>main_ppo_v0.py</code> 路径上还活着。数量上看得很清楚：<code>ray_trainer.py</code>（旧）里有 27 处 <code>DataProto</code> 引用，<code>v1/trainer_sync.py</code> 里是 <b>0</b> 处。
+<br><br>
+所以正确的读法是：<b>读 <code>verl/protocol.py</code> 学概念，读 <code>verl/trainer/ppo/v1/</code> 看实际在跑的代码。</b></div>
+
+<p><code>protocol.py</code> 里值得学的概念（这些操作在新路径上换了实现，但语义没变，因为它们是数据并行本身的需要）：</p>
+<ul>
+  <li><code>chunk</code> / <code>concat</code>：按数据并行度切分和合并。切分必须整除，于是有了下面的补齐。</li>
+  <li><code>pad_dataproto_to_divisor</code> / <code>unpad_dataproto</code>：批大小不能被卡数整除时，<b>把自己开头的几条重新接到尾部</b>凑整，算完再切掉。知道这个机制，才能解释「为什么指标里偶尔有重复样本的痕迹」。</li>
+  <li><code>union</code>：把另一份数据的键合并进来，键冲突时断言相等。这是「算完 log_prob 再贴回原批次」的实现方式。</li>
+  <li><code>repeat</code> 的 <code>interleave</code> 开关：同一个 prompt 的多个采样是排成 ABAB 还是 AABB。<b>这个顺序直接决定组内优势算得对不对</b>，是 GRPO 这类按组求基线的算法最容易错的地方。</li>
+  <li><code>DataProtoFuture</code>：只传 Ray 的对象引用、不把数据拉到 driver。理解它才明白为什么 driver 侧不能随便对数据做操作。</li>
+</ul>
+
+<p>新路径上数据怎么流动：<code>verl/utils/transferqueue_utils.py</code> 的 <code>tqbridge</code> 装饰器在 worker 边界上把元数据和真实张量互相转换，而它是在 <code>verl/single_controller/base/decorator.py</code> 里<b>无条件</b>套到每个 <code>@register</code> 方法上的。含义是：driver 和 worker 之间传的是<b>元数据</b>，worker 自己去分布式存储取张量。所以排查数据问题时，<b>driver 上打印不出真实张量</b>，得在 worker 侧看。</p>
+
+<p><b>数据集层</b>（<code>verl/utils/dataset/rl_dataset.py</code>）有一个反直觉的事实：<code>RLHFDataset.__getitem__</code> <b>不做分词</b>，只返回原始消息，分词已经搬到 agent 循环里去了（因为多轮对话的 token 要按轮次增量拼，数据集这一层看不到对话会怎么长）。它返回的 <code>dummy_tensor</code> 纯粹是为了满足「批次里至少得有一个张量」这个旧约束。</p>
+<p>分词只在一个地方还发生：<code>maybe_filter_out_long_prompts</code> 在加载时试算长度，把超长的行直接丢掉（<code>filter_overlong_prompts</code> 默认 <b>True</b>）。它刻意用和 agent 循环一样的方式加载工具定义，好让估算的 token 数和实际一致。</p>
+
+<div class="box warn"><b>勘误</b>（2026-11-12 画时序图时查出）：本节原先写「真正的截断在 <code>verl/utils/torch_functional.py</code> 的 <code>postprocess_data</code>」，<b>这是错的</b>。那个函数和它的包装 <code>tokenize_and_postprocess_data</code> <b>全仓没有任何调用方</b>，是 agent loop 化之后留下的死代码（<code>verl/utils/ulysses.py</code> 里有个同名方法，但那是 sharding manager 的，不相干）。
+<br><br>
+真正的截断在 <b>agent 循环里</b>：prompt 侧是 <code>AgentLoopBase._cap_text_prompt_length</code>，超长就取末尾（左截断）——而多模态 prompt 会直接<b>抛错</b>，因为占位 token 必须和多模态输入严格一一对应，截断会错位；response 侧则是生成后按 <code>response_length</code> 切片。</div>
+
+<p>关于形状和布局，有一个开关的影响面比它的名字大得多：<b><code>use_remove_padding</code></b>（默认 <code>True</code>）。它决定交给注意力核的是哪种布局——开则把一个微批里的所有序列首尾相接拼成一条（没有 pad 参与计算，边界靠 <code>cu_seqlens</code> 记录），关则补齐成规整矩阵（pad token 要跟着走完整个前向）。它还连带决定另外四样东西能不能用，详见<a href="arch/seq-data-layout.html">数据形状与布局变换</a>那张时序图。<b>两个坑</b>：生效值会被 model 配置覆盖 engine 配置（代码注释自认 <i>not elegant</i>），所以两处都得设；以及 <code>CP&gt;1</code> 时它<b>必须为 True</b>，否则启动即报错（见第 5 节）。</p>
+
+<p><b>一个容易忽略但会毁掉 resume 的点</b>：数据加载器用的是 <code>torchdata</code> 的 <code>StatefulDataLoader</code>，采样器也必须用它配套的 <code>RandomSampler</code>。<code>verl/trainer/ppo/utils.py</code> 里有注释说明原因——标准库的 <code>RandomSampler</code> 恢复不出正确状态。所以自定义数据加载时如果换回标准采样器，训练能跑，但<b>断点恢复之后数据顺序是错的</b>，而且不会报错。</p>
+
+<p><b>要做的</b>：构造一个 2 prompt × 2 采样的极小批次，把每一步的形状、<code>response_mask</code>、优势打出来，和手算对一遍。这个练习的价值在于：以后任何掩码类问题，你都有一个已知正确的参照。</p>
+
+<h3 id="s4">④ FSDP 作为对照系</h3>
+
+<p class="meta">要建立的判断力：遇到一个问题，能设计出「换一个后端看还在不在」的二分实验。</p>
+
+<p>为什么需要：定位最有效的手段是二分，而二分需要第二套实现。你现在只有 Megatron 一条路，一旦出问题，「通用逻辑错了」和「Megatron 特有问题」区分不开。FSDP 还有个实际好处——能在很少的卡上跑起来，迭代快。</p>
+
+<div class="box note"><b>这个 fork 的结构和上游老版本不同</b>：没有 <code>fsdp_workers.py</code> 或 <code>megatron_workers.py</code> 这种按后端分的 worker 文件。两个后端都实现同一个接口 <code>verl/workers/engine/base.py</code> 的 <code>BaseEngine</code>，由 <code>EngineRegistry</code> 按「模型类型 + 后端 + 设备」三个键查表选出来（插课 F 讲过这个查表），上面统一由 <code>verl/workers/engine_workers.py</code> 驱动。
+<br><br>
+所以<b>换后端真的只是换一个配置字符串</b>，worker 代码不变——这正是它能当对照系的前提。</div>
+
+<p>读的顺序：先 <code>engine/base.py</code> 的 <code>BaseEngine</code> 看契约有哪些方法（<code>initialize</code>、<code>train_mode</code> / <code>eval_mode</code>、<code>forward_backward_batch</code>、<code>to</code> 做搬运、<code>get_per_tensor_param</code> 系列导出权重给推理侧），再 <code>engine/fsdp/transformer_impl.py</code> 看 FSDP 怎么实现它，最后和 <code>engine/megatron/transformer_impl.py</code> 对照。</p>
+
+<p>FSDP 侧值得理解的几个旋钮，它们的共性是<b>都在拿通信换显存</b>（这也是为什么它们属于显存账而不是时间账）：</p>
+<table>
+  <tr><th>配置项</th><th>作用</th><th>代价</th></tr>
+  <tr><td><code>fsdp_size</code></td><td>参数在多少张卡之间切；<code>-1</code> 表示全部</td><td>切得越散，每次用参数时要聚合的范围越大</td></tr>
+  <tr><td><code>reshard_after_forward</code></td><td>前向用完是否立刻把参数散回去</td><td>散回去省显存，但反向要再聚合一次</td></tr>
+  <tr><td><code>param_offload</code> / <code>optimizer_offload</code></td><td>参数、优化器状态挪到主机内存</td><td>省显存最多，但每步要来回搬</td></tr>
+  <tr><td><code>use_no_sync_for_gradient_accumulation</code></td><td>梯度累积期间不做同步，只在最后一次同步</td><td>累积期间梯度不是全局的，显存要多留一份</td></tr>
+  <tr><td><code>ulysses_sequence_parallel_size</code></td><td>沿序列切分（对应 Megatron 的 CP）</td><td>注意力处要额外通信</td></tr>
+  <tr><td><code>pad_to_length</code> + <code>pad_to_length_bucket</code></td><td>把打包后的长度向上取整到桶的整数倍</td><td>算一点无用 token，换来<b>形状种类变少</b>，避免核反复重编译和自动调优</td></tr>
+</table>
+
+<p>最后那一项值得单独说：它优化的不是计算量，而是<b>形状的多样性</b>。动态长度会让底层每遇到新形状就重新编译或重新调优，开销出现在 CPU 侧和首次执行上，从总 FLOPs 看不出来。<b>这是一类很容易被忽略的优化方向</b>——凡是「每步形状都不一样」的地方都值得查一下有没有这种开销。</p>
+
+<p><b>要做的</b>：拿一个 0.6B 级别的小模型，用 FSDP + vLLM 跑通两步训练（<code>tests/special_e2e/</code> 下有现成脚本可以照着改）。目标不是训出东西，是建立一个<b>已知能跑通的参照环境</b>。以后怀疑任何问题，先在这里复现一次。</p>
+
+<h3 id="s5">⑤ 算法层</h3>
+
+<p class="meta">要建立的判断力：看到「奖励不涨」，能分清是算法配置选得不对、还是实现有 bug、还是根本不是算法问题。</p>
+
+<p>好消息：算法层<b>几乎全在一个文件</b>——<code>verl/trainer/ppo/core_algos.py</code>（约 2600 行）。两个注册表、所有优势估计器、所有损失函数、两种 KL、损失聚合都在里面。</p>
+
+<p>结构是「注册表 + 装饰器」：<code>@register_adv_est</code> 把优势估计器登记进 <code>ADV_ESTIMATOR_REGISTRY</code>，<code>@register_policy_loss</code> 把损失登记进 <code>POLICY_LOSS_REGISTRY</code>，配置里的字符串按名字查出函数。登记只靠 import 时的副作用，所以<b>自定义算法必须在 trainer 解析名字之前被 import 到</b>——这是接自己算法时最常见的坑。</p>
+
+<p>目前可选项：<b>14 个优势估计器</b>（<code>gae</code>、<code>grpo</code>、<code>reinforce_plus_plus</code>、<code>rloo</code>、<code>remax</code>、<code>opo</code>、<code>grpo_passk</code>、<code>gpg</code>、<code>gdpo</code> 以及几个向量化版本和 token 基线版本），<b>12 种损失模式</b>（<code>vanilla</code> 是默认的 PPO 截断，另有 <code>gspo</code> 做序列级比值、<code>cispo</code>、<code>geo_mean</code>、<code>dro</code>、<code>clip_cov</code> / <code>kl_cov</code>、<code>sapo</code>、<code>dppo_tv</code> / <code>dppo_kl</code> 等）。选择点只有一处：<code>verl/workers/utils/losses.py</code> 的 <code>ppo_loss</code> 读 <code>actor.policy_loss.loss_mode</code> 查表。</p>
+
+<div class="box key"><b>有两个 KL，不要混为一谈</b>——这是算法配置里最常见的误解：
+<ul>
+  <li><b>奖励里的 KL</b>（<code>algorithm.use_kl_in_reward</code>）：在奖励上减一个与参考模型的偏离惩罚，由一个控制器调系数（固定的或自适应的）。它改变的是<b>优化目标</b>。</li>
+  <li><b>损失里的 KL</b>（<code>actor.use_kl_loss</code>）：直接在损失上加一项。它改变的是<b>梯度</b>。</li>
+</ul>
+两个可以同时开，那样惩罚会加两次。另外 <code>kl_penalty</code> 的估计方式有 <code>k1</code> / <code>k2</code> / <code>k3</code> 几种（方差和偏差的不同取舍），带 <code>+</code> 后缀（如 <code>k3+</code>）是个技巧：<b>前向用这个估计量的值，反向用无偏的 k2 梯度</b>。看到配置里带加号不要以为是笔误。</div>
+
+<p>第四课已经讲透 <code>prompt-mean</code> 这一种聚合。<code>agg_loss</code> 一共六种（<code>token-mean</code>、<code>token-sum</code>、<code>prompt-mean</code>、<code>seq-mean-token-sum</code>、<code>seq-mean-token-sum-norm</code>、<code>seq-mean-token-mean</code>）。值得补齐，因为<b>聚合方式决定了长回答和短回答谁的权重大</b>，它对训练结果的影响常常比换算法更大，而且完全不报错。</p>
+
+<p><b>要做的</b>：跑 <code>tests/trainer/ppo/</code> 下的 CPU 测试（<code>test_core_algos_on_cpu.py</code> 测的就是注册表本身的契约，<code>test_loss_aggregation_on_cpu.py</code> 和 <code>test_prompt_mean_loss_on_cpu.py</code> 测聚合）。这些测试无卡可跑，是最便宜的可执行规格说明——<b>读测试比读实现快，因为测试直接告诉你边界在哪</b>。</p>
+
+<h3 id="s6">⑥ 推理引擎与训推一致</h3>
+
+<p class="meta">要建立的判断力：能量化训练侧和推理侧的分歧有多大，并判断这个量级是否正常。</p>
+
+<p>这是 agent RL 里最隐蔽的一类问题。训练用 Megatron 算 log_prob，生成用 vLLM 或 SGLang，两者的核、精度、批处理方式都不同，所以<b>一定有差异</b>——问题是多大算正常。差异过大时策略梯度的比值就不再接近 1，PPO 的截断会被频繁触发，表现出来只是「学不动」，不报错。</p>
+
+<div class="box key"><b>仓库里有现成的探针</b>：<code>scripts/rollout_logprob_diff.py</code>。它用 vLLM 或 SGLang 跑一遍生成，再用 Megatron 重算 <code>old_log_probs</code>，报告两者的差距，<b>超过 <code>--max-k3-kl</code> 阈值就非零退出</b>（所以它可以直接当门禁用）。
+<br><br>
+配套的在线诊断在 <code>verl/utils/debug/metrics.py</code>：<code>calculate_log_prob_diff</code> 和 <code>pearson_correlation_coefficient</code>，训练过程中就能看到这个分歧。
+<br><br>
+<b>建议现在就为自己的模型测一个基线值</b>。有了基线，以后换量化、换引擎版本、改并行布局，都能立刻知道有没有把一致性弄坏——而不是等奖励曲线不对了再回头猜。</div>
+
+<p>要做可复现的对比时，有两个开关：<code>VERL_FULL_DETERMINISM</code>（配合 <code>VERL_SEED</code>）和 <code>VLLM_BATCH_INVARIANT</code>。后者针对的是一个很反直觉的现象：<b>同一条请求，和别的请求一起批处理时，算出的结果和单独跑不完全一样</b>（归约顺序变了）。查训推不一致时这是必须排除的干扰项。</p>
+
+<p>引擎接入方式在 <code>verl/workers/rollout/</code>，枢纽是 <code>replica.py</code>：<code>RolloutMode</code> 三种模式（<code>hybrid</code> 和训练引擎共进程、<code>colocated</code> 同一组卡但独立进程、<code>standalone</code> 独占卡）、<code>RolloutReplica</code> 抽象，注册了 <code>vllm</code> / <code>sglang</code> / <code>trtllm</code> 三个后端。插课 E 已经走过 <code>standalone</code> 那条，另两条可以对照着看。</p>
+
+<p>一个值得知道的实现细节：verl <b>没有自己写 OpenAI 兼容的路由</b>，而是直接 import vLLM 自己的 <code>api_server</code> 把应用建起来（<code>vllm_async_server.py</code>）。好处是协议细节不会漂，代价是 vLLM 升级时这个接口的签名变化会直接打到 verl——代码里因此有按版本分支的调用。<b>这解释了为什么 vLLM 的版本是硬约束而不是建议</b>。</p>
+
+<h3 id="s7">⑦ 依赖栈的内部</h3>
+
+<p class="meta">要建立的判断力：给一个卡住不动的训练，能定位到是哪个 rank 卡在哪一行。</p>
+
+<p>到这一步才向下走，是因为前面几个阶段会不断把问题推到这一层，带着具体问题来读比空读有效得多。</p>
+
+<p><b>Ray</b>——verl 用它做进程编排。要掌握的不是 Ray 的全部，而是四件事：actor 的生命周期和失败语义（<b>verl 这边几乎没有容错</b>，所以 actor 挂了就是作业挂了）、placement group 怎么把 worker 钉到指定的卡上、对象存储什么时候会把数据落盘、以及 dashboard 和日志目录的位置。<code>verl/single_controller/ray/base.py</code> 是 verl 对 Ray 的全部用法，读它比读 Ray 文档更对口。</p>
+
+<p><b>抓卡死</b>——这是最该先练熟的一项技能，因为它最常见也最容易无从下手。<code>py-spy</code> 已经在测试依赖里（<code>pyproject.toml</code> 的 <code>test</code> 和 <code>cpu</code> extra）。办法是对每个 worker 进程 <code>py-spy dump</code>，看各自停在哪。<b>关键是比对而不是单看</b>：如果 N-1 个 rank 都停在同一个集合通信上、剩下一个停在别处，那<b>停在别处的那个才是元凶</b>——集合通信要求所有成员都到场，缺席者不报错，等待者报超时。</p>
+
+<p><b>torch.distributed</b>——重点是通信域<b>惰性创建</b>这件事（插课 G 已经踩过）：建一个组的开销和显存占用发生在<b>第一次真正用它</b>的时候，不是声明的时候。于是「反向传播才首次用到的组」和「显存峰值」会撞在一起。<code>verl/utils/distributed.py</code> 里的 <code>warmup_process_groups</code>（你自己加的那个）就是把这个时刻挪到启动阶段。</p>
+
+<p><b>通信库</b>——NCCL 和 HCCL 的调试主要靠环境变量把日志级别打开，以及理解拓扑探测的结果（哪些链路走高速互联、哪些走网络）。这块插课 G 已经有相当积累，缺的是在正常训练上也看一眼，建立「正常长什么样」的印象——<b>只在出事时看日志，就没有对照</b>。</p>
+
+<p><b>要做的</b>：在正常训练上做一次 <code>py-spy dump</code> 全量采集，存下来。这是「正常状态」的快照，下次卡死时拿来对比。</p>
+
+<h3 id="s8">⑧ checkpoint 与长稳</h3>
+
+<p class="meta">要建立的判断力：能存一次、断一次、恢复一次，并验证恢复后指标是连续的。</p>
+
+<div class="box warn"><b>先避开一个命名陷阱，不然会找错文件</b>：
+<ul>
+  <li><code>verl/utils/checkpoint/</code> 是<b>磁盘</b> checkpoint——存到硬盘、断点恢复。</li>
+  <li><code>verl/checkpoint_engine/</code> <b>不是</b>磁盘 checkpoint，它是<b>训练侧和推理侧之间的权重同步层</b>（发权重、收权重），对应你已经学过的 arch/verl-weight-sync 那张图。</li>
+  <li>更要命的是：trainer 里的 <code>self.checkpoint_manager</code> 是 <code>CheckpointEngineManager</code>，<b>属于后者</b>（权重同步）。它有 <code>update_weights()</code> / <code>sleep_replicas()</code> 这类方法。trainer 从磁盘 checkpoint 那个模块只 import 了一个 <code>find_latest_ckpt_path</code>。</li>
+</ul>
+两套不相干的子系统，名字几乎一样。我已核对过 <code>verl/trainer/ppo/v1/trainer_base.py</code>，确实如此。</div>
+
+<p>磁盘侧的编排者是 <code>verl/utils/checkpoint/checkpoint_handler.py</code> 的 <code>CheckpointHandler</code>，按后端分 <code>FSDPCheckpointManager</code> 和 <code>MegatronCheckpointManager</code>。存什么由 <code>save_contents</code> 控制（默认模型、优化器、额外状态；可选导出 HuggingFace 格式）。</p>
+
+<p>Megatron 侧的目录布局有个设计值得学：根目录下的 <code>ckpt_contents.json</code> 清单由 rank 0 <b>最后</b>写。于是<b>它存在就意味着这份 checkpoint 是完整的</b>——异步保存时这是唯一可靠的完整性信号。自己写工具扫 checkpoint 时应该依赖这个文件，而不是看目录是否存在。</p>
+
+<p>恢复有两个坑：</p>
+<ul>
+  <li>数据加载器状态按数据并行 rank 存成单独文件，依赖 <code>StatefulDataLoader</code>（阶段 ③ 提过）。</li>
+  <li><b>在 epoch 边界上恢复时，数据加载器状态会被刻意跳过</b>（旧 trainer 里有这个判断）。这是有意的，但如果不知道，会以为恢复坏了。</li>
+</ul>
+
+<p><code>verl/model_merger/</code> 是把切碎的 checkpoint 合回 HuggingFace 格式的工具（<code>python -m verl.model_merger merge --backend megatron ...</code>），模型很大时支持多进程合并。训练完要把模型拿出去用，走的是这里。</p>
+
+<h3 id="s9">⑨ 从账本到优化</h3>
+
+<p class="meta">要建立的判断力：提出一个优化点，能先算出预期收益、再用实验验证，并且带测试。</p>
+
+<p>到这一步，三本账已经有真实数据了。优化点子来自账上的不合理支出，常见的几类：</p>
+<ul>
+  <li><b>显存账上的「惰性创建撞上峰值」</b>——把通信域的建立挪到启动阶段（你已经做了）。这类优化的特征是<b>不改变任何计算，只改变发生的时刻</b>。</li>
+  <li><b>通信账上的「组跨出了节点」</b>——调整并行布局让某个维度的组收进节点内。代价要一起算（插课 G §13 算过，收进节点内要付激活显存的代价）。</li>
+  <li><b>时间账上的「在等别人」</b>——异步模式的三个 switch 阶段就是这类支出的读数。</li>
+  <li><b>形状多样性</b>——阶段 ④ 的 <code>pad_to_length</code> 那一类，优化的是编译和调优开销，在 FLOPs 账上看不见。</li>
+</ul>
+
+<p>做之前先读官方的现成结论，避免重复发明：<code>docs/perf/</code> 下有七篇（<code>perf_tuning.rst</code> 覆盖生成调优、序列打包、批大小、Ulysses 序列并行、FSDP 预取和梯度同步；<code>device_tuning.rst</code> 给了 0.5B 到 671B 各档的硬件需求参考；<code>best_practices.rst</code> 是 Qwen3-235B 上 DAPO 的实践；另有 Nsight 和 torch profiler 的使用说明、<code>verl_profiler_system.md</code> 讲 profiler 体系怎么扩展）。<code>docs/advance/</code> 下还有 25 篇，其中 <code>determinism.md</code>、<code>rollout_trace.rst</code>、<code>one_step_off.md</code>、<code>fully_async.md</code> 和这条路线最相关。</p>
+
+<p><b>改动要带测试</b>。测试的约定是<b>按文件名后缀分</b>，没有 pytest 标记：<code>*_on_cpu.py</code> 无卡可跑（仓库里有 163 个），其余默认当作需要 GPU，<code>*_on_npu.py</code> 是昇腾专用。你在插课 G §14 加的两个 gloo CPU 测试正好符合这个约定——<b>用 gloo 后端在 CPU 上测分布式逻辑，是这个仓库里验证通信相关改动的标准做法</b>。</p>
+
+<p>要提到上游时，先读仓库根目录的 <code>CLAUDE.md</code>：它要求查重（已有 PR 就不要再开）、不接受纯粹的琐碎改动、并且 PR 描述里必须写明测试命令与结果、以及用了 AI 协助。</p>
+
+<h2 id="r5">5. 故障现象 → 定位路径</h2>
+
+<p>这一节是第 2 节那张表的「按现象查」版本。每条的结构是：<b>先做什么（最快排除伪装）→ 再做什么 → 常见归属</b>。</p>
+
+<table>
+  <tr><th>现象</th><th>定位路径</th></tr>
+  <tr>
+    <td><b>报 OOM</b></td>
+    <td>① <b>先看有没有分配统计量</b>（<code>Tried to allocate … reserved in total</code>）。没有就不是张量显存问题，调 batch 全是白费——去查通信域建立和网卡资源。<br>② 有统计量：开 <code>torch_memory</code> profiler 看构成，分清是权重、激活还是碎片。<br>③ 注意 <code>reserved</code> 和 <code>allocated</code> 的差：差得多说明分配器攥着缓存不还，而通信库拿不到这部分。</td>
+  </tr>
+  <tr>
+    <td><b>卡住不动</b></td>
+    <td>① 对所有 worker <code>py-spy dump</code>，<b>找停的位置和别人不一样的那个 rank</b>。<br>② 多数 rank 停在集合通信 = 它们在等缺席者，别去查它们。<br>③ 如果所有 rank 都停在同一处，查这个通信域是不是第一次被使用（惰性创建 + 建链失败）。<br>④ 全在 Python 逻辑里 = 看驱动层，可能在等数据。</td>
+  </tr>
+  <tr>
+    <td><b>比预期慢</b></td>
+    <td>① 先看<b>分阶段</b>计时，不要看总时间。<br>② 用 <code>topk_reduce_ratio_min_max</code> 看是不是个别 rank 拖后腿——是的话查那个 rank 的硬件或数据分布，不要调全局参数。<br>③ 大家都慢：看 MFU。MFU 高 = 真在算，要从算子和精度下手；MFU 低 = 在等，查通信账和 switch 阶段。<br>④ 异步模式先看三个 switch 阶段的占比。</td>
+  </tr>
+  <tr>
+    <td><b>奖励不涨 / 学不动</b></td>
+    <td>① <b>先量训推一致性</b>（<code>rollout_logprob_diff.py</code>），这是最容易被忽略又最常见的原因。<br>② 再查数据平面：极小批次手工核对掩码和优势，特别注意同一 prompt 多采样的排列顺序。<br>③ 最后才怀疑算法配置：聚合方式、两个 KL 是否重复开、损失模式。<br>④ 顺序很重要——倒过来查会在算法上浪费很多时间。</td>
+  </tr>
+  <tr>
+    <td><b>某个参数设了没反应</b></td>
+    <td>按阶段 ② 的三步：查展平后的 yaml 有没有这个键 → 搜有没有读取方 → 搜有没有被运行时改写。</td>
+  </tr>
+  <tr>
+    <td><b>改了布局开关就启动失败 / 性能突变</b></td>
+    <td>① <code>use_remove_padding</code> 是一组硬约束的中心。关掉它会<b>报错</b>的：Ulysses 序列并行、动态上下文并行、per-token 损失；会被<b>静默关掉</b>的：融合输出头（只打一行 warning，长序列下 logits 显存因此突然变大）。<br>② <b><code>CP&gt;1</code> 时它必须为 True</b>：per-token 损失在 CP&gt;1 时由 Megatron-Bridge 自动开启，而它硬性要求 THD 布局，配 False 会直接 <code>raise ValueError</code>。报错信息自己给的两个选项是「用 THD」或「关掉 CP」。<br>③ 机制：BSHD 下 verl 不给 MoE router 传 padding mask，router 按含 pad 的 <code>B×S</code> 归一化辅助损失，而梯度按真实 token 数除——代码注释说这正是 <code>CP&gt;1</code> 时 <b>grad_norm 暴涨到 ~1e4</b> 的原因。<br>④ 生效值会被 model 配置覆盖 engine 配置，所以<b>两处都要设</b>，只改一处会让人以为没生效。</td>
+  </tr>
+  <tr>
+    <td><b>偶发失败、重跑就好</b></td>
+    <td>① 分清是<b>资源竞争</b>（显存、端口、网卡配额）还是<b>真随机</b>。<br>② 用确定性开关（<code>VERL_FULL_DETERMINISM</code> + 固定种子）看还能不能复现：不能复现 = 和随机性有关；仍然偶发 = 资源或时序。<br>③ 注意外部依赖：这个分支的 agent 环境要起 pod、调 k8s API，那边的超时和断连会表现成偶发（插课 A 已记过一个这样的 bug）。</td>
+  </tr>
+  <tr>
+    <td><b>恢复后指标跳变</b></td>
+    <td>① 查数据加载器状态是否真的恢复了（epoch 边界上会被<b>刻意跳过</b>）。<br>② 查采样器是不是 <code>StatefulDataLoader</code> 配套的那个。<br>③ 查 checkpoint 是否完整——Megatron 侧看 <code>ckpt_contents.json</code> 在不在。</td>
+  </tr>
+</table>
+
+<h2 id="r6">6. 依赖栈的版本现实</h2>
+
+<p>这一节单独列，因为<b>版本错配会表现成千奇百怪的运行时错误</b>，而真实的版本约束不在你第一眼会去看的那个文件里。</p>
+
+<div class="box warn"><b><code>setup.py</code> 不是真实依赖源</b>。它是 fallback，而且已经落后：里面写 <code>vllm&gt;=0.18.0</code>、<code>sglang==0.5.8</code>。真正生效的是 <code>pyproject.toml</code>——那里是 <code>vllm==0.32.0</code>、<code>sglang==0.5.20</code>、统一 <code>torch==2.13.0</code>（cu130）。<b>查版本只认 <code>pyproject.toml</code> 和 <code>uv.lock</code>。</b></div>
+
+<p>依赖是用一个办法解决「多后端互相冲突」的：<b>一个 lock 文件，每个后端是一个 extra，互斥的后端声明成冲突组</b>，于是一次解析就能把所有组合都算出来，运行时只装其中一个无冲突的组合。可选的后端组合：</p>
+<table>
+  <tr><th>extra</th><th>是什么</th></tr>
+  <tr><td><code>fsdp</code> / <code>megatron</code> / <code>veomni</code> / <code>torchtitan</code></td><td>四个训练后端。<code>veomni</code> 是 FSDP 引擎的子类，用的是同一套原生栈</td></tr>
+  <tr><td><code>vllm</code> / <code>sglang</code></td><td>两个推理后端（<code>trtllm</code> 已接入但在依赖上被推迟）</td></tr>
+  <tr><td><code>cpu</code></td><td><b>无 GPU 的开发和测试环境</b>，见下一节</td></tr>
+  <tr><td><code>ci</code></td><td>CI 叠加用</td></tr>
+</table>
+<p>正常跑训练不需要手工安装：<code>uv run --frozen --all-packages --extra megatron --extra vllm python3 -m verl.trainer.main_ppo ...</code> 会按 lock 文件自己把环境准备好，Ray 的 worker 也指向同一个环境。<code>manage_envs.py</code> 管的是 lock 文件之外的事（重新生成 lock、并存多个环境、预热 Docker 缓存）。</p>
+
+<p>Megatron 这条线依赖的外部组件比看起来多：<code>megatron-core</code>、<code>megatron-bridge</code>、<code>transformer-engine</code>、<code>apex</code>、<code>deep-ep</code>（MoE 分发）、<code>flash-linear-attention</code>（Qwen3.5 那个门控线性注意力的核）、<code>megatron-energon</code>、<code>nvidia-modelopt</code>。<b>其中好几个是「不声明自己依赖」被装进来的</b>（在依赖元数据里被显式清空），所以它们的间接依赖得由 verl 这边手工列出——这就是为什么 <code>pyproject.toml</code> 里有那么多解释性注释。<b>升级其中任何一个之前先读那些注释</b>，它们记录的是上一次踩过的坑。</p>
+
+<div class="box note"><b>两条互斥的线</b>：CUDA 线要 vLLM 0.32.0，昇腾线（<code>docker/ascend/</code>）要的是另一个版本的 vllm-ascend。这两个版本不可能同时满足，所以 <code>third_party/</code> 下只保留了一份。注意 <code>docs/learning-mimo/arch/index.html#pins</code> 那张版本钉子表记的是<b>当时</b>把十个外部依赖都 clone 进来的状态，现在 <code>.gitmodules</code> 里只剩 <code>mimoagent-osr</code> 和 <code>uni_agent</code> 两个（commit <code>947133c6</code> 做的精简），表里的版本号还可以当参考，但别指望能在本地找到对应目录。另外 <code>megatron-bridge</code> 现在是 0.6.2，那张表里写的 0.5.0 已经旧了。</div>
+
+<h2 id="r7">7. 没有卡的时候能做什么</h2>
+
+<p>这一节很实际：路线里相当一部分是无卡可做的，不必等机器空出来。</p>
+<table>
+  <tr><th>能做</th><th>怎么做</th></tr>
+  <tr><td><b>163 个 CPU 测试</b></td><td><code>cpu</code> extra 里带了<b>纯 CPU 版的 <code>megatron-core</code></b>（没有 TE 和 apex 也能 import，有纯 torch 的兜底），所以连 verl 对 Megatron 的接线逻辑都能在无卡环境验证。跑法：<code>pytest -s -x --asyncio-mode=auto</code> 指向任意 <code>*_on_cpu.py</code>。</td></tr>
+  <tr><td><b>算法层全部</b></td><td><code>tests/trainer/ppo/*_on_cpu.py</code> 是自包含的。阶段 ⑤ 整个可以无卡完成。</td></tr>
+  <tr><td><b>配置层全部</b></td><td><code>scripts/print_cfg.py</code> 和 <code>_generated_*.yaml</code> 都不需要卡。阶段 ② 整个可以无卡完成。</td></tr>
+  <tr><td><b>数据平面的形状核对</b></td><td>分词、掩码拼接、padding 这些都是 CPU 上的张量操作。</td></tr>
+  <tr><td><b>一致性自检</b></td><td><code>pytest -s -x tests/special_sanity</code>——里面是许可证头、docstring、API 文档、目录结构镜像、设备 API 用法等元检查，大部分也挂在 pre-commit 上。<b>改代码前先跑一次</b>，省掉来回。</td></tr>
+  <tr><td><b>分布式逻辑</b></td><td>用 gloo 后端在 CPU 上测，你在插课 G §14 已经这么做过。</td></tr>
+</table>
+
+<div class="box note"><b>关于 CI</b>：<code>.github/workflows/</code> 下的作业都带 <code>github.repository_owner == 'verl-project'</code> 这个条件，所以<b>在这个 fork 里它们不会执行</b>。本地自测就是唯一的保障，不能指望推上去让 CI 跑。另外这个 fork 的 <code>e2e_ppo_trainer.yml</code> 已经被精简过，FSDP 的端到端作业不在了，Megatron 那几个变体还留着真实作业。</div>
+
+<h2 id="r8">8. 官方 main 的新进展</h2>
+
+<p>这次把 <code>main</code> 从 <code>689fa1a2</code> 更新到 <code>81464bb6</code>，相对你当前工作分支有 22 个它独有的提交。其中<b>和你手上的昇腾长序列训练直接相关</b>的几条，值得优先看：</p>
+
+<table>
+  <tr><th>提交</th><th>为什么值得看</th></tr>
+  <tr><td><code>14535ee1</code> 让参考模型权重常驻（昇腾 Qwen3.5-35B GRPO）</td><td>显存账上的取舍：参考模型不再反复搬进搬出。和你的显存账直接相关。</td></tr>
+  <tr><td><code>1d4194cb</code> 昇腾 A3 上用 MTP 投机解码 + 生成调优加速 Qwen3.5-35B</td><td>生成侧的加速手段，并且带了端到端 CI。注意它开的是 MTP——而插课 G §15 的结论是你的 27B 场景应该<b>关掉</b> MTP 层（<code>mtp_num_layers=0</code>）。<b>两者不矛盾：那边是把 MTP 用于投机解码加速生成，这边是不让它在训练侧建出多余的层。</b>读的时候留意它在哪一侧开。</td></tr>
+  <tr><td><code>482f86fd</code> 允许 vllm-ascend ≥0.30.0 使用 sleep level 2</td><td>共卡时推理侧让出显存的力度更大一档。</td></tr>
+  <tr><td><code>f3b9d3d9</code> 删掉过时的 vLLM-Ascend 补丁垫片</td><td><b>直接影响你那张 <code>arch/verl-npu.html</code> 补丁分层图</b>——补丁层少了一部分，图该更新。</td></tr>
+  <tr><td><code>1e125260</code> 对齐昇腾 CANN 与 Megatron 依赖版本</td><td>版本钉子变了，和第 6 节相关。</td></tr>
+  <tr><td><code>2b4ed682</code> 批次不变的 actor 前向与采样器 log_prob 公式</td><td><b>正是阶段 ⑥ 那个「同一条请求单独跑和混批跑结果不同」的问题</b>，上游在正面解决它。做训推一致性基线之前应该先读这个。</td></tr>
+  <tr><td><code>4b396702</code> 不再给每个 Ray worker 套用默认线程数</td><td>CPU 线程数设置不当会拖慢数据侧，属于时间账。</td></tr>
+  <tr><td><code>b363245c</code> Megatron actor 上的分数中心化 / <code>3ba1e05d</code> 把全填充行从逐序列指标里排除</td><td>一个是算法层新增项，一个是指标计算的修正——后者属于「指标本身算错了」这类最容易误导判断的 bug。</td></tr>
+  <tr><td><code>5c5ab4b2</code> v1 同步 PPO 支持自定义数据加载器</td><td>和阶段 ③ 相关；注意自定义时别丢掉可恢复采样器。</td></tr>
+</table>
+
+<p class="meta">当前分支和官方 main 的关系：各自有 19 和 22 个独有提交。要不要并，取决于你是想先稳住 262K 那条实验，还是先吃到上面这些昇腾改动——这是个取舍，不是技术问题，路线里不替你决定。</p>
+
+<h2 id="r9">9. 这份路线的边界</h2>
+
+<p>把没做到的地方说清楚，免得当成结论用：</p>
+<ul>
+  <li><b>没有实际运行验证。</b>这份路线里的代码位置、配置键名、测试约定，来自对当前 checkout 的检索和阅读；<code>use_v1</code> 默认值、<code>checkpoint_manager</code> 的真实类型、CPU 测试数量这三项我单独核对过，其余的符号名和路径没有逐个跑起来确认。</li>
+  <li><b>行号基本没写。</b>有意的——符号名比行号稳。需要精确定位时用符号名去搜。</li>
+  <li><b>阶段 ⑦ 最弱。</b>Ray 和通信库的内部，这里给的是「该掌握哪几件事」和入口，不是讲解。那部分得带着具体故障去读，空读留不住。</li>
+  <li><b>没有排时间。</b>九个阶段的工作量很不均：② 和 ⑤ 可能各一两天，③ 和 ④ 要动手跑，⑦ 可以无限深入。按缺口的优先级走，不必按顺序走完。</li>
+  <li><b>第 8 节的提交只读了标题和改动范围</b>，没有逐个读 diff。要依赖其中某一条时，先自己看代码。</li>
+</ul>
+
+<div class="box key"><b>如果只能做三件事</b>：阶段 ① 把测量配齐（尤其 <code>torch_memory</code> 的 OOM 自动快照，它直接补上插课 G 缺的证据）、阶段 ② 把配置查法固化成习惯、阶段 ⑥ 为自己的模型测一个训推一致性基线。这三件的共同点是<b>都在建立判据</b>——判据一旦有了，后面的问题从「猜」变成「测」。</div>
+
+</main>
+</body>
+</html>
