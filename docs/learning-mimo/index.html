@@ -42,7 +42,7 @@
     <li><a href="arch/index.html">地图索引（总入口）</a></li>
     <li><a href="arch/seq-init-overview.html"><b>时序：初始化总览</b></a></li>
     <li><a href="arch/seq-train-step.html"><b>时序：训练一步</b></a></li>
-    <li><a href="arch/index.html#seq">时序：六张子流程</a></li>
+    <li><a href="arch/index.html#seq">时序：七张子流程</a></li>
     <li><a href="arch/verl-init.html">初始化总分图</a></li>
     <li><a href="arch/verl-train-loop.html">训练主循环与三模式</a></li>
     <li><a href="arch/verl-ppo-step.html">训练步九阶段</a></li>
@@ -269,7 +269,7 @@
 <h2 id="maps">流程细节地图</h2>
 <p>与上面「各课要点」不同，这一组是<b>可随时查阅的参考地图</b>，不按学习顺序组织。总入口：<a href="arch/index.html"><b>地图索引</b></a>。里面分两类，视角不同：</p>
 <ul>
-  <li><b><a href="arch/index.html#seq">跨栈时序图</a>（8 张，新）</b>——回答「谁先调谁、谁等谁、跨栈边界落在哪」。泳道从左到右大致就是软件栈从上到下，<b>覆盖 verl 之外的依赖</b>：Ray、torch.distributed、Megatron-Core / Bridge、NCCL / HCCL、vLLM / SGLang、CUDA / CANN 与硬件。两张整体（<a href="arch/seq-init-overview.html">初始化</a>、<a href="arch/seq-train-step.html">训练一步</a>）+ 六张子流程（worker 启动与通信域、一次生成请求、<b>数据形状与布局变换</b>、actor 更新、权重同步两条路、<b>推理 PD 分离部署</b>）。</li>
+  <li><b><a href="arch/index.html#seq">跨栈时序图</a>（9 张，新）</b>——回答「谁先调谁、谁等谁、跨栈边界落在哪」。泳道从左到右大致就是软件栈从上到下，<b>覆盖 verl 之外的依赖</b>：Ray、torch.distributed、Megatron-Core / Bridge、NCCL / HCCL、vLLM / SGLang、CUDA / CANN 与硬件。两张整体（<a href="arch/seq-init-overview.html">初始化</a>、<a href="arch/seq-train-step.html">训练一步</a>）+ 七张子流程（worker 启动与通信域、一次生成请求、<b>数据形状与布局变换</b>、actor 更新、权重同步两条路、<b>推理 PD 分离部署</b>、<b>1F1B 流水线调度</b>）。</li>
   <li><b>模块地图（9 张）</b>——回答「谁是谁的一部分」，按模块切分，每个节点带源码引用。</li>
 </ul>
 <table>
@@ -282,6 +282,7 @@
   <tr><td><a href="arch/seq-actor-update.html">时序 · actor 更新</a></td><td>集合通信的三类归属（verl 显式 / Megatron 隐式 / 优化器内部）；四个同步点；打包与切分的形状变化</td></tr>
   <tr><td><a href="arch/seq-weight-sync.html">时序 · 权重同步两条路</a></td><td>共卡传显存句柄 vs 分离部署广播；中间那道栅栏为何必要</td></tr>
   <tr><td><a href="arch/seq-pd-disagg.html">时序 · 推理 PD 分离部署</a></td><td>1 prefill + N decode 的单节点编排；vLLM 串行两段与 SGLang 并发扇出；KV 搬运；非对称 TP 下的权重同步；<b>昇腾上当前不可用</b></td></tr>
+  <tr><td><a href="arch/seq-pipeline-1f1b.html">时序 · 1F1B 流水线调度</a></td><td>warmup / 稳态 / cooldown 的真实收发配对；气泡占比与「首段攥得最多」；配对收发为何会卡死；<b>更正</b>：微批数要乘采样数 n</td></tr>
   <tr><td><a href="arch/verl-init.html">初始化总分图</a></td><td>从命令行到进入 <code>fit</code> 的六个阶段，以及 <code>_setup()</code> 十九步的真实顺序</td></tr>
   <tr><td><a href="arch/verl-train-loop.html">训练主循环与三模式</a></td><td>一个 global step 的顺序；sync / colocate_async / separate_async 的 GPU 交接差异</td></tr>
   <tr><td><a href="arch/verl-ppo-step.html">训练步九阶段</a></td><td><code>_step_once</code> 九个阶段的往返与条件分支</td></tr>
@@ -323,10 +324,12 @@
   <tr><td>更新 main 分支；给一个 verl 及配套软件栈的学习路线，目标是训练问题能快速定位 + 能有优化系统的 idea</td><td><a href="roadmap.html">学习路线</a></td></tr>
   <tr><td>绘制 verl 的 RL 初始化和训练时序图，要涉及组件与硬件、覆盖不同特性、分整体与子流程，模块要覆盖 verl 依赖的软件栈而不只是 verl</td><td><a href="arch/index.html#seq">跨栈时序图 7 张</a></td></tr>
   <tr><td>增加一个流程：推理 PD 分离部署的流程</td><td><a href="arch/seq-pd-disagg.html">时序 · 推理 PD 分离部署</a></td></tr>
+  <tr><td>增加一个 1F1B 流水线的流程</td><td><a href="arch/seq-pipeline-1f1b.html">时序 · 1F1B 流水线调度</a></td></tr>
 </table>
 
 <h2 id="todo">待学内容</h2>
 <ul>
+  <li><b>待处理（2026-11-13 查出）</b>：<a href="xg-npu-ei0007-qp-oom.html#xg-13">插课 G §13</a> 与 <a href="xg-npu-ei0007-qp-oom.html#xg-15">§15</a> 算 stage 0 激活时把微批数当成 <code>ppo_mini_batch_size</code>，漏乘了 <code>rollout.n</code>（推导见 <a href="arch/seq-pipeline-1f1b.html">1F1B 图</a>的更正卡片）。等另一个会话的 §16 提交后，在原页对应位置加勘误框，并按真实的 n 重算 §15 的显存表。</li>
   <li><b>主线已转入 <a href="roadmap.html">学习路线</a></b>：九个阶段按「先能看见 → 再能查 → 再懂数据 → 再有对照 → 再懂算法 → 再懂训推 → 再懂底座 → 再能长跑 → 最后优化」排序。缺口集中在六块：测量基础设施、数据平面、FSDP 对照路径、算法层全貌、训推一致性、checkpoint 与恢复。</li>
   <li>可选：真正的黑盒 harness（Claude Code CLI 跑在容器里）端到端走一遍，<code>examples/blackbox_recipes/claude_code/</code>。链匹配机制已在<a href="xb-uni-agent-gateway.html#xb-5">插课 B §5</a> 讲过。</li>
   <li>待处理：<a href="xd-k8s-identity.html#xd-10">pod_timeout 未使用（pod 不自动过期）</a>、<a href="xd-k8s-identity.html#xd-12">Code 路径 KUBECONFIG 可为空、会回退到节点默认凭据</a>、<a href="xd-k8s-identity.html#xd-6">Code 路径未传 K8S_NAMESPACE</a>、<a href="xc-k8s-api.html#xc-14">K8S_* 环境变量未接线</a>、<a href="xa-ray-k8s-pod.html#xa-bug">插课 A 的 pod 断连匹配失败</a>、<a href="04-actor-update.html#l4-9">length_penalty 未接线</a>（已确认暂不修改）。</li>
@@ -369,6 +372,7 @@
   图上还记了<b>三种布局依次出现</b>（一维逐样本 <code>(p+r,)</code> → 锯齿 <code>(B, j1)</code> → 打包 <code>(1, T)</code> 或补齐 <code>(B, S)</code>）与完整逆变换（聚合 → 反 zigzag → 切真实长度 → 锯齿 → 损失前变 dense <code>(B, R)</code> 并<b>左移一位</b>对齐成 token t+1 的 logprob），以及 <b>CP 的 zigzag</b>（每条补到 <code>tp×cp×2</code> 的倍数、每 rank 取首尾两块以均衡因果注意力负载）、<b>两处为形状稳定而付的 pad</b>（THD 的 <code>pad_to_length</code>+桶长默认关、BSHD 的 <code>pad_bshd_to_minibatch_max</code> 默认开，买的是「形状种类变少、少重建注意力执行计划」而不是算力）、以及<b>微批划分不改形状却决定快慢</b>（按工作量 <code>24576·l + l²</code> 而非 token 数做最大差分法分组，微批个数要在 DP 组内取最大值对齐否则集合通信错位，最后首尾交错排列压流水线气泡）。
   <b>另更正<a href="roadmap.html#s3">学习路线阶段 ③</a> 一处错</b>：原写「真正的截断在 <code>torch_functional.py::postprocess_data</code>」——该函数与其包装 <code>tokenize_and_postprocess_data</code> <b>全仓无调用方</b>，是 agent loop 化后的死代码；真正的截断在 agent 循环内（prompt 侧 <code>_cap_text_prompt_length</code> 取末尾，<b>多模态 prompt 则直接抛错</b>因占位 token 必须与多模态输入一一对应）。另记一条<b>文档与代码不符</b>：FSDP 的 <code>pad_to_length_bucket</code> 文档声称会向上取整到 SP 倍数，代码里并无此取整。七张图均通过 schema 校验、源码证据核验与真实浏览器渲染检查；<b>未做人工视觉审阅</b>。</li>
   <li>2026-11-12：新增<a href="arch/seq-pd-disagg.html"><b>推理 PD 分离部署</b></a>时序图（第 8 张）。此前<a href="arch/verl-init.html">初始化总分图</a>只画到「配置与副本数怎么算」，这张往下深挖到<b>启动编排、请求接力、KV 搬运、权重同步、睡眠唤醒</b>。<b>结构</b>：一个副本 = 1 个 prefill server + N 个 decode server，<b>不另要卡</b>——前 <code>prefill_tp</code> 张给 prefill、其后每 <code>decode_tp</code> 张给一个 decode，全部钉在训练 worker 所在的卡上；副本对外登记的地址和句柄<b>都是 prefill 的</b>，路由层看不到 decode。<b>两个引擎接力方式不同</b>：vLLM 是<b>串行两段</b>——先在 prefill 上跑 <code>max_tokens=1</code>、<code>do_remote_decode=True</code>（生成的那个 token 直接丢掉，只为算出 KV），拿到 <code>kv_transfer_params</code> 再交给轮询选出的 decode；Mooncake 连接器不回传参数，verl 自己用 <code>engine_id</code> 和本地 bootstrap 地址拼。SGLang 是<b>并发扇出</b>——prefill 生成 63 位随机 <code>bootstrap_room</code>，本地 prefill 与远端 decode 同时启动、靠 room 配对，decode 随机选（注释说是避免 RL 长尾 prompt 造成系统性倾斜）。<b>权重同步为什么不怕非对称 TP</b>：训练侧发的是 HF 命名的完整张量，引擎各按自己的 TP 再切；难点只在 PD 下每个引擎 actor 的本地 rank 从 0 起，vLLM 用 <code>VERL_ZMQ_BASE_TRAINER_RANK</code> 偏移回训练 rank、SGLang 按单副本足迹取模定角色，两处都假设 <code>prefill_replicas=1</code>。<b>对你最要紧的一条</b>：<code>vLLMPDReplica</code> 与 <code>SGLangPDReplica</code> 都在 <code>launch_servers</code> 里断言 <code>not is_torch_npu_available()</code>（<i>PD on NPU not validated</i>），<b>昇腾上这条路当前走不通</b>；配置白名单里的 <code>ascend</code> 只是占位。初始化总分图卡片里那句「KV 传输后端 nixl / mooncake / ascend / mori / fake」列的是<b>配置白名单</b>而非实际可用集合（vLLM 只接受前两种），已在<a href="arch/index.html#caveat">地图索引·已知坑</a>补注。其余 MVP 限制：<code>prefill_replicas=1</code>、整副本单节点、<code>data_parallel_size=1</code>、vLLM 还要求 PP=1；SGLang 的 delta 检查点引擎与 vLLM 的 <code>snapshot()</code> 均不支持 PD；仓库<b>无启用 PD 的示例脚本</b>，测试只覆盖配置校验与角色划分。另记四个端口与连接的坑（活 socket 先占端口防抢占、SGLang 的 bootstrap 必须绑可路由 IP、NIXL 的 UCX 要 dlopen <code>libcudart.so.12</code> 故启动前前置 cu12 库路径、Mooncake 默认开 TCP 连接池防端口耗尽）。卡片「PD 分离在解决什么」是领域背景，<b>不来自仓库代码</b>，图上已标明。该图通过 schema 校验、源码证据核验与真实浏览器渲染检查；<b>未做人工视觉审阅</b>。</li>
+  <li>2026-11-13：新增<a href="arch/seq-pipeline-1f1b.html"><b>1F1B 流水线调度</b></a>时序图（第 9 张）。以 PP=3、4 个微批为例，按 Megatron 源码（本机 <code>.venv</code> 里的 megatron-core 0.19.2，不在本仓库内）中 <code>forward_backward_pipelining_without_interleaving</code> 的<b>真实收发配对顺序</b>逐拍画出：warmup 次数 = min(PP − 段号 − 1, m)，首段最多、末段为 0；稳态里中间段用一次配对操作同时「发这次的激活、收最早那个微批的梯度」；cooldown 补完欠下的反向。竖条是各段在算，竖条之间的空白就是气泡。要点：① 气泡占比 (PP−1)/(m+PP−1)，m 越小越大；② 段 s 同时在手的激活份数 = min(PP − s, m)，所以 stage 0 激活 ∝ min(PP, m)——插课 G 公式里那一项的来历；③ 收发两端必须配对，任一段微批数不同就卡在某次收发上，<b>只超时不报错</b>；④ verl 打开变长序列（传给调度的 <code>seq_length=1</code> 是占位，真实形状靠收发前交换）、关掉 <code>batch_p2p_comm</code>、昇腾上替换形状交换的实现；⑤ <code>overlap_grad_reduce</code> 默认关闭（Megatron-Core 默认 False，Megatron-Bridge 0.6.0 只在 Megatron-FSDP 时打开），每段跑完自己的 cooldown 才做 DP×CP 归约，末段先归约正好落在前面各段的尾部气泡里；⑥ <code>optimizer.step</code> 求梯度范数要跨所有段归约（分布式优化器下是整个世界组），各段在这里重新对齐。<b>更正插课 G 的一个前提</b>：<code>ppo_mini_batch_size</code> 的单位是 <b>prompt</b>——<code>_update_actor</code> 先乘 <code>rollout.n</code>（<code>trainer_base.py:2427</code>），worker 再除以 DP（<code>engine_workers.py:305</code>），然后才切微批，所以 <b>m = ppo_mini_batch_size × n ÷ DP ÷ 每微批序列数</b>。<a href="xg-npu-ei0007-qp-oom.html#xg-13">§13</a> 说官方 235B 脚本「微批只有 4 个、stage 0 只攥 4 个」，漏乘了 n：该脚本 <code>train_prompt_mini_bsz=4</code>、<code>n_resp_per_prompt=4</code>，TP2·CP8·PP16 用满 256 卡所以 DP=1，静态微批大小 1，于是 <b>m = 16 = PP</b>，流水线正好填满，stage 0 攥 16 个。<a href="xg-npu-ei0007-qp-oom.html#xg-15">§15</a> 给 27B 推荐 PP=8 + <code>ppo_mini_batch_size=4</code> 时也按 4 个微批算：只要 n ≥ 2（GRPO 必然如此），m 就 ≥ 8，stage 0 实际攥 8 个，<b>激活显存估小了一倍</b>，「微批数 ≤ PP 时删掉首尾层数覆盖」的前提也不成立。插课 G 页面本身暂未改动（另一个会话在那里有未提交的 §16），已记入<a href="#todo">待处理</a>。该图通过 schema 校验、源码证据核验与真实浏览器渲染检查；时间按前向、反向等长示意，非实测；<b>未做人工视觉审阅</b>。</li>
 </ul>
 </main>
 </body>

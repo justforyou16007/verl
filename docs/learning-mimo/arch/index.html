@@ -30,6 +30,7 @@
     <li><a href="seq-actor-update.html">子：actor 更新</a></li>
     <li><a href="seq-weight-sync.html">子：权重同步两条路</a></li>
     <li><a href="seq-pd-disagg.html">子：推理 PD 分离部署</a></li>
+    <li><a href="seq-pipeline-1f1b.html">子：1F1B 流水线调度</a></li>
   </ol>
   <h2 style="margin-top:20px">模块地图（九张）</h2>
   <ol>
@@ -112,6 +113,7 @@
   <tr><td><a href="seq-actor-update.html">子流程：actor 更新</a></td><td>集合通信的三类归属（verl 显式 / Megatron 隐式 / 优化器内部）；四个同步点与异步错误的落点；打包与切分的形状变化</td></tr>
   <tr><td><a href="seq-weight-sync.html">子流程：权重同步两条路</a></td><td>共卡传显存句柄 vs 分离部署集合通信广播；导出为何写成生成器；中间那道栅栏的必要性</td></tr>
   <tr><td><a href="seq-pd-disagg.html"><b>子流程：推理 PD 分离部署</b></a></td><td>一个副本 = 1 prefill + N decode 怎么在单节点内编排；vLLM 串行两段 vs SGLang 并发扇出两种接力；KV 走 NIXL / Mooncake；非对称 TP 下权重同步为何仍成立；当前 MVP 限制（<b>昇腾上不可用</b>）</td></tr>
+  <tr><td><a href="seq-pipeline-1f1b.html"><b>子流程：1F1B 流水线调度</b></a></td><td>PP=3、4 个微批按 Megatron 真实收发配对逐拍画出 warmup / 稳态 / cooldown；气泡占比与「首段攥得最多」的显存规律；配对收发为何会卡死；梯度归约落在哪段气泡里；<b>更正</b>：微批数要乘采样数 n</td></tr>
 </table>
 <div class="box key">
   <b>几个与直觉相反、容易把图画错的事实</b>（都已在图上标出）：
@@ -123,6 +125,7 @@
     <li><b><code>use_remove_padding</code> 的生效值会被 model 配置覆盖 engine 配置</b>（代码注释自认 <i>not elegant</i>），所以两处都要设；而 <code>CP&gt;1</code> 时它<b>必须为 True</b>，否则启动即 <code>raise ValueError</code>——per-token 损失在 CP&gt;1 时由 Megatron-Bridge 自动开启，它硬性要求 THD 布局。</li>
     <li><b>verl 从不自己发流水线收发和梯度归约</b>：一次 <code>forward_backward_func</code> 调用全包；verl 只在启动时把归约钩子装进 Megatron 的配置。</li>
     <li><b>路由器是 verl 自己写的 Python</b>，不是 sglang_router 或 vLLM 的路由进程。</li>
+    <li><b><code>ppo_mini_batch_size</code> 的单位是 prompt，不是序列</b>：<code>_update_actor</code> 先乘 <code>rollout.n</code>，worker 再除以 DP，然后才切微批。所以流水线里的微批数 m = ppo_mini_batch_size × n ÷ DP ÷ 每微批序列数——插课 G §13 / §15 漏乘了 n，见 <a href="seq-pipeline-1f1b.html">1F1B 图</a>的更正卡片。</li>
   </ul>
 </div>
 
